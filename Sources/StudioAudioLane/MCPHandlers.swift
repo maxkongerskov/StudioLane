@@ -4,13 +4,6 @@ import Foundation
 
 @MainActor
 enum MCPHandlers {
-    static var mcpRevision: Int { model_revision }
-    private static var model_revision: Int = 0
-
-    static func bumpRevision() {
-        model_revision += 1
-    }
-
     // MARK: Read Tools
 
     static func getProjectState(model: EditorModel, compact: Bool) -> [String: Any] {
@@ -47,7 +40,7 @@ enum MCPHandlers {
         }
 
         return [
-            "revision": model_revision,
+            "revision": model.mcpRevision,
             "timeline_duration": model.duration,
             "is_playing": model.isPlaying,
             "is_exporting": model.isExporting,
@@ -72,12 +65,12 @@ enum MCPHandlers {
 
     // MARK: Revision Check
 
-    static func checkRevision(expected: Int?) -> MCPErrorResponse? {
-        guard let expected, expected != model_revision else { return nil }
+    static func checkRevision(model: EditorModel, expected: Int?) -> MCPErrorResponse? {
+        guard let expected, expected != model.mcpRevision else { return nil }
         return MCPErrorResponse(
             error: "revision_conflict",
-            message: "Expected revision \(expected) but current is \(model_revision). Re-read state before editing.",
-            currentRevision: model_revision
+            message: "Expected revision \(expected) but current is \(model.mcpRevision). Re-read state before editing.",
+            currentRevision: model.mcpRevision
         )
     }
 
@@ -339,5 +332,70 @@ enum MCPHandlers {
             return nil
         }
         return MCPErrorResponse(error: "clip_not_found", message: "No clip with id \(clipId)", currentRevision: nil)
+    }
+
+    static func crossfadeClips(model: EditorModel, leftClipId: String, rightClipId: String, duration: Double) -> Result<(Double, Double, Double), MCPErrorResponse> {
+        guard let leftUUID = UUID(uuidString: leftClipId) else {
+            return .failure(MCPErrorResponse(error: "invalid_clip_id", message: "Not a UUID: \(leftClipId)", currentRevision: nil))
+        }
+        guard let rightUUID = UUID(uuidString: rightClipId) else {
+            return .failure(MCPErrorResponse(error: "invalid_clip_id", message: "Not a UUID: \(rightClipId)", currentRevision: nil))
+        }
+        guard leftUUID != rightUUID else {
+            return .failure(MCPErrorResponse(error: "same_clip", message: "Crossfade requires two different clips", currentRevision: nil))
+        }
+
+        func crossfadePair(left: MediaClip, right: MediaClip) -> MCPErrorResponse? {
+            let requested = max(0, duration)
+            let leftAvailable = max(0, left.duration - left.fadeIn)
+            let rightAvailable = max(0, right.duration - right.fadeOut)
+            let overlap = min(leftAvailable, rightAvailable, requested)
+            guard overlap > 0.001 else {
+                return MCPErrorResponse(
+                    error: "crossfade_too_long",
+                    message: "Requested \(requested)s but adjacent clips only support \(min(leftAvailable, rightAvailable))s",
+                    currentRevision: nil
+                )
+            }
+
+            var mutableLeft = left
+            mutableLeft.fadeOut = overlap
+            mutableLeft.clampFades()
+
+            var mutableRight = right
+            mutableRight.fadeIn = overlap
+            mutableRight.clampFades()
+            mutableRight.timelineStart = mutableLeft.timelineEnd - overlap
+
+            return nil
+        }
+
+        if let leftIndex = model.videoIndexPublic(leftUUID), let rightIndex = model.videoIndexPublic(rightUUID) {
+            if let error = crossfadePair(left: model.videoClips[leftIndex], right: model.videoClips[rightIndex]) {
+                return .failure(error)
+            }
+            model.bumpMCPRevision()
+            model.applyFadesPublic()
+            let left = model.videoClips[leftIndex]
+            let right = model.videoClips[rightIndex]
+            return .success((left.timelineStart, left.fadeOut, right.fadeIn))
+        }
+
+        if let leftIndex = model.audioIndexPublic(leftUUID), let rightIndex = model.audioIndexPublic(rightUUID) {
+            if let error = crossfadePair(left: model.audioClips[leftIndex], right: model.audioClips[rightIndex]) {
+                return .failure(error)
+            }
+            model.bumpMCPRevision()
+            model.applyFadesPublic()
+            let left = model.audioClips[leftIndex]
+            let right = model.audioClips[rightIndex]
+            return .success((left.timelineStart, left.fadeOut, right.fadeIn))
+        }
+
+        return .failure(MCPErrorResponse(
+            error: "crossfade_kinds_mismatch",
+            message: "Both clips must exist and belong to the same media kind",
+            currentRevision: nil
+        ))
     }
 }

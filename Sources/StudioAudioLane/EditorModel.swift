@@ -691,6 +691,66 @@ final class EditorModel {
         }
     }
 
+    /// MCP template entry point — replaces the live timeline without a confirmation dialog.
+    /// The MCP layer owns the explicit confirmation gate.
+    func resetForTemplate(videoTrackCount: Int, audioTrackCount: Int, name: String?) async {
+        guard !isExporting else { return }
+        pushHistory()
+
+        let videoCount = max(1, videoTrackCount)
+        let audioCount = max(1, audioTrackCount)
+        var templateTracks: [TimelineTrack] = []
+
+        for index in 0..<videoCount {
+            let id = index == 0 ? Self.defaultVideoTrackID : UUID()
+            let trackName = index == 0 ? "Video" : "Video \(index + 1)"
+            templateTracks.append(TimelineTrack(id: id, name: trackName, kind: .video, volume: 1))
+        }
+        for index in 0..<audioCount {
+            let id = index == 0 ? Self.defaultAudioTrackID : UUID()
+            let trackName = index == 0 ? "Music" : "Audio \(index + 1)"
+            templateTracks.append(TimelineTrack(id: id, name: trackName, kind: .audio, volume: index == 0 ? 0.62 : 1))
+        }
+
+        for clip in videoClips { filmstrips[clip.id] = nil }
+        videoClips = []
+        audioClips = []
+        tracks = templateTracks
+        selectedClipID = nil
+        selectedClipIDs = []
+        selectedTrackIDs = []
+        focusedLane = .video
+        focusedTrackID = Self.defaultVideoTrackID
+        currentTime = 0
+        player.pause()
+        isPlaying = false
+        loopEnabled = false
+        loopIn = 0
+        loopOut = 0
+        timelineSpan = 0
+        if let name {
+            status = "Created template: \(name)"
+        } else {
+            status = "Created new project template"
+        }
+        errorMessage = nil
+        bumpMCPRevision()
+        projectFileURL = nil
+        scheduleAutosave()
+        await rebuildComposition()
+    }
+
+    /// MCP save entry point — bypasses the save panel after template creation.
+    func saveProjectDirect(to destination: URL) throws {
+        let finalURL = destination.pathExtension.lowercased() == "salproject"
+            ? destination
+            : destination.deletingPathExtension().appendingPathExtension("salproject")
+        try writeProjectDocument(makeProjectDocument(), to: finalURL)
+        projectFileURL = finalURL
+        status = "Saved \(finalURL.lastPathComponent)"
+        errorMessage = nil
+    }
+
     private static func filmstripFrameCount(for sourceDuration: TimeInterval) -> Int {
         // Full-source density (~2 thumbs/sec), capped so long clips stay light.
         max(12, min(64, Int(ceil(max(sourceDuration, 0.1) * 2))))

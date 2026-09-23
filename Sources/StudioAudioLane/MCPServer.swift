@@ -6,6 +6,7 @@ import Foundation
 final class MCPServer {
     private let model: EditorModel
     private var isRunning = false
+    private var capabilitiesSent = false
 
     init(model: EditorModel) {
         self.model = model
@@ -31,9 +32,9 @@ final class MCPServer {
                     Thread.sleep(forTimeInterval: 0.05)
                     continue
                 }
-                Task { @MainActor in
-                    self.handleMessage(line)
-                }
+            Task { @MainActor [weak self] in
+                self?.handleMessage(line)
+            }
             }
         }
     }
@@ -57,6 +58,7 @@ final class MCPServer {
 
         switch method {
         case "initialize":
+            capabilitiesSent = true
             writeResponse(MCPJSONRPC.response(id: id, result: [
                 "protocolVersion": "2024-11-05",
                 "capabilities": ["tools": [:]],
@@ -64,7 +66,7 @@ final class MCPServer {
             ]))
 
         case "notifications/initialized":
-            break // No response needed
+            break
 
         case "tools/list":
             writeResponse(MCPJSONRPC.response(id: id, result: ["tools": toolDefinitions]))
@@ -76,9 +78,11 @@ final class MCPServer {
                 return
             }
             let args = (params["arguments"] as? [String: Any]) ?? [:]
-            Task { @MainActor in
-                let result = await self.callTool(name: toolName, arguments: args)
-                self.writeResponse(result)
+            let requestId = args["__id"] ?? id
+            Task { @MainActor [weak self] in
+                let result = await self?.callTool(name: toolName, arguments: args) ?? Data()
+                self?.writeResponse(result)
+                self?.monitorExportAfterToolCall(requestId: requestId, initiallyExporting: self?.model.isExporting ?? false)
             }
 
         default:
@@ -89,6 +93,62 @@ final class MCPServer {
     private func writeResponse(_ data: Data) {
         FileHandle.standardOutput.write(data)
         FileHandle.standardOutput.write(Data("\n".utf8))
+    }
+
+    private func writeNotification(_ data: Data) {
+        FileHandle.standardOutput.write(data)
+        FileHandle.standardOutput.write(Data("\n".utf8))
+    }
+
+    private func monitorExportAfterToolCall(requestId: Any, initiallyExporting: Bool) {
+        guard capabilitiesSent else { return }
+        if initiallyExporting {
+            sendExportStarted(requestId: requestId)
+        }
+        Task { @MainActor [weak self] in
+            await self?.waitForExportChange(initiallyExporting: initiallyExporting, requestId: requestId)
+        }
+    }
+
+    private func sendExportStarted(requestId: Any) {
+        writeNotification(MCPJSONRPC.notification(method: "notifications/progress", params: [
+            "progressToken": requestId,
+            "progress": 0,
+            "total": 1,
+            "message": "Export started"
+        ] as [String: Any]))
+    }
+
+    private func waitForExportChange(initiallyExporting: Bool, requestId: Any) async {
+        var lastProgress = initiallyExporting ? 0.0 : 1.0
+        if initiallyExporting {
+            try? await Task.sleep(nanoseconds: 150_000_000)
+        }
+
+        while model.isExporting {
+            let progress = model.exportProgress
+            if progress - lastProgress >= 0.01 || progress < lastProgress {
+                lastProgress = progress
+                writeNotification(MCPJSONRPC.notification(method: "notifications/progress", params: [
+                    "progressToken": requestId,
+                    "progress": progress,
+                    "total": 1,
+                    "message": model.exportDestinationURL?.lastPathComponent ?? "Exporting"
+                ] as [String: Any]))
+            }
+            try? await Task.sleep(nanoseconds: 150_000_000)
+        }
+
+        if initiallyExporting {
+            let progress = model.exportProgress
+            let succeeded = abs(progress - 1) < 0.001
+            writeNotification(MCPJSONRPC.notification(method: "notifications/progress", params: [
+                "progressToken": requestId,
+                "progress": succeeded ? 1 : 0,
+                "total": 1,
+                "message": succeeded ? "Export completed" : "Export failed or cancelled"
+            ] as [String: Any]))
+        }
     }
 
     // MARK: - Tool Registry
@@ -209,6 +269,28 @@ final class MCPServer {
             ]),
             toolDef("cancel_export", "Cancel active export and delete partial output", [
                 "type": "object", "properties": [:]
+            ]),
+            toolDef("crossfade_clips", "Overlap two same-kind clips and apply complementary fades", [
+                "type": "object",
+                "properties": [
+                    "left_clip_id": ["type": "string", "description": "Clip that fades out"],
+                    "right_clip_id": ["type": "string", "description": "Clip that fades in"],
+                    "duration": ["type": "number", "minimum": 0, "description": "Requested overlap in seconds"],
+                    "expected_revision": ["type": "integer", "description": "Reject if model revision differs"]
+                ],
+                "required": ["left_clip_id", "right_clip_id", "duration"]
+            ]),
+            toolDef("create_project_template", "Replace the current timeline with an empty multi-track template", [
+                "type": "object",
+                "properties": [
+                    "name": ["type": "string", "description": "Human-readable template name"],
+                    "video_track_count": ["type": "integer", "minimum": 1, "maximum": 10, "default": 1],
+                    "audio_track_count": ["type": "integer", "minimum": 1, "maximum": 20, "default": 1],
+                    "save_path": ["type": "string", "description": "Optional absolute .salproject path"],
+                    "overwrite": ["type": "boolean", "description": "Allow replacing an existing save file", "default": false],
+                    "confirmed": ["type": "boolean", "description": "Must be true because this clears the current timeline"]
+                ],
+                "required": ["confirmed"]
             ])
         ]
     }
@@ -229,7 +311,7 @@ final class MCPServer {
         case .failure(let error):
             return MCPJSONRPC.response(id: arguments["__id"] ?? NSNull(), result: [
                 "isError": true,
-                "content": [["type": "text", "text": encodeJSON(error)]]
+                "content": [["type": "text", "text": encodeJSON(error.dict)]]
             ])
         }
     }
@@ -245,8 +327,6 @@ final class MCPServer {
     }
 
     private func dispatchTool(name: String, arguments: [String: Any]) async -> Result<[String: Any], MCPDictError> {
-        let id = arguments["__id"] ?? NSNull()
-
         switch name {
         case "get_project_state":
             let compact = (arguments["compact"] as? Bool) ?? false
@@ -263,7 +343,7 @@ final class MCPServer {
             let result = await MCPHandlers.addClip(model: model, filePath: filePath, trackKind: trackKind, start: start, trackId: trackId)
             switch result {
             case .success:
-                return .success(["status": "added", "revision": MCPHandlers.mcpRevision])
+                return .success(["status": "added", "revision": model.mcpRevision])
             case .failure(let e):
                 return .failure(MCPErrorResponseDict(e))
             }
@@ -272,20 +352,20 @@ final class MCPServer {
             if let conflict = checkExpectedRevision(arguments) { return .failure(conflict) }
             let error = MCPHandlers.trimClip(model: model, clipId: arguments["clip_id"] as? String ?? "", newIn: arguments["new_in"] as? Double, newDuration: arguments["new_duration"] as? Double)
             if let e = error { return .failure(MCPErrorResponseDict(e)) }
-            return .success(["status": "trimmed", "revision": MCPHandlers.mcpRevision])
+            return .success(["status": "trimmed", "revision": model.mcpRevision])
 
         case "move_clip":
             if let conflict = checkExpectedRevision(arguments) { return .failure(conflict) }
             let error = MCPHandlers.moveClip(model: model, clipId: arguments["clip_id"] as? String ?? "", newStart: arguments["new_start"] as? Double ?? 0, trackId: arguments["track_id"] as? String)
             if let e = error { return .failure(MCPErrorResponseDict(e)) }
-            return .success(["status": "moved", "revision": MCPHandlers.mcpRevision])
+            return .success(["status": "moved", "revision": model.mcpRevision])
 
         case "split_clip":
             if let conflict = checkExpectedRevision(arguments) { return .failure(conflict) }
             let result = MCPHandlers.splitClip(model: model, clipId: arguments["clip_id"] as? String ?? "", atTime: arguments["at_time"] as? Double ?? 0)
             switch result {
             case .success(let ids):
-                return .success(["status": "split", "clip_ids": ids, "revision": MCPHandlers.mcpRevision])
+                return .success(["status": "split", "clip_ids": ids, "revision": model.mcpRevision])
             case .failure(let e):
                 return .failure(MCPErrorResponseDict(e))
             }
@@ -295,7 +375,7 @@ final class MCPServer {
             let result = MCPHandlers.deleteClip(model: model, clipId: arguments["clip_id"] as? String ?? "", confirmed: arguments["confirmed"] as? Bool ?? false)
             switch result {
             case .success:
-                return .success(["status": "deleted", "revision": MCPHandlers.mcpRevision])
+                return .success(["status": "deleted", "revision": model.mcpRevision])
             case .failure(let e):
                 return .failure(MCPErrorResponseDict(e))
             }
@@ -304,37 +384,37 @@ final class MCPServer {
             if let conflict = checkExpectedRevision(arguments) { return .failure(conflict) }
             let error = MCPHandlers.setClipVolume(model: model, clipId: arguments["clip_id"] as? String ?? "", gain: arguments["gain"] as? Double ?? 1)
             if let e = error { return .failure(MCPErrorResponseDict(e)) }
-            return .success(["status": "volume_set", "revision": MCPHandlers.mcpRevision])
+            return .success(["status": "volume_set", "revision": model.mcpRevision])
 
         case "set_track_volume":
             if let conflict = checkExpectedRevision(arguments) { return .failure(conflict) }
             let error = MCPHandlers.setTrackVolume(model: model, trackId: arguments["track_id"] as? String ?? "", volume: arguments["volume"] as? Double ?? 1)
             if let e = error { return .failure(MCPErrorResponseDict(e)) }
-            return .success(["status": "track_volume_set", "revision": MCPHandlers.mcpRevision])
+            return .success(["status": "track_volume_set", "revision": model.mcpRevision])
 
         case "toggle_mute":
             if let conflict = checkExpectedRevision(arguments) { return .failure(conflict) }
             let error = MCPHandlers.toggleMute(model: model, clipId: arguments["clip_id"] as? String ?? "")
             if let e = error { return .failure(MCPErrorResponseDict(e)) }
-            return .success(["status": "muted_toggled", "revision": MCPHandlers.mcpRevision])
+            return .success(["status": "muted_toggled", "revision": model.mcpRevision])
 
         case "set_fade_in":
             if let conflict = checkExpectedRevision(arguments) { return .failure(conflict) }
             let error = MCPHandlers.setFade(model: model, clipId: arguments["clip_id"] as? String ?? "", direction: "in", duration: arguments["duration"] as? Double ?? 0)
             if let e = error { return .failure(MCPErrorResponseDict(e)) }
-            return .success(["status": "fade_in_set", "revision": MCPHandlers.mcpRevision])
+            return .success(["status": "fade_in_set", "revision": model.mcpRevision])
 
         case "set_fade_out":
             if let conflict = checkExpectedRevision(arguments) { return .failure(conflict) }
             let error = MCPHandlers.setFade(model: model, clipId: arguments["clip_id"] as? String ?? "", direction: "out", duration: arguments["duration"] as? Double ?? 0)
             if let e = error { return .failure(MCPErrorResponseDict(e)) }
-            return .success(["status": "fade_out_set", "revision": MCPHandlers.mcpRevision])
+            return .success(["status": "fade_out_set", "revision": model.mcpRevision])
 
         case "clear_fades":
             if let conflict = checkExpectedRevision(arguments) { return .failure(conflict) }
             let error = MCPHandlers.clearFades(model: model, clipId: arguments["clip_id"] as? String ?? "")
             if let e = error { return .failure(MCPErrorResponseDict(e)) }
-            return .success(["status": "fades_cleared", "revision": MCPHandlers.mcpRevision])
+            return .success(["status": "fades_cleared", "revision": model.mcpRevision])
 
         case "batch_edit":
             return await batchEdit(arguments)
@@ -344,8 +424,32 @@ final class MCPServer {
 
         case "cancel_export":
             model.cancelExport()
-            MCPHandlers.bumpRevision()
-            return .success(["status": "export_cancelled", "revision": MCPHandlers.mcpRevision])
+            model.bumpMCPRevision()
+            return .success(["status": "export_cancelled", "revision": model.mcpRevision])
+
+        case "crossfade_clips":
+            if let conflict = checkExpectedRevision(arguments) { return .failure(conflict) }
+            let result = MCPHandlers.crossfadeClips(
+                model: model,
+                leftClipId: arguments["left_clip_id"] as? String ?? "",
+                rightClipId: arguments["right_clip_id"] as? String ?? "",
+                duration: arguments["duration"] as? Double ?? 0
+            )
+            switch result {
+            case .success(let applied):
+                return .success([
+                    "status": "crossfade_applied",
+                    "left_timeline_start": applied.0,
+                    "applied_overlap": applied.1,
+                    "fade_in": applied.2,
+                    "revision": model.mcpRevision
+                ])
+            case .failure(let error):
+                return .failure(MCPErrorResponseDict(error))
+            }
+
+        case "create_project_template":
+            return await createProjectTemplate(arguments)
 
         default:
         return .failure(MCPDictError(dict: ["error": "unknown_tool", "message": "Unknown tool: \(name)"] as [String: Any]))
@@ -354,7 +458,7 @@ final class MCPServer {
 
     private func checkExpectedRevision(_ args: [String: Any]) -> MCPDictError? {
         guard let expected = args["expected_revision"] as? Int else { return nil }
-        let conflict = MCPHandlers.checkRevision(expected: expected)
+        let conflict = MCPHandlers.checkRevision(model: model, expected: expected)
         guard let c = conflict else { return nil }
         return MCPErrorResponseDict(c)
     }
@@ -399,6 +503,16 @@ final class MCPServer {
                 if let e = MCPHandlers.toggleMute(model: model, clipId: op["clip_id"] as? String ?? "") {
                     errors.append(["index": i, "error": e.error, "message": e.message])
                 } else { applied += 1 }
+            case "crossfade_clips":
+                let result = MCPHandlers.crossfadeClips(
+                    model: model,
+                    leftClipId: op["left_clip_id"] as? String ?? "",
+                    rightClipId: op["right_clip_id"] as? String ?? "",
+                    duration: op["duration"] as? Double ?? 0
+                )
+                if case .failure(let e) = result {
+                    errors.append(["index": i, "error": e.error, "message": e.message])
+                } else { applied += 1 }
             default:
                 errors.append(["index": i, "error": "unknown_action", "message": "Unknown batch op action: '\(action)'"])
             }
@@ -409,8 +523,71 @@ final class MCPServer {
             "applied_ops": applied,
             "total_ops": opsRaw.count,
             "errors": errors,
-            "revision": MCPHandlers.mcpRevision
+            "revision": model.mcpRevision
         ])
+    }
+
+    private func createProjectTemplate(_ args: [String: Any]) async -> Result<[String: Any], MCPDictError> {
+        guard args["confirmed"] as? Bool == true else {
+            return .failure(MCPDictError(dict: [
+                "error": "confirmation_required",
+                "message": "Set confirmed=true to replace the current timeline with an empty template."
+            ] as [String: Any]))
+        }
+        guard !model.isExporting else {
+            return .failure(MCPDictError(dict: ["error": "export_in_progress", "message": "Cannot change the project during export"] as [String: Any]))
+        }
+
+        let videoCount = args["video_track_count"] as? Int ?? 1
+        let audioCount = args["audio_track_count"] as? Int ?? 1
+        guard (1...10).contains(videoCount), (1...20).contains(audioCount) else {
+            return .failure(MCPDictError(dict: [
+                "error": "invalid_track_count",
+                "message": "video_track_count must be 1–10 and audio_track_count must be 1–20"
+            ] as [String: Any]))
+        }
+
+        let name = (args["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let destination: URL?
+        if let savePath = args["save_path"] as? String, !savePath.isEmpty {
+            let requested = URL(fileURLWithPath: savePath)
+            let finalURL = requested.pathExtension.lowercased() == "salproject"
+                ? requested
+                : requested.deletingPathExtension().appendingPathExtension("salproject")
+            if FileManager.default.fileExists(atPath: finalURL.path), args["overwrite"] as? Bool != true {
+                return .failure(MCPDictError(dict: [
+                    "error": "file_exists",
+                    "message": "Destination already exists. Pass overwrite=true to replace it."
+                ] as [String: Any]))
+            }
+            destination = finalURL
+        } else {
+            destination = nil
+        }
+
+        let previousRevision = model.mcpRevision
+        await model.resetForTemplate(videoTrackCount: videoCount, audioTrackCount: audioCount, name: name)
+        guard model.mcpRevision > previousRevision else {
+            return .failure(MCPDictError(dict: ["error": "template_failed", "message": "Template could not be applied"] as [String: Any]))
+        }
+
+        var response: [String: Any] = [
+            "status": "template_created",
+            "video_track_count": videoCount,
+            "audio_track_count": audioCount,
+            "tracks": MCPHandlers.getProjectState(model: model, compact: true)["tracks"] ?? [],
+            "revision": model.mcpRevision
+        ]
+        if let name { response["name"] = name }
+        if let destination {
+            do {
+                try model.saveProjectDirect(to: destination)
+                response["saved_path"] = destination.path
+            } catch {
+                response["save_error"] = error.localizedDescription
+            }
+        }
+        return .success(response)
     }
 
     private func exportProject(_ args: [String: Any]) -> Result<[String: Any], MCPDictError> {
@@ -480,7 +657,7 @@ final class MCPServer {
             "container": container,
             "codec": codecRaw,
             "quality": qualityRaw,
-            "revision": MCPHandlers.mcpRevision
+            "revision": model.mcpRevision
         ])
     }
 

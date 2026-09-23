@@ -70,6 +70,14 @@ struct MCPToolResult {
 // MARK: - JSON-RPC Framing
 
 enum MCPJSONRPC {
+    static func notification(method: String, params: [String: Any]) -> Data {
+        encode([
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params
+        ])
+    }
+
     static func response(id: Any, result: Any) -> Data {
         let dict: [String: Any] = [
             "jsonrpc": "2.0",

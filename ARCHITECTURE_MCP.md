@@ -168,9 +168,9 @@ The MCP server is compiled into the main app binary. It activates on a launch ar
 - `export_project` + `cancel_export`
 
 **Phase 3 — Polish**
-- Export progress callbacks (push notification to MCP client)
-- Crossfade composition helper (`crossfade_clips` tool that wraps `set_fade_out` + `set_fade_in` + `move_clip`)
-- AI-authored project templates (agent can create a new project from a text description)
+- Export progress callbacks: `notifications/progress` with the `tools/call` request id as its progress token
+- Crossfade composition helper: `crossfade_clips` validates available duration, sets complementary fades, and abuts the right clip
+- AI-authored project templates: `create_project_template` with an explicit confirmation gate, track counts, and optional direct save
 
 ## What Makes This Competitive
 
