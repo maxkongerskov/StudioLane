@@ -3,12 +3,16 @@ import SwiftUI
 @main
 struct StudioAudioLaneApp: App {
     @State private var model = EditorModel()
+    @State private var mcpServer: MCPServer?
 
     var body: some Scene {
         WindowGroup {
             StudioView()
                 .environment(model)
                 .preferredColorScheme(.dark)
+                .onAppear {
+                    startMCPIfNeeded()
+                }
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1568, height: 780)
@@ -96,6 +100,21 @@ struct StudioAudioLaneApp: App {
                 .keyboardShortcut(.space, modifiers: [])
                 .disabled(model.isExportSheetPresented)
             }
+        }
+    }
+
+    init() {
+        if CommandLine.arguments.contains("--mcp") {
+        }
+    }
+
+    private func startMCPIfNeeded() {
+        guard CommandLine.arguments.contains("--mcp"), mcpServer == nil else { return }
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            let server = MCPServer(model: model)
+            mcpServer = server
+            server.start()
         }
     }
 }

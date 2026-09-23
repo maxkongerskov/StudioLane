@@ -622,7 +622,74 @@ final class EditorModel {
     private var exportProgressTimer: Timer?
     private var exportWriterTask: Task<Void, Never>?
     /// Destination of the in-flight export; used to delete incomplete files on cancel/failure.
-    private var exportDestinationURL: URL?
+    var exportDestinationURL: URL?
+
+    /// Monotonic revision counter — bumped on every MCP-initiated mutation.
+    private(set) var mcpRevision: Int = 0
+
+    func bumpMCPRevision() {
+        mcpRevision += 1
+    }
+
+    /// Public bridge for MCP server — the MCP layer calls these instead of reaching into private state.
+    func addVideoPublic(url: URL, start: TimeInterval?, ontoTrackID: UUID) async {
+        await addVideo(url, fade: 0, at: start, ontoTrackID: ontoTrackID)
+    }
+
+    func addAudioPublic(url: URL, start: TimeInterval?, ontoTrackID: UUID) async {
+        await addAudio(url, fade: 0, at: start, ontoTrackID: ontoTrackID)
+    }
+
+    func videoIndexPublic(_ id: UUID) -> Int? { videoIndex(id) }
+    func audioIndexPublic(_ id: UUID) -> Int? { audioIndex(id) }
+    func gaplessSplitPublic(_ clip: MediaClip, at time: TimeInterval) -> (left: MediaClip, right: MediaClip) {
+        gaplessSplit(clip, at: time)
+    }
+    func deleteClipPublic(clipID: UUID) {
+        deleteClip(clipID: clipID)
+    }
+    func rebuildCompositionPublic() async {
+        await rebuildComposition()
+    }
+    func applyFadesPublic() {
+        applyFades()
+    }
+
+    /// MCP export entry point — bypasses the save panel.
+    func beginExportDirect(settings: ExportSettings, destination: URL) {
+        guard !isExporting, let item = player.currentItem else { return }
+        var settings = settings
+        settings.sanitize()
+
+        try? FileManager.default.removeItem(at: destination)
+        isExporting = true
+        exportProgress = 0
+        errorMessage = nil
+        exportDestinationURL = destination
+        let pipeline = settings.prefersWriterPipeline ? "writer" : "session"
+        status = "Exporting… (\(pipeline), \(settings.codec.rawValue)/\(settings.container.rawValue))"
+
+        let videoComposition = makeExportVideoComposition(settings: settings)
+        let audioMix = item.audioMix ?? makeAudioMix()
+
+        if settings.prefersWriterPipeline {
+            startWriterExport(
+                asset: item.asset,
+                settings: settings,
+                destination: destination,
+                videoComposition: videoComposition,
+                audioMix: audioMix
+            )
+        } else {
+            startSessionExport(
+                asset: item.asset,
+                settings: settings,
+                destination: destination,
+                videoComposition: videoComposition,
+                audioMix: audioMix
+            )
+        }
+    }
 
     private static func filmstripFrameCount(for sourceDuration: TimeInterval) -> Int {
         // Full-source density (~2 thumbs/sec), capped so long clips stay light.
