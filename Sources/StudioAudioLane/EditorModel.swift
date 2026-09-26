@@ -196,10 +196,12 @@ struct ProjectDocument: Codable {
     var isDuckingMusic: Bool
     var audioLayoutMode: Int?
     var timelineSpan: TimeInterval?
+    /// Playhead in seconds. Absent in older files, which open at the start.
+    var playhead: TimeInterval?
 
     enum CodingKeys: String, CodingKey {
         case clips, tracks, focusedLane, focusedTrackID, selectedClipID, selectedClipIDs
-        case videoVolume, musicVolume, isDuckingMusic, audioLayoutMode, timelineSpan
+        case videoVolume, musicVolume, isDuckingMusic, audioLayoutMode, timelineSpan, playhead
     }
 
     init(
@@ -213,7 +215,8 @@ struct ProjectDocument: Codable {
         musicVolume: Float,
         isDuckingMusic: Bool,
         audioLayoutMode: Int? = 0,
-        timelineSpan: TimeInterval? = nil
+        timelineSpan: TimeInterval? = nil,
+        playhead: TimeInterval? = nil
     ) {
         self.clips = clips
         self.tracks = tracks
@@ -226,6 +229,7 @@ struct ProjectDocument: Codable {
         self.isDuckingMusic = isDuckingMusic
         self.audioLayoutMode = audioLayoutMode
         self.timelineSpan = timelineSpan
+        self.playhead = playhead
     }
 
     init(from decoder: Decoder) throws {
@@ -241,6 +245,7 @@ struct ProjectDocument: Codable {
         isDuckingMusic = try c.decode(Bool.self, forKey: .isDuckingMusic)
         audioLayoutMode = try c.decodeIfPresent(Int.self, forKey: .audioLayoutMode)
         timelineSpan = try c.decodeIfPresent(TimeInterval.self, forKey: .timelineSpan)
+        playhead = try c.decodeIfPresent(TimeInterval.self, forKey: .playhead)
     }
 }
 
@@ -824,7 +829,8 @@ final class EditorModel {
             musicVolume: musicVolume,
             isDuckingMusic: isDuckingMusic,
             audioLayoutMode: audioLayoutMode.rawValue,
-            timelineSpan: timelineSpan
+            timelineSpan: timelineSpan,
+            playhead: currentTime
         )
     }
 
@@ -1009,6 +1015,11 @@ final class EditorModel {
             timelineSpan = max(timelineSpan, duration)
         }
         selectedTrackIDs = trackIDsWithSelectedClips
+        if let saved = project.playhead, saved.isFinite {
+            currentTime = min(max(0, saved), max(duration, 0))
+        } else {
+            currentTime = 0
+        }
         regenerateMissingVisuals()
         Task { await rebuildComposition() }
         return true
