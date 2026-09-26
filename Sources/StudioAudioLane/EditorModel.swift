@@ -939,7 +939,7 @@ final class EditorModel {
             loadedTracks = []
         }
 
-        guard !videoClips.isEmpty || !audioClips.isEmpty else {
+        guard !loadedVideoClips.isEmpty || !loadedAudioClips.isEmpty else {
             videoClips = []
             audioClips = []
             tracks = []
