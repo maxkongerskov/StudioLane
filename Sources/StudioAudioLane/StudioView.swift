@@ -1,6 +1,5 @@
 import AVFoundation
 import SwiftUI
-import UniformTypeIdentifiers
 
 struct StudioView: View {
     @Environment(EditorModel.self) private var model
@@ -46,12 +45,14 @@ struct StudioView: View {
     private var preview: some View {
         ZStack {
             StudioTheme.canvas
-            PlayerSurface(player: model.player)
-                .padding(18)
+            PlayerSurface(player: model.player) { urls in
+                model.acceptDroppedFiles(urls)
+            }
             if model.isLoading {
                 ProgressView(model.status.isEmpty ? "Loading…" : model.status)
                     .controlSize(.small)
                     .tint(.white)
+                    .allowsHitTesting(false)
             } else if !model.hasVideo {
                 VStack(spacing: 10) {
                     Image(systemName: "film")
@@ -61,56 +62,21 @@ struct StudioView: View {
                         .font(.system(size: 13))
                         .foregroundStyle(StudioTheme.muted)
                 }
+                .allowsHitTesting(false)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onDrop(of: [.fileURL, .movie, .audio], isTargeted: nil) { providers in
-            _ = loadDropped(providers)
-            return true
-        }
-    }
-
-    private func loadDropped(_ providers: [NSItemProvider]) -> Bool {
-        let eligible = providers.filter {
-            $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
-                || $0.hasItemConformingToTypeIdentifier(UTType.movie.identifier)
-                || $0.hasItemConformingToTypeIdentifier(UTType.audio.identifier)
-        }
-        guard !eligible.isEmpty else { return false }
-
-        let group = DispatchGroup()
-        let box = DropURLBox()
-        for provider in eligible {
-            group.enter()
-            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
-                provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
-                    let url: URL? = {
-                        if let url = item as? URL { return url }
-                        if let data = item as? Data { return URL(dataRepresentation: data, relativeTo: nil) }
-                        return nil
-                    }()
-                    if let url { box.append(url) }
-                    group.leave()
-                }
-            } else {
-                group.leave()
-            }
-        }
-        group.notify(queue: .main) {
-            let urls = box.urls
-            guard !urls.isEmpty else { return }
-            model.acceptDroppedFiles(urls)
-        }
-        return true
     }
 }
 
 struct PlayerSurface: NSViewRepresentable {
     let player: AVPlayer
+    var onDropFiles: ([URL]) -> Void
 
     func makeNSView(context: Context) -> PlayerNSView {
         let view = PlayerNSView()
         view.playerLayer.player = player
+        view.onDropFiles = onDropFiles
         return view
     }
 
@@ -118,6 +84,7 @@ struct PlayerSurface: NSViewRepresentable {
         if view.playerLayer.player !== player {
             view.playerLayer.player = player
         }
+        view.onDropFiles = onDropFiles
     }
 }
 
@@ -130,6 +97,25 @@ final class PlayerNSView: NSView {
         layer = playerLayer
         playerLayer.videoGravity = .resizeAspect
         playerLayer.backgroundColor = NSColor.black.cgColor
+        registerForDraggedTypes([.fileURL])
+    }
+
+    var onDropFiles: ([URL]) -> Void = { _ in }
+
+    override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation { .copy }
+
+    override func draggingUpdated(_ sender: any NSDraggingInfo) -> NSDragOperation { .copy }
+
+    override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
+        let urls = sender.draggingPasteboard.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]
+        ) as? [URL] ?? []
+        guard !urls.isEmpty else { return false }
+        let files = urls
+        let deliver = onDropFiles
+        DispatchQueue.main.async { deliver(files) }
+        return true
     }
 
     @available(*, unavailable)
@@ -137,6 +123,6 @@ final class PlayerNSView: NSView {
 
     override func layout() {
         super.layout()
-        playerLayer.frame = bounds
+        playerLayer.frame = bounds.insetBy(dx: 18, dy: 18)
     }
 }

@@ -698,7 +698,7 @@ struct TimelineDropDelegate: DropDelegate {
 
         for provider in providers {
             group.enter()
-            Self.loadFileURL(from: provider) { url in
+            DroppedMediaURL.load(from: provider) { url in
                 if let url { box.append(url) }
                 group.leave()
             }
@@ -714,28 +714,73 @@ struct TimelineDropDelegate: DropDelegate {
         return true
     }
 
-    private static func loadFileURL(from provider: NSItemProvider, completion: @escaping @Sendable (URL?) -> Void) {
-        if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
-            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
-                completion(Self.parseURL(item))
-            }
-            return
-        }
-        // Some drops only expose the concrete media UTI; still try fileURL data representation.
-        provider.loadDataRepresentation(forTypeIdentifier: UTType.fileURL.identifier) { data, _ in
-            if let data, let url = URL(dataRepresentation: data, relativeTo: nil) {
+}
+
+/// Finder file drags often refuse `loadItem(public.file-url)` and only yield a URL
+/// through `loadObject(ofClass:)`. The preview and the lanes both use this.
+enum DroppedMediaURL {
+    static func load(from provider: NSItemProvider, completion: @escaping @Sendable (URL?) -> Void) {
+        nonisolated(unsafe) let provider = provider
+        let deliver: @Sendable (URL?) -> Void = { url in
+            if let url, url.isFileURL {
                 completion(url)
             } else {
                 completion(nil)
             }
         }
+        if provider.canLoadObject(ofClass: URL.self) {
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                if let url, url.isFileURL {
+                    deliver(url)
+                } else {
+                    loadItem(from: provider, completion: deliver)
+                }
+            }
+            return
+        }
+        loadItem(from: provider, completion: deliver)
     }
 
-    nonisolated private static func parseURL(_ item: (any NSSecureCoding)?) -> URL? {
-        if let url = item as? URL { return url }
-        if let data = item as? Data { return URL(dataRepresentation: data, relativeTo: nil) }
-        if let str = item as? String { return URL(fileURLWithPath: str) }
+    private static func loadItem(from provider: NSItemProvider, completion: @escaping @Sendable (URL?) -> Void) {
+        nonisolated(unsafe) let provider = provider
+        if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                if let url = parse(item) {
+                    completion(url)
+                    return
+                }
+                provider.loadDataRepresentation(forTypeIdentifier: UTType.fileURL.identifier) { data, _ in
+                    completion(data.flatMap(parse(data:)))
+                }
+            }
+            return
+        }
+        provider.loadDataRepresentation(forTypeIdentifier: UTType.fileURL.identifier) { data, _ in
+            completion(data.flatMap(parse(data:)))
+        }
+    }
+
+    private static func parse(_ item: (any NSSecureCoding)?) -> URL? {
+        if let url = item as? URL, url.isFileURL { return url }
+        if let str = item as? String { return fileURL(from: str) }
+        if let data = item as? Data { return parse(data: data) }
         return nil
+    }
+
+    private static func parse(data: Data) -> URL? {
+        if let url = URL(dataRepresentation: data, relativeTo: nil), url.isFileURL { return url }
+        if let str = String(data: data, encoding: .utf8) { return fileURL(from: str) }
+        return nil
+    }
+
+    private static func fileURL(from raw: String) -> URL? {
+        let str = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !str.isEmpty else { return nil }
+        if str.hasPrefix("file:") {
+            return URL(string: str).flatMap { $0.isFileURL ? $0 : nil }
+        }
+        guard str.hasPrefix("/") else { return nil }
+        return URL(fileURLWithPath: str)
     }
 }
 
