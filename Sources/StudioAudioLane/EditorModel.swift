@@ -1458,9 +1458,13 @@ final class EditorModel {
     }
 
     func toggleMuteSelectedAudio() {
-        beginEdit()
+        // A discrete click must record its own step. beginEdit() no-ops while a
+        // slider drag is still open, which left Mute off the undo stack.
+        guard !isLoading else { return }
+        isEditingClip = false
+        pushHistory()
         mutateSelectedAudio { $0.muted.toggle() }
-        commitEdit()
+        scheduleAutosave()
     }
 
     func isClipSelected(_ id: UUID) -> Bool {
