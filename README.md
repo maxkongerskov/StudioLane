@@ -4,6 +4,8 @@ A native macOS studio for cutting picture and sound together. Bring in a recordi
 
 Requires macOS 14 or later.
 
+![StudioLane editing a launch clip with music underneath](docs/studiolane.jpg)
+
 ## What you can do
 
 The editor opens empty, or restores the last session. Drop video or audio on the preview, or choose File ▸ Open Media. Video lanes show a filmstrip. Audio lanes show a waveform. Add more lanes when one picture track and one music track are not enough.
