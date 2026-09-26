@@ -122,33 +122,55 @@ struct TitleBar: View {
 struct InspectorPane: View {
     @Environment(EditorModel.self) private var model
 
+    /// Header plus the hairline under it. The action footer is measured to the
+    /// three chip rows so it never covers the sliders above the timeline.
+    private var actionFooterHeight: CGFloat { selectedClip == nil ? 0 : 108 }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Rectangle().fill(StudioTheme.hairline).frame(height: 1)
-            if model.isLoading {
-                loading
-            } else if !model.hasVideo {
-                emptyProject
-            } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 0) {
-                        tracksSection
-                        Rectangle()
-                            .fill(StudioTheme.hairline)
-                            .frame(height: 1)
-                            .padding(.top, 16)
-                            .padding(.bottom, 14)
-                        clipSection
+            GeometryReader { geo in
+                let scrollHeight = max(80, geo.size.height - actionFooterHeight)
+                VStack(alignment: .leading, spacing: 0) {
+                    if model.isLoading {
+                        loading
+                    } else if !model.hasVideo {
+                        emptyProject
+                    } else {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 0) {
+                                tracksSection
+                                Rectangle()
+                                    .fill(StudioTheme.hairline)
+                                    .frame(height: 1)
+                                    .padding(.top, 16)
+                                    .padding(.bottom, 14)
+                                clipSection
+                            }
+                            .padding(.horizontal, 16)
+                            .padding(.top, 8)
+                            .padding(.bottom, 8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .frame(height: scrollHeight)
+                        if selectedClip != nil {
+                            VStack(spacing: 0) {
+                                Rectangle().fill(StudioTheme.hairline).frame(height: 1)
+                                actionRow
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 12)
+                            }
+                            .frame(height: actionFooterHeight, alignment: .top)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(StudioTheme.inspector)
+                        }
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.top, 14)
-                    .padding(.bottom, 18)
-                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
         }
         .frame(width: 248)
+        .frame(maxHeight: .infinity, alignment: .top)
         .background(StudioTheme.inspector)
     }
 
@@ -215,32 +237,11 @@ struct InspectorPane: View {
                     )
                 }
             }
-            LazyVGrid(
-                columns: [
-                    GridItem(.flexible(), spacing: 8),
-                    GridItem(.flexible(), spacing: 8)
-                ],
-                spacing: 8
+            AddChipButton(
+                title: model.audioLayoutMode == .playlist ? "Playlist" : "Layer",
+                systemImage: "rectangle.stack"
             ) {
-                AddChipButton(title: "Add media", systemImage: "plus") {
-                    model.pickMediaFile()
-                }
-                AddChipButton(
-                    title: model.audioLayoutMode == .playlist ? "Playlist" : "Layer",
-                    systemImage: "rectangle.stack"
-                ) {
-                    model.toggleAudioLayoutMode()
-                }
-                AddChipButton(title: "Fill from Files…", systemImage: "folder") {
-                    model.fillMusicFromFiles()
-                }
-                AddChipButton(
-                    title: "Replace…",
-                    systemImage: "arrow.triangle.2.circlepath",
-                    enabled: model.selectedAudio != nil
-                ) {
-                    model.replaceSelectedMusic()
-                }
+                model.toggleAudioLayoutMode()
             }
             .padding(.top, 4)
         }
@@ -270,13 +271,12 @@ struct InspectorPane: View {
     // MARK: - Selected clip
 
     private var clipSection: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 8) {
             sectionLabel("Selected clip")
             laneSegmented
             if let clip = selectedClip {
                 identity(for: clip)
                 clipFields
-                actionRow
             } else {
                 Text("Select a clip on the timeline.")
                     .font(.system(size: 12))
@@ -438,9 +438,9 @@ struct InspectorPane: View {
                     ActionChipButton(title: "Replace…", kind: .normal) {
                         model.replaceSelectedMusic()
                     }
-                    ActionChipButton(title: "Fit to Video", kind: .normal) {
-                        model.fitSelectedMusicToVideo()
-                    }
+                }
+                ActionChipButton(title: "Fit to Video", kind: .normal) {
+                    model.fitSelectedMusicToVideo()
                 }
             }
             HStack(spacing: 8) {
@@ -462,7 +462,7 @@ struct InspectorPane: View {
     }
 
     private func parameterStack<Content: View>(@ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 8) {
             content()
         }
     }
@@ -683,6 +683,7 @@ struct ActionChipButton: View {
                 )
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(title)
         .onHover { hovering = $0 }
     }
 
