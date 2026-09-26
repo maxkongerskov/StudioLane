@@ -8,7 +8,7 @@ Requires macOS 14 or later.
 
 [StudioLane 1.0](https://github.com/maxkongerskov/StudioLane/releases/download/v1.0/StudioLane-1.0.dmg) is a disk image for macOS 14 or later. Open it and drag StudioLane into Applications.
 
-The app is signed with Max Køngerskov’s Developer ID. This build is not notarized yet, so the first time you open it, control-click the app and choose Open.
+The app is signed with Max Køngerskov’s Developer ID and notarized by Apple. Open the disk image and drag StudioLane into Applications.
 
 ![StudioLane editing a launch clip with music underneath](docs/studiolane.jpg)
 
