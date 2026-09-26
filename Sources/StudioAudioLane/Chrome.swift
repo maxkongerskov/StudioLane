@@ -3,11 +3,49 @@ import SwiftUI
 
 enum StudioFormat {
     static func timecode(_ t: TimeInterval) -> String {
+        timecode(t, hours: false)
+    }
+
+    /// `mm:ss.t`, or `h:mm:ss.t` when the timeline is an hour or longer.
+    static func timecode(_ t: TimeInterval, hours: Bool) -> String {
         let s = max(0, t)
-        let m = Int(s) / 60
-        let r = Int(s) % 60
-        let f = Int((s.truncatingRemainder(dividingBy: 1)) * 10)
-        return String(format: "%02d:%02d.%d", m, r, f)
+        let total = Int(s)
+        let frac = Int((s.truncatingRemainder(dividingBy: 1)) * 10)
+        if hours {
+            let h = total / 3600
+            let m = (total % 3600) / 60
+            let r = total % 60
+            return String(format: "%d:%02d:%02d.%d", h, m, r, frac)
+        }
+        let m = total / 60
+        let r = total % 60
+        return String(format: "%02d:%02d.%d", m, r, frac)
+    }
+
+    /// Accepts `5`, `5.5`, `1:30`, `1:30.5`, and `1:02:03.4`.
+    static func parseTimecode(_ raw: String) -> TimeInterval? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: ",", with: ".")
+        guard !trimmed.isEmpty else { return nil }
+        let parts = trimmed.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+        guard (1...3).contains(parts.count) else { return nil }
+        func whole(_ part: String) -> Int? {
+            guard let value = Int(part), value >= 0, part.allSatisfy(\.isNumber) else { return nil }
+            return value
+        }
+        switch parts.count {
+        case 1:
+            guard let seconds = Double(parts[0]), seconds >= 0 else { return nil }
+            return seconds
+        case 2:
+            guard let minutes = whole(parts[0]), let seconds = Double(parts[1]), seconds >= 0 else { return nil }
+            return TimeInterval(minutes) * 60 + seconds
+        default:
+            guard let hours = whole(parts[0]),
+                  let minutes = whole(parts[1]), minutes < 60,
+                  let seconds = Double(parts[2]), seconds >= 0, seconds < 60 else { return nil }
+            return TimeInterval(hours) * 3600 + TimeInterval(minutes) * 60 + seconds
+        }
     }
 }
 
@@ -23,7 +61,7 @@ enum InspectorValueFormat {
 }
 
 struct WindowConfigurator: NSViewRepresentable {
-    var title: String = "Studio Audio Lane"
+    var title: String = "StudioLane"
 
     func makeNSView(context: Context) -> WindowHookView {
         WindowHookView()
@@ -175,7 +213,7 @@ struct InspectorPane: View {
     }
 
     private var header: some View {
-        Text("Studio Audio Lane")
+        Text("StudioLane")
             .font(.system(size: 11, weight: .semibold))
             .tracking(0.7)
             .foregroundStyle(StudioTheme.text.opacity(0.45))

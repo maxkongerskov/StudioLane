@@ -24,7 +24,7 @@ struct StudioView: View {
         .frame(minWidth: 1100, minHeight: 620)
         .background(WindowConfigurator(title: model.projectDisplayName))
         .onAppear { model.start() }
-        .alert("Studio", isPresented: Binding(
+        .alert("StudioLane", isPresented: Binding(
             get: { model.errorMessage != nil },
             set: { if !$0 { model.errorMessage = nil } }
         )) {

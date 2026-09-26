@@ -1,8 +1,8 @@
 #!/bin/zsh
-# Build, wrap, and install Studio Audio Lane into /Applications.
+# Build, wrap, and install StudioLane into /Applications.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DEST="/Applications/Studio Audio Lane.app"
+DEST="/Applications/StudioLane.app"
 BUNDLE_ID="dev.maxkongerskov.StudioAudioLane"
 
 "$ROOT/scripts/bundle.sh"
@@ -21,7 +21,7 @@ if pgrep -f "${BUNDLE_ID}|StudioAudioLane.app/Contents/MacOS/StudioAudioLane" >/
 fi
 
 if [ -e "$DEST" ]; then
-  TRASH="$HOME/.Trash/Studio Audio Lane.app.$(date +%s)"
+  TRASH="$HOME/.Trash/StudioLane.app.$(date +%s)"
   mv "$DEST" "$TRASH"
 fi
 ditto "$APP" "$DEST"

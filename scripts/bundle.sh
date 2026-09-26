@@ -25,12 +25,12 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <plist version="1.0">
 <dict>
   <key>CFBundleDevelopmentRegion</key><string>en</string>
-  <key>CFBundleDisplayName</key><string>Studio Audio Lane</string>
+  <key>CFBundleDisplayName</key><string>StudioLane</string>
   <key>CFBundleExecutable</key><string>StudioAudioLane</string>
   <key>CFBundleIdentifier</key><string>dev.maxkongerskov.StudioAudioLane</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
-  <key>CFBundleName</key><string>Studio Audio Lane</string>
+  <key>CFBundleName</key><string>StudioLane</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>CFBundleVersion</key><string>1</string>
@@ -43,7 +43,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
       <key>UTTypeIdentifier</key>
       <string>dev.maxkongerskov.StudioAudioLane.project</string>
       <key>UTTypeDescription</key>
-      <string>Studio Audio Lane Project</string>
+      <string>StudioLane Project</string>
       <key>UTTypeConformsTo</key>
       <array>
         <string>public.json</string>
@@ -62,7 +62,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <array>
     <dict>
       <key>CFBundleTypeName</key>
-      <string>Studio Audio Lane Project</string>
+      <string>StudioLane Project</string>
       <key>CFBundleTypeRole</key>
       <string>Editor</string>
       <key>LSItemContentTypes</key>

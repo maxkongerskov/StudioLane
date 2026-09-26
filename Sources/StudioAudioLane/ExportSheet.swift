@@ -131,7 +131,7 @@ struct ExportSettings: Equatable {
     /// Explicit AAC kbps opts into the writer pipeline.
     var audioBitrate: AudioBitrate = .match
     /// Base file name without extension (shown/editable in the export sheet).
-    var fileBaseName: String = "StudioAudioLane"
+    var fileBaseName: String = "StudioLane"
 
     mutating func sanitize() {
         if codec.requiresMOV {
@@ -159,7 +159,7 @@ struct ExportSettings: Equatable {
             }
             return cleaned
         }()
-        return noExt.isEmpty ? "StudioAudioLane" : noExt
+        return noExt.isEmpty ? "StudioLane" : noExt
     }
 
     var availableContainers: [Container] {

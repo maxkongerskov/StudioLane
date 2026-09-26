@@ -9,6 +9,8 @@ struct TimelineView: View {
     @State private var dragOrigin: TimeInterval = 0
     @State private var dragClipID: UUID?
     @State private var lastPlayheadFollowAt: Date = .distantPast
+    @State private var isEditingPlayheadTime = false
+    @State private var playheadTimeHovering = false
 
     static let videoLaneHeight: CGFloat = 54
     static let audioLaneHeight: CGFloat = 52
@@ -148,12 +150,7 @@ struct TimelineView: View {
 
             HStack(spacing: 12) {
                 Spacer(minLength: 0)
-                Text(timeLabel)
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    .foregroundStyle(StudioTheme.muted)
-                    .monospacedDigit()
-                    .lineLimit(1)
-                    .fixedSize()
+                playheadClock
                 transportDivider
                 TransportIconButton(systemImage: "minus.magnifyingglass") { model.zoomOut() }
                 TransportIconButton(systemImage: "plus.magnifyingglass") { model.zoomIn() }
@@ -575,16 +572,46 @@ struct TimelineView: View {
         max(2, CGFloat(span / duration) * width)
     }
 
-    private var timeLabel: String {
-        "\(format(model.currentTime))  /  \(format(model.duration))"
+    private var showsHours: Bool {
+        model.currentTime >= 3600 || model.duration >= 3600
     }
 
-    private func format(_ t: TimeInterval) -> String {
-        let s = max(0, t)
-        let m = Int(s) / 60
-        let r = Int(s) % 60
-        let f = Int((s.truncatingRemainder(dividingBy: 1)) * 10)
-        return String(format: "%02d:%02d.%d", m, r, f)
+    private var playheadClock: some View {
+        HStack(spacing: 0) {
+            if isEditingPlayheadTime {
+                PlayheadTimeEditor(text: format(model.currentTime, hours: showsHours)) { typed in
+                    isEditingPlayheadTime = false
+                    if let time = StudioFormat.parseTimecode(typed) {
+                        model.seek(to: time)
+                    }
+                } onCancel: {
+                    isEditingPlayheadTime = false
+                }
+                .frame(width: showsHours ? 78 : 58)
+            } else {
+                Text(format(model.currentTime, hours: showsHours))
+                    .foregroundStyle(playheadTimeHovering ? StudioTheme.text : StudioTheme.muted)
+                    .contentShape(Rectangle())
+                    .onHover { playheadTimeHovering = $0 }
+                    .onTapGesture {
+                        isEditingPlayheadTime = true
+                    }
+                    .help("Jump to a time")
+                    .accessibilityLabel("Playhead time")
+                    .accessibilityHint("Enter hours, minutes, and seconds")
+                    .accessibilityAddTraits(.isButton)
+            }
+            Text("  /  \(format(model.duration, hours: showsHours))")
+                .foregroundStyle(StudioTheme.muted)
+        }
+        .font(.system(size: 11, weight: .medium, design: .monospaced))
+        .monospacedDigit()
+        .lineLimit(1)
+        .fixedSize()
+    }
+
+    private func format(_ t: TimeInterval, hours: Bool = false) -> String {
+        StudioFormat.timecode(t, hours: hours)
     }
 
     private func showClipMenu(clipID: UUID) {
@@ -808,6 +835,76 @@ struct AddLaneMenuButton: View {
         .help("Add lane")
         .accessibilityLabel("Add lane")
         .onHover { hovering = $0 }
+    }
+}
+
+/// A borderless field so the transport time can be typed without looking like a form.
+private struct PlayheadTimeEditor: NSViewRepresentable {
+    var text: String
+    var onCommit: (String) -> Void
+    var onCancel: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onCommit: onCommit, onCancel: onCancel)
+    }
+
+    func makeNSView(context: Context) -> NSTextField {
+        let field = NSTextField(string: text)
+        field.isBezeled = false
+        field.isBordered = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.font = .monospacedSystemFont(ofSize: 11, weight: .medium)
+        field.textColor = NSColor.white.withAlphaComponent(0.92)
+        field.alignment = .right
+        field.delegate = context.coordinator
+        field.setAccessibilityLabel("Playhead time")
+        DispatchQueue.main.async {
+            field.window?.makeFirstResponder(field)
+            field.currentEditor()?.selectAll(nil)
+        }
+        return field
+    }
+
+    func updateNSView(_ field: NSTextField, context: Context) {
+        context.coordinator.onCommit = onCommit
+        context.coordinator.onCancel = onCancel
+    }
+
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var onCommit: (String) -> Void
+        var onCancel: () -> Void
+        private var finished = false
+
+        init(onCommit: @escaping (String) -> Void, onCancel: @escaping () -> Void) {
+            self.onCommit = onCommit
+            self.onCancel = onCancel
+        }
+
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+                finish(commit: false, value: "")
+                control.window?.makeFirstResponder(nil)
+                return true
+            }
+            if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+                finish(commit: true, value: control.stringValue)
+                control.window?.makeFirstResponder(nil)
+                return true
+            }
+            return false
+        }
+
+        func controlTextDidEndEditing(_ obj: Notification) {
+            let value = (obj.object as? NSTextField)?.stringValue ?? ""
+            finish(commit: true, value: value)
+        }
+
+        private func finish(commit: Bool, value: String) {
+            guard !finished else { return }
+            finished = true
+            if commit { onCommit(value) } else { onCancel() }
+        }
     }
 }
 

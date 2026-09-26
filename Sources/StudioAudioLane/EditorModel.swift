@@ -864,7 +864,7 @@ final class EditorModel {
         panel.canCreateDirectories = true
         panel.isExtensionHidden = false
         panel.title = "Save Project"
-        panel.message = "Save Studio Audio Lane project"
+        panel.message = "Save StudioLane project"
         let defaultBase = (clipName == "No clip") ? "Untitled" : clipName
         panel.nameFieldStringValue = projectFileURL?.lastPathComponent ?? "\(defaultBase).salproject"
         panel.allowedContentTypes = [.salProject]
@@ -905,7 +905,7 @@ final class EditorModel {
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
         panel.title = "Open Project"
-        panel.message = "Open a Studio Audio Lane project"
+        panel.message = "Open a StudioLane project"
         panel.allowedContentTypes = [.salProject, .json]
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
@@ -2082,7 +2082,7 @@ final class EditorModel {
         let cleaned = raw
             .replacingOccurrences(of: "/", with: "-")
             .replacingOccurrences(of: ":", with: "-")
-        return cleaned.isEmpty ? "StudioAudioLane" : cleaned
+        return cleaned.isEmpty ? "StudioLane" : cleaned
     }
 
     private func startSessionExport(

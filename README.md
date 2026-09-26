@@ -1,36 +1,47 @@
-# Studio Audio Lane
+# StudioLane
 
-Native macOS prototype of a CleanShot X Studio feature: an **audio track under the video filmstrip**.
+A native macOS studio for cutting picture and sound together. Bring in a recording, lay music under it, trim and mix until both are clear, then export a finished movie.
 
-CleanShot X 5.0 is closed-source and signed. This is not a patch of their app. It is a working Studio-style editor that loads the Desktop recording and places a music lane beneath the video so the interaction can be demoed.
+Requires macOS 14 or later.
 
-## What it does
+## What you can do
 
-- Opens `CleanShot 2026-09-04 at 1.12.12 PM.cleanshotvideo`
-- Drops `Guten Morgen - Christian.wav` onto a new audio lane under the video
-- Mixes music + original recording audio with separate volumes
-- Play / scrub the timeline
-- Replace by dropping another audio file
-- Export a muxed MP4 to the Desktop
+The editor opens empty, or restores the last session. Drop video or audio on the preview, or choose File ▸ Open Media. Video lanes show a filmstrip. Audio lanes show a waveform. Add more lanes when one picture track and one music track are not enough.
+
+Clips can be trimmed, split at the playhead, moved, and duplicated. Each clip has a fade in, a fade out, and its own gain. Each lane has a volume, and a clip can be muted on its own. Playlist layout lines music up end to end. Layer layout lets clips overlap. Ducking pulls the music down under the recording.
+
+Play and scrub from the timeline. Zoom in without losing the lanes. Undo and redo follow the edits. Save a `.salproject`, or leave the session to autosave. Export an MP4, MOV, or M4V, including H.264, HEVC, and ProRes.
 
 ## Run
 
-Dev wrap (`.build/StudioAudioLane.app`):
+Build the app and open it:
 
 ```bash
 cd ~/Projects/StudioAudioLane
 ./scripts/launch.sh
 ```
 
-Install into `/Applications/Studio Audio Lane.app` (Spotlight, Launchpad, Dock, Finder):
+That writes `.build/StudioAudioLane.app` and launches it. The window opens at 1568×780, and can shrink to 1100×620.
+
+To put a copy in `/Applications`:
 
 ```bash
-cd ~/Projects/StudioAudioLane
 ./scripts/install.sh
 ```
 
-Or run the binary without wrapping:
+## Everyday controls
 
-```bash
-swift run -c release
-```
+| Action | Shortcut |
+| --- | --- |
+| Open media | ⌘O |
+| Save project | ⌘S |
+| Export | ⌘E |
+| Play / pause | Space |
+| Split at playhead | S |
+| Duplicate clip | ⌘D |
+| Delete clip | Delete |
+| Undo | ⌘Z |
+| Redo | ⇧⌘Z or ⌘Y |
+| Previous / next music clip | ⌥← / ⌥→ |
+
+Mark in, mark out, and loop live in the Audio menu. Fit to Video, Replace, and the fades sit on the selected clip.
