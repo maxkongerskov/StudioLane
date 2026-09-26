@@ -124,7 +124,7 @@ struct InspectorPane: View {
 
     /// Header plus the hairline under it. The action footer is measured to the
     /// three chip rows so it never covers the sliders above the timeline.
-    private var actionFooterHeight: CGFloat { selectedClip == nil ? 0 : 108 }
+    private var actionFooterHeight: CGFloat { selectedClip == nil ? 0 : 96 }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -144,8 +144,8 @@ struct InspectorPane: View {
                                 Rectangle()
                                     .fill(StudioTheme.hairline)
                                     .frame(height: 1)
-                                    .padding(.top, 16)
-                                    .padding(.bottom, 14)
+                                    .padding(.top, 8)
+                                    .padding(.bottom, 6)
                                 clipSection
                             }
                             .padding(.horizontal, 16)
@@ -159,7 +159,7 @@ struct InspectorPane: View {
                                 Rectangle().fill(StudioTheme.hairline).frame(height: 1)
                                 actionRow
                                     .padding(.horizontal, 16)
-                                    .padding(.vertical, 12)
+                                    .padding(.vertical, 8)
                             }
                             .frame(height: actionFooterHeight, alignment: .top)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -179,7 +179,7 @@ struct InspectorPane: View {
             .font(.system(size: 11, weight: .semibold))
             .tracking(0.7)
             .foregroundStyle(StudioTheme.text.opacity(0.45))
-            .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
+            .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
             .padding(.horizontal, 14)
     }
 
@@ -533,7 +533,7 @@ struct TrackRow<Volume: View>: View {
             }
         }
         .padding(.horizontal, 9)
-        .padding(.vertical, 6)
+        .padding(.vertical, 4)
         .background(
             RoundedRectangle(cornerRadius: 7, style: .continuous)
                 .fill(Color.white.opacity(isSelected ? 0.05 : (hovering ? 0.04 : 0)))
