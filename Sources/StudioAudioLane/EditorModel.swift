@@ -153,11 +153,16 @@ struct MediaClip: Identifiable, Codable {
                 : []
         )
         var sanitized = clip
-        let minimumClipDuration = 0.12
+        // Floors/ceilings go through the shared EditorModel constants (see
+        // renderableDuration's comment): stored duration must never exceed the
+        // media available from inPoint. A ceiling above that makes insertTimeRange
+        // throw and one tiny clip fails the entire timeline rebuild.
+        let minimumClipDuration = EditorModel.minimumClipDuration
         sanitized.inPoint = min(max(0, inPoint), max(0, sourceDuration - minimumClipDuration))
-        sanitized.duration = min(
-            max(duration, minimumClipDuration),
-            max(minimumClipDuration, sourceDuration - sanitized.inPoint)
+        sanitized.duration = EditorModel.renderableDuration(
+            requested: max(duration, min(minimumClipDuration, max(0, sourceDuration - sanitized.inPoint))),
+            sourceDuration: sourceDuration,
+            inPoint: sanitized.inPoint
         )
         sanitized.timelineStart = max(0, timelineStart)
         sanitized.clampFades()
@@ -523,7 +528,7 @@ final class EditorModel {
             selectedClipID = selectedClipIDs.first ?? videoClips.last?.id ?? audioClips.last?.id
         }
         scheduleAutosave()
-        Task { await rebuildComposition() }
+        scheduleRebuild()
     }
 
     enum AudioLayoutMode: Int, Hashable, CaseIterable, Codable {
@@ -554,10 +559,25 @@ final class EditorModel {
         max(duration, timelineSpan, 0.0001)
     }
 
-    static let minimumClipDuration: TimeInterval = 0.12
+    // nonisolated: immutable Sendable constants, needed by MediaClip.sanitized()
+    // which runs outside the main actor (project/autosave decode).
+    nonisolated static let minimumClipDuration: TimeInterval = 0.12
     /// Floor for a clip's rendered duration. Composition inserts `max(0.05, clip.duration)`,
     /// so keep the stored duration no larger than the media — a 50 ms file must not become 0.12 s.
-    static let minimumRenderedDuration: TimeInterval = 0.05
+    nonisolated static let minimumRenderedDuration: TimeInterval = 0.05
+
+    /// Duration a clip can actually render: never more than the media available from
+    /// `inPoint`. `insertTimeRange` throws when asked for more than the source holds,
+    /// and one bad insert fails the entire timeline rebuild — so the rendered floor
+    /// applies only when the media can supply it, never inflating a shorter file.
+    nonisolated static func renderableDuration(
+        requested: TimeInterval,
+        sourceDuration: TimeInterval,
+        inPoint: TimeInterval
+    ) -> TimeInterval {
+        let available = max(0, sourceDuration - max(0, inPoint))
+        return min(max(minimumRenderedDuration, requested), available)
+    }
 
     func growTimelineSpan() {
         if duration <= 0 {
@@ -611,6 +631,12 @@ final class EditorModel {
     private var endObserver: NSObjectProtocol?
     private var mix = AVMutableComposition()
     private var rebuildTask: Task<Void, Never>?
+    /// Bumped every time a rebuild is scheduled; lets `waitForRebuildsToSettle()`
+    /// detect a newer rebuild queued while it was awaiting an older one.
+    private var rebuildGeneration = 0
+    /// Bumped by export start/cancel so a deferred snapshot (queued behind a
+    /// pending rebuild) can tell whether its export intent is still valid.
+    private var exportIntent = 0
     private var renderSize = CGSize(width: 1380, height: 2304)
     private var frameDuration = CMTime(value: 1, timescale: 60)
     private var musicTrackIDs: [UUID: CMPersistentTrackID] = [:]
@@ -623,7 +649,26 @@ final class EditorModel {
     private var history: [EditorSnapshot] = []
     private var future: [EditorSnapshot] = []
     private var autosaveTimer: Timer?
+    /// Lock-box token for the writer pipeline. `Task.isCancelled` is always false
+    /// inside `requestMediaDataWhenReady` callbacks (they run on raw dispatch queues
+    /// with no task context), so `cancelExport()` flips this flag instead (HIGH-2).
+    final class ExportCancelFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cancelled = false
+        func cancel() {
+            lock.lock()
+            cancelled = true
+            lock.unlock()
+        }
+        var value: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return cancelled
+        }
+    }
+
     private var activeExportSession: AVAssetExportSession?
+    private var exportCancelFlag: ExportCancelFlag?
     private var exportProgressTimer: Timer?
     private var exportWriterTask: Task<Void, Never>?
     /// Destination of the in-flight export; used to delete incomplete files on cancel/failure.
@@ -637,11 +682,11 @@ final class EditorModel {
     }
 
     /// Public bridge for MCP server — the MCP layer calls these instead of reaching into private state.
-    func addVideoPublic(url: URL, start: TimeInterval?, ontoTrackID: UUID) async {
+    func addVideoPublic(url: URL, start: TimeInterval?, ontoTrackID: UUID) async -> Bool {
         await addVideo(url, fade: 0, at: start, ontoTrackID: ontoTrackID)
     }
 
-    func addAudioPublic(url: URL, start: TimeInterval?, ontoTrackID: UUID) async {
+    func addAudioPublic(url: URL, start: TimeInterval?, ontoTrackID: UUID) async -> Bool {
         await addAudio(url, fade: 0, at: start, ontoTrackID: ontoTrackID)
     }
 
@@ -654,22 +699,44 @@ final class EditorModel {
         deleteClip(clipID: clipID)
     }
     func rebuildCompositionPublic() async {
-        await rebuildComposition()
+        await rebuildAndWait()
     }
     func applyFadesPublic() {
         applyFades()
     }
 
     /// MCP export entry point — bypasses the save panel.
-    func beginExportDirect(settings: ExportSettings, destination: URL) {
-        guard !isExporting, let item = player.currentItem else { return }
+    /// Returns false when nothing was started (export already running / empty timeline),
+    /// so the MCP layer can report failure instead of a fake `"started"` (HIGH-3).
+    @discardableResult
+    func beginExportDirect(settings: ExportSettings, destination: URL) -> Bool {
+        guard !isExporting, player.currentItem != nil else { return false }
         var settings = settings
         settings.sanitize()
 
-        try? FileManager.default.removeItem(at: destination)
+        // Claim the export slot now; if a rebuild is mid-flight, wait for it before
+        // snapshotting so the item's asset and the fade instructions come from the
+        // same composition (CRITICAL-1).
         isExporting = true
         exportProgress = 0
         errorMessage = nil
+        exportIntent += 1
+        let intent = exportIntent
+        Task { @MainActor in
+            await self.waitForRebuildsToSettle()
+            guard self.isExporting, self.exportIntent == intent else { return }
+            self.startExportSnapshot(settings: settings, destination: destination)
+        }
+        return true
+    }
+
+    private func startExportSnapshot(settings: ExportSettings, destination: URL) {
+        guard let item = player.currentItem else {
+            isExporting = false
+            status = "Nothing to export"
+            return
+        }
+        try? FileManager.default.removeItem(at: destination)
         exportDestinationURL = destination
         let pipeline = settings.prefersWriterPipeline ? "writer" : "session"
         status = "Exporting… (\(pipeline), \(settings.codec.rawValue)/\(settings.container.rawValue))"
@@ -742,7 +809,7 @@ final class EditorModel {
         bumpMCPRevision()
         projectFileURL = nil
         scheduleAutosave()
-        await rebuildComposition()
+        await rebuildAndWait()
     }
 
     /// MCP save entry point — bypasses the save panel after template creation.
@@ -1021,7 +1088,7 @@ final class EditorModel {
             currentTime = 0
         }
         regenerateMissingVisuals()
-        Task { await rebuildComposition() }
+        scheduleRebuild()
         return true
     }
 
@@ -1325,12 +1392,12 @@ final class EditorModel {
         var clip = audioClips[i]
         // A clip parked after the video end would otherwise stay put at the trim floor.
         // Re-anchor it so it ends within the video span before shortening.
-        let sourceMax = max(Self.minimumRenderedDuration, clip.sourceDuration - clip.inPoint)
+        let sourceMax = Self.renderableDuration(requested: clip.sourceDuration, sourceDuration: clip.sourceDuration, inPoint: clip.inPoint)
         if clip.timelineStart >= videoEnd - Self.minimumRenderedDuration {
             clip.timelineStart = max(0, videoEnd - sourceMax)
         }
         let remaining = max(Self.minimumRenderedDuration, videoEnd - clip.timelineStart)
-        let maxDur = max(Self.minimumRenderedDuration, clip.sourceDuration - clip.inPoint)
+        let maxDur = Self.renderableDuration(requested: remaining, sourceDuration: clip.sourceDuration, inPoint: clip.inPoint)
         clip.duration = min(remaining, maxDur)
         clip.clampFades()
         audioClips[i] = clip
@@ -1401,7 +1468,7 @@ final class EditorModel {
             applyPlaylistCrossfades()
         }
         scheduleAutosave()
-        Task { await rebuildComposition() }
+        scheduleRebuild()
     }
 
     func deleteClip(clipID: UUID) {
@@ -1425,7 +1492,7 @@ final class EditorModel {
             applyPlaylistCrossfades()
         }
         scheduleAutosave()
-        Task { await rebuildComposition() }
+        scheduleRebuild()
     }
 
     func deleteVideoTrack() {
@@ -1440,7 +1507,7 @@ final class EditorModel {
         }
         focusedLane = .video
         scheduleAutosave()
-        Task { await rebuildComposition() }
+        scheduleRebuild()
     }
 
     func deleteMusicTrack() {
@@ -1454,7 +1521,7 @@ final class EditorModel {
         }
         focusedLane = .audio
         scheduleAutosave()
-        Task { await rebuildComposition() }
+        scheduleRebuild()
     }
 
     func toggleMuteSelectedAudio() {
@@ -1870,15 +1937,42 @@ final class EditorModel {
             applyPlaylistCrossfades()
         }
         growTimelineSpan()
-        rebuildTask?.cancel()
-        rebuildTask = Task { await rebuildComposition() }
-        scheduleAutosave()
+        rebuild()
     }
 
     private func rebuild() {
-        rebuildTask?.cancel()
-        rebuildTask = Task { await rebuildComposition() }
+        scheduleRebuild()
         scheduleAutosave()
+    }
+
+    /// The single serialization point for composition rebuilds: always cancels the
+    /// in-flight task and takes over `rebuildTask`, so two rebuilds can never mutate
+    /// the shared track-ID maps at once (HIGH-1).
+    private func scheduleRebuild() {
+        rebuildTask?.cancel()
+        rebuildGeneration += 1
+        rebuildTask = Task { await rebuildComposition() }
+    }
+
+    /// Schedules a rebuild and waits until no rebuild is pending — for async
+    /// mutators (add/import/template) that must not return a half-built timeline.
+    private func rebuildAndWait() async {
+        scheduleRebuild()
+        await waitForRebuildsToSettle()
+    }
+
+    func scheduleRebuildPublic() { scheduleRebuild() }
+
+    /// Awaits the pending composition rebuild (if any) until no newer one has been
+    /// queued in the meantime. Export snapshots must pair the player item's asset
+    /// with fade instructions derived from the same model state (CRITICAL-1).
+    private func waitForRebuildsToSettle() async {
+        while true {
+            guard let task = rebuildTask else { return }
+            let generation = rebuildGeneration
+            await task.value
+            if generation == rebuildGeneration { return }
+        }
     }
 
     var duckingGain: Float { isDuckingMusic ? 0.22 : 1.0 }
@@ -2011,7 +2105,7 @@ final class EditorModel {
     }
 
     func beginExport(with settings: ExportSettings) {
-        guard !isExporting, let item = player.currentItem else { return }
+        guard !isExporting, player.currentItem != nil else { return }
         var settings = settings
         settings.sanitize()
 
@@ -2030,38 +2124,26 @@ final class EditorModel {
             return dest.deletingPathExtension().appendingPathExtension(ext)
         }()
 
-        try? FileManager.default.removeItem(at: finalURL)
+        // Claim the export slot now; if a rebuild is mid-flight, wait for it before
+        // snapshotting so the item's asset and the fade instructions come from the
+        // same composition (CRITICAL-1).
         isExporting = true
         exportProgress = 0
         errorMessage = nil
-        exportDestinationURL = finalURL
-        let pipeline = settings.prefersWriterPipeline ? "writer" : "session"
-        status = "Exporting… (\(pipeline), \(settings.codec.rawValue)/\(settings.container.rawValue))"
-
-        let videoComposition = makeExportVideoComposition(settings: settings)
-        let audioMix = item.audioMix ?? makeAudioMix()
-
-        if settings.prefersWriterPipeline {
-            startWriterExport(
-                asset: item.asset,
-                settings: settings,
-                destination: finalURL,
-                videoComposition: videoComposition,
-                audioMix: audioMix
-            )
-        } else {
-            startSessionExport(
-                asset: item.asset,
-                settings: settings,
-                destination: finalURL,
-                videoComposition: videoComposition,
-                audioMix: audioMix
-            )
+        exportIntent += 1
+        let intent = exportIntent
+        Task { @MainActor in
+            await self.waitForRebuildsToSettle()
+            guard self.isExporting, self.exportIntent == intent else { return }
+            self.startExportSnapshot(settings: settings, destination: finalURL)
         }
     }
 
     func cancelExport() {
+        exportIntent += 1 // abort any snapshot deferred behind a pending rebuild
         activeExportSession?.cancelExport()
+        exportCancelFlag?.cancel()
+        exportCancelFlag = nil
         exportWriterTask?.cancel()
         exportWriterTask = nil
         stopExportProgressTimer()
@@ -2130,8 +2212,12 @@ final class EditorModel {
         exporter.exportAsynchronously { [weak self] in
             let status = exporter.status
             let message = exporter.error?.localizedDescription
+            let exporterID = ObjectIdentifier(exporter)
             Task { @MainActor in
                 guard let self else { return }
+                // A cancelled or superseded exporter must not nil out the current
+                // export's session or stop its progress timer (HIGH-2).
+                guard self.activeExportSession.map(ObjectIdentifier.init) == exporterID else { return }
                 self.activeExportSession = nil
                 switch status {
                 case .completed:
@@ -2172,6 +2258,9 @@ final class EditorModel {
             }
         }
 
+        let cancelFlag = ExportCancelFlag()
+        exportCancelFlag = cancelFlag
+        let intent = exportIntent
         exportWriterTask = Task { [weak self] in
             guard let self else { return }
             do {
@@ -2188,13 +2277,18 @@ final class EditorModel {
                     audioBitRate: audioBitRate,
                     videoComposition: unsafeVideoComposition,
                     audioMix: unsafeAudioMix,
-                    isCancelled: { Task.isCancelled },
+                    isCancelled: { cancelFlag.value },
                     onProgress: onProgress
                 )
+                // A cancelled/superseded export must not report success for a
+                // truncated file or stomp the next export's state (HIGH-2).
+                guard self.exportIntent == intent else { return }
                 self.finishExport(success: true, destination: destination, message: nil)
             } catch is CancellationError {
+                guard self.exportIntent == intent else { return }
                 self.finishExport(success: false, destination: destination, message: "Export cancelled", reveal: false)
             } catch {
+                guard self.exportIntent == intent else { return }
                 self.finishExport(
                     success: false,
                     destination: destination,
@@ -2348,6 +2442,11 @@ final class EditorModel {
                 done = true
                 return true
             }
+            func isFired() -> Bool {
+                lock.lock()
+                defer { lock.unlock() }
+                return done
+            }
         }
 
         final class FailureBox: @unchecked Sendable {
@@ -2365,94 +2464,125 @@ final class EditorModel {
             }
         }
 
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            let group = DispatchGroup()
-            let videoDone = OnceFlag()
-            let audioDone = OnceFlag()
-            let resumeOnce = OnceFlag()
-            let failure = FailureBox()
-
-            @Sendable func finishInput(_ flag: OnceFlag, input: AVAssetWriterInput?, leave: Bool) {
-                if flag.fire() {
-                    input?.markAsFinished()
-                    if leave { group.leave() }
-                }
-            }
-
-            group.enter()
-            writerVideo.requestMediaDataWhenReady(on: DispatchQueue(label: "studio.export.video")) {
-                while writerVideo.isReadyForMoreMediaData {
-                    if isCancelled() {
-                        reader.cancelReading()
-                        writer.cancelWriting()
-                        finishInput(videoDone, input: writerVideo, leave: true)
-                        return
-                    }
-                    if let sample = readerVideo.copyNextSampleBuffer() {
-                        let pts = CMSampleBufferGetPresentationTimeStamp(sample).seconds
-                        onProgress(min(0.99, max(0, pts / durationSeconds)))
-                        if !writerVideo.append(sample) {
-                            failure.set(writer.error?.localizedDescription ?? "Video append failed")
-                            reader.cancelReading()
-                            finishInput(videoDone, input: writerVideo, leave: true)
-                            return
-                        }
-                    } else {
-                        if reader.status == .failed {
-                            failure.set(reader.error?.localizedDescription ?? "Video read failed")
-                        }
-                        finishInput(videoDone, input: writerVideo, leave: true)
-                        return
+        // Task cancellation must unblock the reader/writer callbacks right away —
+        // they run on raw dispatch queues that observe neither task nor flag until
+        // the next sample arrives (HIGH-2).
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let group = DispatchGroup()
+                let videoDone = OnceFlag()
+                let audioDone = OnceFlag()
+                let resumeOnce = OnceFlag()
+                let failure = FailureBox()
+    
+                @Sendable func finishInput(_ flag: OnceFlag, input: AVAssetWriterInput?, leave: Bool) {
+                    if flag.fire() {
+                        input?.markAsFinished()
+                        if leave { group.leave() }
                     }
                 }
-            }
-
-            if let writerAudio, let readerAudio {
+    
                 group.enter()
-                writerAudio.requestMediaDataWhenReady(on: DispatchQueue(label: "studio.export.audio")) {
-                    while writerAudio.isReadyForMoreMediaData {
+                writerVideo.requestMediaDataWhenReady(on: DispatchQueue(label: "studio.export.video")) {
+                    while writerVideo.isReadyForMoreMediaData {
                         if isCancelled() {
                             reader.cancelReading()
                             writer.cancelWriting()
-                            finishInput(audioDone, input: writerAudio, leave: true)
+                            finishInput(videoDone, input: writerVideo, leave: true)
                             return
                         }
-                        if let sample = readerAudio.copyNextSampleBuffer() {
-                            if !writerAudio.append(sample) {
-                                failure.set(writer.error?.localizedDescription ?? "Audio append failed")
+                        if let sample = readerVideo.copyNextSampleBuffer() {
+                            let pts = CMSampleBufferGetPresentationTimeStamp(sample).seconds
+                            onProgress(min(0.99, max(0, pts / durationSeconds)))
+                            if !writerVideo.append(sample) {
+                                failure.set(writer.error?.localizedDescription ?? "Video append failed")
                                 reader.cancelReading()
-                                finishInput(audioDone, input: writerAudio, leave: true)
+                                finishInput(videoDone, input: writerVideo, leave: true)
                                 return
                             }
                         } else {
                             if reader.status == .failed {
-                                failure.set(reader.error?.localizedDescription ?? "Audio read failed")
+                                failure.set(reader.error?.localizedDescription ?? "Video read failed")
                             }
-                            finishInput(audioDone, input: writerAudio, leave: true)
+                            finishInput(videoDone, input: writerVideo, leave: true)
                             return
                         }
                     }
                 }
-            }
-
-            group.notify(queue: DispatchQueue.global(qos: .userInitiated)) {
-                guard resumeOnce.fire() else { return }
-                if isCancelled() {
-                    continuation.resume(throwing: CancellationError())
-                    return
+    
+                if let writerAudio, let readerAudio {
+                    group.enter()
+                    writerAudio.requestMediaDataWhenReady(on: DispatchQueue(label: "studio.export.audio")) {
+                        while writerAudio.isReadyForMoreMediaData {
+                            if isCancelled() {
+                                reader.cancelReading()
+                                writer.cancelWriting()
+                                finishInput(audioDone, input: writerAudio, leave: true)
+                                return
+                            }
+                            if let sample = readerAudio.copyNextSampleBuffer() {
+                                if !writerAudio.append(sample) {
+                                    failure.set(writer.error?.localizedDescription ?? "Audio append failed")
+                                    reader.cancelReading()
+                                    finishInput(audioDone, input: writerAudio, leave: true)
+                                    return
+                                }
+                            } else {
+                                if reader.status == .failed {
+                                    failure.set(reader.error?.localizedDescription ?? "Audio read failed")
+                                }
+                                finishInput(audioDone, input: writerAudio, leave: true)
+                                return
+                            }
+                        }
+                    }
                 }
-                if let message = failure.get() {
-                    continuation.resume(
-                        throwing: NSError(
-                            domain: "StudioAudioLane",
-                            code: 8,
-                            userInfo: [NSLocalizedDescriptionKey: message]
+    
+                group.notify(queue: DispatchQueue.global(qos: .userInitiated)) {
+                    guard resumeOnce.fire() else { return }
+                    if isCancelled() {
+                        continuation.resume(throwing: CancellationError())
+                        return
+                    }
+                    if let message = failure.get() {
+                        continuation.resume(
+                            throwing: NSError(
+                                domain: "StudioAudioLane",
+                                code: 8,
+                                userInfo: [NSLocalizedDescriptionKey: message]
+                            )
                         )
-                    )
-                    return
+                        return
+                    }
+                    continuation.resume()
                 }
-                continuation.resume()
+
+                // If the pipeline dies in a way that never re-invokes a
+                // requestMediaDataWhenReady callback, that input's group.leave
+                // never happens and the continuation above would hang forever.
+                // Poll for cancellation or a terminal reader/writer state and
+                // force the outstanding inputs to finish so the group drains.
+                func drainIfDead() {
+                    guard isCancelled() || writer.status == .cancelled || writer.status == .failed || reader.status == .failed else { return }
+                    reader.cancelReading()
+                    writer.cancelWriting()
+                    finishInput(videoDone, input: writerVideo, leave: true)
+                    if let writerAudio { finishInput(audioDone, input: writerAudio, leave: true) }
+                }
+
+                let watchdog = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
+                watchdog.schedule(deadline: .now() + 0.05, repeating: 0.05)
+                watchdog.setEventHandler { [weak watchdog] in
+                    drainIfDead()
+                    if videoDone.isFired() && (writerAudio == nil || audioDone.isFired()) {
+                        watchdog?.cancel()
+                    }
+                }
+                watchdog.resume()
             }
+        } onCancel: {
+            reader.cancelReading()
+            writer.cancelWriting()
         }
 
         if isCancelled() {
@@ -2492,6 +2622,7 @@ final class EditorModel {
         stopExportProgressTimer()
         activeExportSession = nil
         exportWriterTask = nil
+        exportCancelFlag = nil
         isExporting = false
         exportDestinationURL = nil
 
@@ -2640,13 +2771,13 @@ final class EditorModel {
         }
     }
 
+    @discardableResult
     private func addVideo(
         _ url: URL,
         fade: TimeInterval = 0,
         at start: TimeInterval? = nil,
         ontoTrackID: UUID? = nil
-    ) async {
-        if !isLoading { pushHistory() }
+    ) async -> Bool {
         let trackID = ontoTrackID ?? focusedVideoTrackID()
         let placed: TimeInterval
         if let start {
@@ -2656,19 +2787,23 @@ final class EditorModel {
                 ?? videoClips.map(\.timelineEnd).max()
                 ?? 0
         }
-        let clip = await makeClip(url: url, start: placed, fade: fade, trackID: trackID)
+        // Validate before pushing history so a rejected import leaves no undo step.
+        guard let clip = await makeClip(url: url, start: placed, fade: fade, trackID: trackID, requiresMediaType: .video) else { return false }
+        if !isLoading { pushHistory() }
         videoClips.append(clip)
         selectedClipID = clip.id
         selectedClipIDs = [clip.id]
         focusedLane = .video
         focusedTrackID = trackID
         growTimelineSpan()
-        await rebuildComposition()
+        await rebuildAndWait()
         scheduleFilmstrip(for: clip)
+        return true
     }
 
     /// Places full `sourceDuration` — never silently truncates to remaining video.
     /// Use `fitSelectedMusicToVideo` when truncate is desired.
+    @discardableResult
     private func addAudio(
         _ url: URL,
         fade: TimeInterval = 0,
@@ -2677,14 +2812,11 @@ final class EditorModel {
         ontoTrackID: UUID? = nil,
         recordsHistory: Bool = true,
         normalize: Bool = true
-    ) async {
+    ) async -> Bool {
         let trackID = ontoTrackID ?? focusedAudioTrackID()
         if replaceSelected, let id = selectedAudio?.id, let i = audioIndex(id) {
-            await replaceAudio(at: i, with: url)
-            return
+            return await replaceAudio(at: i, with: url)
         }
-        if recordsHistory, !isLoading { pushHistory() }
-
         let laneClips = audioClips.filter { $0.trackID == trackID }
         let placed: TimeInterval
         if let start {
@@ -2698,7 +2830,8 @@ final class EditorModel {
         // Playlist insert: ripple push clips on THIS lane that start at/after drop time.
         var insertAt = placed
         if audioLayoutMode == .playlist, start != nil {
-            let provisional = await makeClip(url: url, start: placed, fade: fade, trackID: trackID)
+            guard let provisional = await makeClip(url: url, start: placed, fade: fade, trackID: trackID, requiresMediaType: .audio) else { return false }
+            if recordsHistory, !isLoading { pushHistory() }
             let newDur = provisional.duration
             for i in audioClips.indices where audioClips[i].trackID == trackID && audioClips[i].timelineStart >= placed - 0.0001 {
                 audioClips[i].timelineStart += newDur
@@ -2717,14 +2850,15 @@ final class EditorModel {
                 applyPlaylistCrossfades(trackID: trackID)
             }
             growTimelineSpan()
-            await rebuildComposition()
-            return
+            await rebuildAndWait()
+            return true
         }
 
-        var clip = await makeClip(url: url, start: insertAt, fade: fade, trackID: trackID)
+        guard var clip = await makeClip(url: url, start: insertAt, fade: fade, trackID: trackID, requiresMediaType: .audio) else { return false }
+        if recordsHistory, !isLoading { pushHistory() }
         // Full source — grow timeline; do NOT truncate to remaining video.
-        // Floor with the rendered minimum, not the trim floor, so a short file isn't inflated.
-        clip.duration = max(Self.minimumRenderedDuration, clip.sourceDuration)
+        // Capped at the media actually available so `insertTimeRange` can't throw.
+        clip.duration = Self.renderableDuration(requested: clip.sourceDuration, sourceDuration: clip.sourceDuration, inPoint: 0)
         clip.clampFades()
         audioClips.append(clip)
         selectedClipID = clip.id
@@ -2737,23 +2871,32 @@ final class EditorModel {
             applyPlaylistCrossfades(trackID: trackID)
         }
         growTimelineSpan()
-        await rebuildComposition()
+        await rebuildAndWait()
+        return true
     }
 
-    private func replaceAudio(at index: Int, with url: URL) async {
+    @discardableResult
+    private func replaceAudio(at index: Int, with url: URL) async -> Bool {
+        let asset = AVURLAsset(url: url)
+        let loadedSource = try? await asset.load(.duration).seconds
+        let hasAudioTrack = !((try? await asset.loadTracks(withMediaType: .audio)) ?? []).isEmpty
+        guard let loadedSource, loadedSource.isFinite, loadedSource > 0, hasAudioTrack else {
+            errorMessage = "Can't replace with “\(url.lastPathComponent)” — the file is unsupported, corrupt, or has no audio track."
+            return false
+        }
         pushHistory()
         let old = audioClips[index]
-        let asset = AVURLAsset(url: url)
-        let source = (try? await asset.load(.duration).seconds) ?? old.sourceDuration
+        let source = loadedSource
         var clip = old
         clip.id = UUID()
         clip.url = url
         clip.name = url.deletingPathExtension().lastPathComponent
         clip.sourceDuration = source
         clip.inPoint = 0
-        // Keep timelineStart; keep duration if it fits, else stretch to full source.
-        let keepDur = min(old.duration, max(Self.minimumRenderedDuration, source))
-        clip.duration = keepDur > Self.minimumRenderedDuration ? keepDur : max(Self.minimumRenderedDuration, source)
+        // Keep timelineStart; keep duration if it fits, else stretch to full source —
+        // but never past what the new media can actually render.
+        let keepDur = min(old.duration, Self.renderableDuration(requested: source, sourceDuration: source, inPoint: 0))
+        clip.duration = keepDur > Self.minimumRenderedDuration ? keepDur : Self.renderableDuration(requested: source, sourceDuration: source, inPoint: 0)
         clip.waveform = []
         clip.clampFades()
         audioClips[index] = clip
@@ -2766,13 +2909,34 @@ final class EditorModel {
             applyPlaylistCrossfades()
         }
         growTimelineSpan()
-        await rebuildComposition()
+        await rebuildAndWait()
+        return true
     }
 
-    private func makeClip(url: URL, start: TimeInterval, fade: TimeInterval, trackID: UUID) async -> MediaClip {
+    /// Returns nil (with `errorMessage` set) when the file can't be read or lacks the
+    /// media kind the lane needs. An unloadable clip would become an invisible ghost:
+    /// rebuild silently skips it, and the next reload drops it via `sanitized()` (HIGH-3).
+    private func makeClip(
+        url: URL,
+        start: TimeInterval,
+        fade: TimeInterval,
+        trackID: UUID,
+        requiresMediaType: AVMediaType? = nil
+    ) async -> MediaClip? {
         let asset = AVURLAsset(url: url)
         let source = (try? await asset.load(.duration).seconds) ?? 0
-        let dur = max(Self.minimumRenderedDuration, source)
+        guard source.isFinite, source > 0 else {
+            errorMessage = "Can't read “\(url.lastPathComponent)” — the file is unsupported or corrupt."
+            return nil
+        }
+        if let mediaType = requiresMediaType {
+            let tracks = (try? await asset.loadTracks(withMediaType: mediaType)) ?? []
+            guard !tracks.isEmpty else {
+                errorMessage = "“\(url.lastPathComponent)” has no \(mediaType.rawValue) track to place here."
+                return nil
+            }
+        }
+        let dur = Self.renderableDuration(requested: source, sourceDuration: source, inPoint: 0)
         return MediaClip(
             id: UUID(),
             url: url,
@@ -2955,8 +3119,12 @@ final class EditorModel {
         if Task.isCancelled { return }
         do {
             let rebuiltMix = AVMutableComposition()
-            musicTrackIDs = [:]
-            videoAudioTrackIDs = [:]
+            // Build the track-ID maps in locals and publish them together with
+            // `mix` at the commit point below — a cancelled or superseded rebuild
+            // must never leave the shared maps describing a composition that is
+            // not loaded (HIGH-1).
+            var newVideoAudioTrackIDs: [UUID: CMPersistentTrackID] = [:]
+            var newMusicTrackIDs: [UUID: CMPersistentTrackID] = [:]
 
             let videoTrack = rebuiltMix.addMutableTrack(withMediaType: .video, preferredTrackID: 1)
 
@@ -2968,6 +3136,7 @@ final class EditorModel {
             // the single source of truth for that collapse, and `makeVideoComposition` derives
             // its instructions from the same segments so they can't disagree.
             for segment in renderSegments() {
+                if Task.isCancelled { return }
                 let asset = AVURLAsset(url: segment.clip.url)
                 guard let src = try await asset.loadTracks(withMediaType: .video).first, let videoTrack else { continue }
                 try videoTrack.insertTimeRange(
@@ -2989,39 +3158,47 @@ final class EditorModel {
             // Each video clip gets its own audio track so `makeAudioMix` can attach one
             // `AVAudioMixInputParameters` per clip (a shared track drops earlier clips' fades).
             for clip in videoClips.sorted(by: { $0.timelineStart < $1.timelineStart }) {
+                if Task.isCancelled { return }
                 let asset = AVURLAsset(url: clip.url)
                 guard let src = try await asset.loadTracks(withMediaType: .audio).first else { continue }
                 guard let track = rebuiltMix.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) else { continue }
                 let start = max(0, clip.timelineStart)
-                let duration = max(Self.minimumRenderedDuration, min(clip.duration, clip.timelineEnd - start))
+                let duration = Self.renderableDuration(requested: min(clip.duration, clip.timelineEnd - start), sourceDuration: clip.sourceDuration, inPoint: clip.inPoint)
                 try track.insertTimeRange(
                     CMTimeRange(start: CMTime(seconds: clip.inPoint, preferredTimescale: 600), duration: CMTime(seconds: duration, preferredTimescale: 600)),
                     of: src,
                     at: CMTime(seconds: start, preferredTimescale: 600)
                 )
-                videoAudioTrackIDs[clip.id] = track.trackID
+                newVideoAudioTrackIDs[clip.id] = track.trackID
             }
             for clip in audioClips where !clip.muted {
+                if Task.isCancelled { return }
                 let asset = AVURLAsset(url: clip.url)
                 guard let src = try await asset.loadTracks(withMediaType: .audio).first else { continue }
                 // Let AVFoundation allocate the track ID; a fixed preferred ID can be
                 // rejected after repeated rebuilds, which used to crash on force-unwrap.
                 guard let track = rebuiltMix.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) else { continue }
                 try track.insertTimeRange(
-                    CMTimeRange(start: CMTime(seconds: clip.inPoint, preferredTimescale: 600), duration: CMTime(seconds: max(0.05, clip.duration), preferredTimescale: 600)),
+                    CMTimeRange(start: CMTime(seconds: clip.inPoint, preferredTimescale: 600), duration: CMTime(seconds: Self.renderableDuration(requested: clip.duration, sourceDuration: clip.sourceDuration, inPoint: clip.inPoint), preferredTimescale: 600)),
                     of: src,
                     at: CMTime(seconds: clip.timelineStart, preferredTimescale: 600)
                 )
-                musicTrackIDs[clip.id] = track.trackID
+                newMusicTrackIDs[clip.id] = track.trackID
             }
 
             if Task.isCancelled { return }
+            // Commit `mix` and the track-ID maps together BEFORE building the player
+            // item: makeAudioMix()/makeVideoComposition() read them (track IDs, layer
+            // instructions), so assigning after would pair the new item with the
+            // PREVIOUS composition — video fades silently vanish after every edit.
+            mix = rebuiltMix
+            videoAudioTrackIDs = newVideoAudioTrackIDs
+            musicTrackIDs = newMusicTrackIDs
             let item = AVPlayerItem(asset: rebuiltMix)
             item.audioMix = makeAudioMix()
             item.videoComposition = makeVideoComposition()
             let wasPlaying = isPlaying
             player.replaceCurrentItem(with: item)
-            mix = rebuiltMix
             seek(to: min(currentTime, duration))
             if wasPlaying {
                 player.play()
@@ -3122,7 +3299,7 @@ final class EditorModel {
         var videoTrackEnd: TimeInterval = 0
         for clip in videoClips.sorted(by: { $0.timelineStart < $1.timelineStart }) {
             let start = max(0, clip.timelineStart)
-            let desired = max(Self.minimumRenderedDuration, clip.duration)
+            let desired = Self.renderableDuration(requested: clip.duration, sourceDuration: clip.sourceDuration, inPoint: clip.inPoint)
             let clipEnd = start + desired
             if start >= videoTrackEnd - 0.0001 {
                 // No overlap: lay the whole clip.

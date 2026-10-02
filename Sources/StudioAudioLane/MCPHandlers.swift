@@ -108,12 +108,22 @@ enum MCPHandlers {
             trackID = kind == .video ? EditorModel.defaultVideoTrackID : EditorModel.defaultAudioTrackID
         }
 
-        model.bumpMCPRevision()
+        // Revision is bumped only on success — a rejected import must not shift
+        // the revision the client is tracking.
+        let added: Bool
         if kind == .video {
-            await model.addVideoPublic(url: url, start: start.map { TimeInterval($0) }, ontoTrackID: trackID)
+            added = await model.addVideoPublic(url: url, start: start.map { TimeInterval($0) }, ontoTrackID: trackID)
         } else {
-            await model.addAudioPublic(url: url, start: start.map { TimeInterval($0) }, ontoTrackID: trackID)
+            added = await model.addAudioPublic(url: url, start: start.map { TimeInterval($0) }, ontoTrackID: trackID)
         }
+        guard added else {
+            return .failure(MCPErrorResponse(
+                error: "import_failed",
+                message: model.errorMessage ?? "Could not import \(url.lastPathComponent).",
+                currentRevision: model.mcpRevision
+            ))
+        }
+        model.bumpMCPRevision()
         return .success(())
     }
 
@@ -134,7 +144,7 @@ enum MCPHandlers {
             clip.clampFades()
             model.videoClips[vi] = clip
             model.bumpMCPRevision()
-            Task { await model.rebuildCompositionPublic() }
+            model.scheduleRebuildPublic()
             return nil
         }
         if let ai = model.audioIndexPublic(uuid) {
@@ -150,7 +160,7 @@ enum MCPHandlers {
             clip.clampFades()
             model.audioClips[ai] = clip
             model.bumpMCPRevision()
-            Task { await model.rebuildCompositionPublic() }
+            model.scheduleRebuildPublic()
             return nil
         }
         return MCPErrorResponse(error: "clip_not_found", message: "No clip with id \(clipId)", currentRevision: nil)
@@ -169,7 +179,7 @@ enum MCPHandlers {
             if let nt = newTrackID { clip.trackID = nt }
             model.videoClips[vi] = clip
             model.bumpMCPRevision()
-            Task { await model.rebuildCompositionPublic() }
+            model.scheduleRebuildPublic()
             return nil
         }
         if let ai = model.audioIndexPublic(uuid) {
@@ -178,7 +188,7 @@ enum MCPHandlers {
             if let nt = newTrackID { clip.trackID = nt }
             model.audioClips[ai] = clip
             model.bumpMCPRevision()
-            Task { await model.rebuildCompositionPublic() }
+            model.scheduleRebuildPublic()
             return nil
         }
         return MCPErrorResponse(error: "clip_not_found", message: "No clip with id \(clipId)", currentRevision: nil)
@@ -198,7 +208,7 @@ enum MCPHandlers {
             model.videoClips[vi] = parts.left
             model.videoClips.insert(parts.right, at: vi + 1)
             model.bumpMCPRevision()
-            Task { await model.rebuildCompositionPublic() }
+            model.scheduleRebuildPublic()
             return .success([parts.left.id.uuidString, parts.right.id.uuidString])
         }
         if let ai = model.audioIndexPublic(uuid) {
@@ -213,7 +223,7 @@ enum MCPHandlers {
             model.audioClips[ai] = parts.left
             model.audioClips.insert(right, at: ai + 1)
             model.bumpMCPRevision()
-            Task { await model.rebuildCompositionPublic() }
+            model.scheduleRebuildPublic()
             return .success([parts.left.id.uuidString, parts.right.id.uuidString])
         }
         return .failure(MCPErrorResponse(error: "clip_not_found", message: "No clip with id \(clipId)", currentRevision: nil))
@@ -345,17 +355,19 @@ enum MCPHandlers {
             return .failure(MCPErrorResponse(error: "same_clip", message: "Crossfade requires two different clips", currentRevision: nil))
         }
 
-        func crossfadePair(left: MediaClip, right: MediaClip) -> MCPErrorResponse? {
+        // Returns the mutated pair — the old version wrote to local copies and
+        // discarded them, making the tool a silent no-op that reported success.
+        func crossfadePair(left: MediaClip, right: MediaClip) -> Result<(MediaClip, MediaClip), MCPErrorResponse> {
             let requested = max(0, duration)
             let leftAvailable = max(0, left.duration - left.fadeIn)
             let rightAvailable = max(0, right.duration - right.fadeOut)
             let overlap = min(leftAvailable, rightAvailable, requested)
             guard overlap > 0.001 else {
-                return MCPErrorResponse(
+                return .failure(MCPErrorResponse(
                     error: "crossfade_too_long",
                     message: "Requested \(requested)s but adjacent clips only support \(min(leftAvailable, rightAvailable))s",
                     currentRevision: nil
-                )
+                ))
             }
 
             var mutableLeft = left
@@ -367,26 +379,36 @@ enum MCPHandlers {
             mutableRight.clampFades()
             mutableRight.timelineStart = mutableLeft.timelineEnd - overlap
 
-            return nil
+            return .success((mutableLeft, mutableRight))
         }
 
         if let leftIndex = model.videoIndexPublic(leftUUID), let rightIndex = model.videoIndexPublic(rightUUID) {
-            if let error = crossfadePair(left: model.videoClips[leftIndex], right: model.videoClips[rightIndex]) {
+            switch crossfadePair(left: model.videoClips[leftIndex], right: model.videoClips[rightIndex]) {
+            case .failure(let error):
                 return .failure(error)
+            case .success(let (newLeft, newRight)):
+                model.videoClips[leftIndex] = newLeft
+                model.videoClips[rightIndex] = newRight
             }
             model.bumpMCPRevision()
-            model.applyFadesPublic()
+            // The right clip moved on the timeline — needs a full composition
+            // rebuild, not just fade ramps on the existing mix.
+            model.scheduleRebuildPublic()
             let left = model.videoClips[leftIndex]
             let right = model.videoClips[rightIndex]
             return .success((left.timelineStart, left.fadeOut, right.fadeIn))
         }
 
         if let leftIndex = model.audioIndexPublic(leftUUID), let rightIndex = model.audioIndexPublic(rightUUID) {
-            if let error = crossfadePair(left: model.audioClips[leftIndex], right: model.audioClips[rightIndex]) {
+            switch crossfadePair(left: model.audioClips[leftIndex], right: model.audioClips[rightIndex]) {
+            case .failure(let error):
                 return .failure(error)
+            case .success(let (newLeft, newRight)):
+                model.audioClips[leftIndex] = newLeft
+                model.audioClips[rightIndex] = newRight
             }
             model.bumpMCPRevision()
-            model.applyFadesPublic()
+            model.scheduleRebuildPublic()
             let left = model.audioClips[leftIndex]
             let right = model.audioClips[rightIndex]
             return .success((left.timelineStart, left.fadeOut, right.fadeIn))

@@ -649,7 +649,12 @@ final class MCPServer {
         }
 
         // Bypass the save panel and start the export directly.
-        model.beginExportDirect(settings: settings, destination: finalURL)
+        guard model.beginExportDirect(settings: settings, destination: finalURL) else {
+            return .failure(MCPDictError(dict: [
+                "error": "export_not_started",
+                "message": "Another export is already running, or nothing is loaded to export."
+            ] as [String: Any]))
+        }
 
         return .success([
             "status": "started",
