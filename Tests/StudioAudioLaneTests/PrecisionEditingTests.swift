@@ -105,6 +105,34 @@ final class PrecisionEditingTests: XCTestCase {
         XCTAssertEqual(model.videoClips[0].timelineStart, 1.97, accuracy: 0.000_001)
     }
 
+    @MainActor
+    func testMultiSelectionExtendsTrimsAndFadesTogether() {
+        let model = EditorModel()
+        model.isLoading = false
+        let first = clip(start: 0, inPoint: 1, duration: 4, trackID: EditorModel.defaultAudioTrackID)
+        let second = clip(start: 6, inPoint: 2, duration: 3, trackID: EditorModel.defaultAudioTrackID)
+        model.audioClips = [first, second]
+        model.selectedClipID = first.id
+        model.selectedClipIDs = [first.id, second.id]
+
+        model.trimOut(clipID: first.id, toTimelineTime: 5, snapping: false)
+        XCTAssertEqual(model.audioClips[0].duration, 5, accuracy: 0.000_001)
+        XCTAssertEqual(model.audioClips[1].duration, 4, accuracy: 0.000_001)
+
+        model.trimIn(clipID: first.id, toTimelineTime: 0.5, snapping: false)
+        XCTAssertEqual(model.audioClips[0].timelineStart, 0.5, accuracy: 0.000_001)
+        XCTAssertEqual(model.audioClips[1].timelineStart, 6.5, accuracy: 0.000_001)
+        XCTAssertEqual(model.audioClips[0].inPoint, 1.5, accuracy: 0.000_001)
+        XCTAssertEqual(model.audioClips[1].inPoint, 2.5, accuracy: 0.000_001)
+
+        model.setSelectedFadeIn(0.75)
+        model.setSelectedFadeOut(1.25)
+        XCTAssertEqual(model.audioClips[0].fadeIn, 0.75, accuracy: 0.000_001)
+        XCTAssertEqual(model.audioClips[1].fadeIn, 0.75, accuracy: 0.000_001)
+        XCTAssertEqual(model.audioClips[0].fadeOut, 1.25, accuracy: 0.000_001)
+        XCTAssertEqual(model.audioClips[1].fadeOut, 1.25, accuracy: 0.000_001)
+    }
+
     func testOptionFineDragUsesOneTenthScale() {
         let normal = TimelinePrecisionMath.dragDelta(
             translation: 100,

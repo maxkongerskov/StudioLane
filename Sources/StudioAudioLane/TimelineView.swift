@@ -565,10 +565,14 @@ struct TimelineView: View {
                     dragKind = kind
                     dragClipID = clipID
                     dragOrigin = origin()
-                    if kind == .videoFadeIn || kind == .videoFadeOut {
-                        model.selectVideoClip(clipID)
-                    } else {
-                        model.selectAudioClip(clipID)
+                    // Keep an existing multi-selection intact so dragging one
+                    // selected fade handle applies the fade to every highlighted clip.
+                    if !model.isClipSelected(clipID) {
+                        if kind == .videoFadeIn || kind == .videoFadeOut {
+                            model.selectVideoClip(clipID)
+                        } else {
+                            model.selectAudioClip(clipID)
+                        }
                     }
                 }
                 guard dragKind == kind, dragClipID == clipID, width > 0 else { return }
@@ -609,10 +613,14 @@ struct TimelineView: View {
                     dragKind = kind
                     dragClipID = clipID
                     dragOrigin = origin()
-                    if model.videoClips.contains(where: { $0.id == clipID }) {
-                        model.selectVideoClip(clipID)
-                    } else {
-                        model.selectAudioClip(clipID)
+                    // Trimming a highlighted clip is a group edit. Only replace
+                    // the selection when the grabbed clip was not selected.
+                    if !model.isClipSelected(clipID) {
+                        if model.videoClips.contains(where: { $0.id == clipID }) {
+                            model.selectVideoClip(clipID)
+                        } else {
+                            model.selectAudioClip(clipID)
+                        }
                     }
                 }
                 guard dragKind == kind, dragClipID == clipID, laneWidth > 0 else { return }

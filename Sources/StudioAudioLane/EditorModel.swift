@@ -1655,11 +1655,51 @@ final class EditorModel {
     func trimIn(clipID: UUID, toTimelineTime time: TimeInterval, snapping: Bool = true) {
         beginEdit()
         if let i = audioIndex(clipID) {
-            let end = audioClips[i].timelineEnd
-            trimInOn(&audioClips[i], time: snapping ? snapTime(time, excluding: [end]) : time)
+            let original = audioClips[i]
+            var anchor = original
+            trimInOn(
+                &anchor,
+                time: snapping ? snapTime(time, excluding: [original.timelineEnd]) : time
+            )
+            let delta = anchor.timelineStart - original.timelineStart
+            for id in directEditClipIDs(anchor: clipID) {
+                if id == clipID {
+                    audioClips[i] = anchor
+                } else if let selectedAudioIndex = audioIndex(id) {
+                    trimInOn(
+                        &audioClips[selectedAudioIndex],
+                        time: audioClips[selectedAudioIndex].timelineStart + delta
+                    )
+                } else if let selectedVideoIndex = videoIndex(id) {
+                    trimInOn(
+                        &videoClips[selectedVideoIndex],
+                        time: videoClips[selectedVideoIndex].timelineStart + delta
+                    )
+                }
+            }
         } else if let i = videoIndex(clipID) {
-            let end = videoClips[i].timelineEnd
-            trimInOn(&videoClips[i], time: snapping ? snapTime(time, excluding: [end]) : time)
+            let original = videoClips[i]
+            var anchor = original
+            trimInOn(
+                &anchor,
+                time: snapping ? snapTime(time, excluding: [original.timelineEnd]) : time
+            )
+            let delta = anchor.timelineStart - original.timelineStart
+            for id in directEditClipIDs(anchor: clipID) {
+                if id == clipID {
+                    videoClips[i] = anchor
+                } else if let selectedVideoIndex = videoIndex(id) {
+                    trimInOn(
+                        &videoClips[selectedVideoIndex],
+                        time: videoClips[selectedVideoIndex].timelineStart + delta
+                    )
+                } else if let selectedAudioIndex = audioIndex(id) {
+                    trimInOn(
+                        &audioClips[selectedAudioIndex],
+                        time: audioClips[selectedAudioIndex].timelineStart + delta
+                    )
+                }
+            }
         }
         isEditingClip = true
     }
@@ -1667,13 +1707,51 @@ final class EditorModel {
     func trimOut(clipID: UUID, toTimelineTime time: TimeInterval, snapping: Bool = true) {
         beginEdit()
         if let i = audioIndex(clipID) {
-            let start = audioClips[i].timelineStart
-            trimOutOn(&audioClips[i], time: snapping ? snapTime(time, excluding: [start]) : time)
+            let original = audioClips[i]
+            var anchor = original
+            trimOutOn(
+                &anchor,
+                time: snapping ? snapTime(time, excluding: [original.timelineStart]) : time
+            )
+            let delta = anchor.timelineEnd - original.timelineEnd
+            for id in directEditClipIDs(anchor: clipID) {
+                if id == clipID {
+                    audioClips[i] = anchor
+                } else if let selectedAudioIndex = audioIndex(id) {
+                    trimOutOn(
+                        &audioClips[selectedAudioIndex],
+                        time: audioClips[selectedAudioIndex].timelineEnd + delta
+                    )
+                } else if let selectedVideoIndex = videoIndex(id) {
+                    trimOutOn(
+                        &videoClips[selectedVideoIndex],
+                        time: videoClips[selectedVideoIndex].timelineEnd + delta
+                    )
+                }
+            }
         } else if let i = videoIndex(clipID) {
-            let start = videoClips[i].timelineStart
-            var clip = videoClips[i]
-            trimOutOn(&clip, time: snapping ? snapTime(time, excluding: [start]) : time)
-            videoClips[i] = clip
+            let original = videoClips[i]
+            var anchor = original
+            trimOutOn(
+                &anchor,
+                time: snapping ? snapTime(time, excluding: [original.timelineStart]) : time
+            )
+            let delta = anchor.timelineEnd - original.timelineEnd
+            for id in directEditClipIDs(anchor: clipID) {
+                if id == clipID {
+                    videoClips[i] = anchor
+                } else if let selectedVideoIndex = videoIndex(id) {
+                    trimOutOn(
+                        &videoClips[selectedVideoIndex],
+                        time: videoClips[selectedVideoIndex].timelineEnd + delta
+                    )
+                } else if let selectedAudioIndex = audioIndex(id) {
+                    trimOutOn(
+                        &audioClips[selectedAudioIndex],
+                        time: audioClips[selectedAudioIndex].timelineEnd + delta
+                    )
+                }
+            }
         }
         isEditingClip = true
     }
@@ -3607,6 +3685,12 @@ final class EditorModel {
 
     private func audioIndex(_ id: UUID) -> Int? { audioClips.firstIndex(where: { $0.id == id }) }
     private func videoIndex(_ id: UUID) -> Int? { videoClips.firstIndex(where: { $0.id == id }) }
+
+    /// Direct manipulation preserves a multi-selection when its anchor is already
+    /// selected. Clicking a handle on an unselected clip edits only that clip.
+    private func directEditClipIDs(anchor id: UUID) -> Set<UUID> {
+        selectedClipIDs.contains(id) ? selectedClipIDs : [id]
+    }
 
     private func mutateSelectedVideo(_ body: (inout MediaClip) -> Void) {
         let ids = selectedClipIDs.isEmpty ? Set([selectedVideo?.id].compactMap { $0 }) : selectedClipIDs
