@@ -183,6 +183,8 @@ struct ExportSettings: Equatable {
     var customWidth: Int = 1920
     var customHeight: Int = 1080
     var frameRate: FrameRate = .original
+    /// Pro override. Zero keeps the quality-derived automatic bit rate.
+    var videoBitrateMbps: Double = 0
     /// Default Match → AVAssetExportSession (reliable QuickTime output).
     /// Explicit AAC kbps opts into the writer pipeline.
     var audioBitrate: AudioBitrate = .match
@@ -212,6 +214,9 @@ struct ExportSettings: Equatable {
         }
         customWidth = Swift.max(16, Swift.min(7680, customWidth))
         customHeight = Swift.max(16, Swift.min(4320, customHeight))
+        videoBitrateMbps = videoBitrateMbps.isFinite
+            ? Swift.max(0, Swift.min(200, videoBitrateMbps))
+            : 0
         fileBaseName = Self.sanitizedBaseName(fileBaseName)
     }
 
@@ -306,7 +311,13 @@ struct ExportSettings: Equatable {
     /// Writer is only used when the user picks an explicit AAC bitrate that
     /// ExportSession cannot set — and that path must stay MainActor-safe.
     var prefersWriterPipeline: Bool {
-        !codec.usesPCMAudio && audioBitrate.bitsPerSecond != nil
+        !codec.usesPCMAudio && (audioBitrate.bitsPerSecond != nil || videoBitrateMbps > 0)
+    }
+
+    func videoBitRate(pixelCount: CGFloat) -> Int {
+        videoBitrateMbps > 0
+            ? Int(videoBitrateMbps * 1_000_000)
+            : quality.approximateBitRate(pixelCount: pixelCount)
     }
 
     var pathExtension: String {
@@ -387,39 +398,45 @@ struct ExportSheet: View {
 
     @ViewBuilder
     private var standardVideoFields: some View {
-        field("Container") {
-            Picker("", selection: $settings.container) {
-                ForEach(settings.availableContainers) { item in
-                    Text(item.rawValue).tag(item)
+        if model.isProMode {
+            field("Container") {
+                Picker("", selection: $settings.container) {
+                    ForEach(settings.availableContainers) { item in
+                        Text(item.rawValue).tag(item)
+                    }
                 }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .disabled(settings.codec.requiresMOV)
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .disabled(settings.codec.requiresMOV)
-        }
-        field("Video codec") {
-            Picker("", selection: $settings.codec) {
-                ForEach(ExportSettings.Codec.allCases) { item in
-                    Text(item.rawValue).tag(item)
+            field("Video codec") {
+                Picker("", selection: $settings.codec) {
+                    ForEach(ExportSettings.Codec.allCases) { item in
+                        Text(item.rawValue).tag(item)
+                    }
                 }
+                .pickerStyle(.menu)
+                .labelsHidden()
             }
-            .pickerStyle(.menu)
-            .labelsHidden()
-        }
-        field("Quality") {
-            Picker("", selection: $settings.quality) {
-                ForEach(ExportSettings.Quality.allCases) { item in
-                    Text(item.rawValue).tag(item)
+            field("Quality") {
+                Picker("", selection: $settings.quality) {
+                    ForEach(ExportSettings.Quality.allCases) { item in
+                        Text(item.rawValue).tag(item)
+                    }
                 }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .disabled(settings.codec.usesPCMAudio)
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .disabled(settings.codec.usesPCMAudio)
         }
         field("Resolution") {
             VStack(alignment: .leading, spacing: 8) {
                 Picker("", selection: $settings.resolution) {
-                    ForEach(ExportSettings.Resolution.allCases) { item in
+                    ForEach(
+                        model.isProMode
+                            ? ExportSettings.Resolution.allCases
+                            : [.original, .p1080, .p720]
+                    ) { item in
                         Text(item.rawValue).tag(item)
                     }
                 }
@@ -440,31 +457,58 @@ struct ExportSheet: View {
                     .foregroundStyle(StudioTheme.muted)
             }
         }
-        field("Frame rate") {
-            Picker("", selection: $settings.frameRate) {
-                ForEach(ExportSettings.FrameRate.allCases) { item in
-                    Text(item.rawValue).tag(item)
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-        }
-        field("Audio") {
-            VStack(alignment: .leading, spacing: 6) {
-                Picker("", selection: $settings.audioBitrate) {
-                    ForEach(settings.availableAudioBitrates) { item in
+        if model.isProMode {
+            field("Frame rate") {
+                Picker("", selection: $settings.frameRate) {
+                    ForEach(ExportSettings.FrameRate.allCases) { item in
                         Text(item.rawValue).tag(item)
                     }
                 }
-                .pickerStyle(.menu)
+                .pickerStyle(.segmented)
                 .labelsHidden()
-                .disabled(settings.codec.usesPCMAudio)
-                Text(settings.codec.usesPCMAudio
-                     ? "ProRes exports use linear PCM audio."
-                     : "Match uses ExportSession (recommended). Explicit kbps uses the writer pipeline.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(StudioTheme.muted)
             }
+            field("Video bitrate") {
+                HStack(spacing: 8) {
+                    TextField(
+                        "Automatic",
+                        value: $settings.videoBitrateMbps,
+                        format: .number.precision(.fractionLength(0...1))
+                    )
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12, weight: .medium).monospacedDigit())
+                    .padding(.horizontal, 8)
+                    .frame(width: 100, height: 28)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(Color.white.opacity(0.06))
+                    )
+                    Text(settings.videoBitrateMbps > 0 ? "Mbps" : "0 = automatic")
+                        .font(.system(size: 11))
+                        .foregroundStyle(StudioTheme.muted)
+                }
+            }
+            field("Audio") {
+                VStack(alignment: .leading, spacing: 6) {
+                    Picker("", selection: $settings.audioBitrate) {
+                        ForEach(settings.availableAudioBitrates) { item in
+                            Text(item.rawValue).tag(item)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .disabled(settings.codec.usesPCMAudio)
+                    Text(settings.codec.usesPCMAudio
+                         ? "ProRes exports use linear PCM audio."
+                         : "Project sample rate: \(Int(model.proSettings.sampleRate)) Hz. Explicit rates use the writer.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(StudioTheme.muted)
+                }
+            }
+        } else {
+            Text("Standard export uses H.264 with automatic quality and matched audio. Enable Pro for codec, bitrate, frame-rate, and audio controls.")
+                .font(.system(size: 11))
+                .foregroundStyle(StudioTheme.muted)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 

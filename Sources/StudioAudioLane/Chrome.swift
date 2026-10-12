@@ -213,12 +213,36 @@ struct InspectorPane: View {
     }
 
     private var header: some View {
-        Text("StudioLane")
-            .font(.system(size: 11, weight: .semibold))
-            .tracking(0.7)
-            .foregroundStyle(StudioTheme.text.opacity(0.45))
-            .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
-            .padding(.horizontal, 14)
+        HStack(spacing: 8) {
+            Text("StudioLane")
+                .font(.system(size: 11, weight: .semibold))
+                .tracking(0.7)
+                .foregroundStyle(StudioTheme.text.opacity(0.45))
+            Spacer(minLength: 4)
+            Button {
+                model.setProMode(!model.isProMode)
+            } label: {
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(model.isProMode ? StudioTheme.accent : StudioTheme.text.opacity(0.2))
+                        .frame(width: 6, height: 6)
+                    Text("PRO")
+                        .font(.system(size: 9, weight: .bold))
+                        .tracking(0.5)
+                }
+                .foregroundStyle(model.isProMode ? StudioTheme.text : StudioTheme.text.opacity(0.42))
+                .padding(.horizontal, 7)
+                .frame(height: 20)
+                .background(
+                    Capsule()
+                        .fill(model.isProMode ? StudioTheme.accent.opacity(0.18) : Color.white.opacity(0.04))
+                )
+            }
+            .buttonStyle(.plain)
+            .help(model.isProMode ? "Switch to Standard mode" : "Enable advanced editing controls")
+        }
+        .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
+        .padding(.horizontal, 14)
     }
 
     private var loading: some View {
@@ -282,7 +306,93 @@ struct InspectorPane: View {
                 model.toggleAudioLayoutMode()
             }
             .padding(.top, 4)
+            if model.isProMode {
+                proProjectSection
+                    .padding(.top, 8)
+            }
         }
+    }
+
+    private var proProjectSection: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            sectionLabel("Pro project")
+            HStack {
+                Text("Frame rate")
+                Spacer()
+                Picker("", selection: Binding(
+                    get: { model.proSettings.frameRate },
+                    set: { value in model.updateProSettings { $0.frameRate = value } }
+                )) {
+                    ForEach([24.0, 25.0, 30.0, 60.0], id: \.self) {
+                        Text("\(Int($0)) fps").tag($0)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 92)
+            }
+            HStack {
+                Text("Sample rate")
+                Spacer()
+                Picker("", selection: Binding(
+                    get: { model.proSettings.sampleRate },
+                    set: { value in model.updateProSettings { $0.sampleRate = value } }
+                )) {
+                    Text("44.1 kHz").tag(44_100.0)
+                    Text("48 kHz").tag(48_000.0)
+                    Text("96 kHz").tag(96_000.0)
+                }
+                .labelsHidden()
+                .frame(width: 92)
+            }
+            Toggle("Master soft limiter", isOn: Binding(
+                get: { model.proSettings.limiterEnabled },
+                set: { value in model.updateProSettings { $0.limiterEnabled = value } }
+            ))
+            .toggleStyle(.checkbox)
+            Text("SNAPPING")
+                .font(.system(size: 9, weight: .semibold))
+                .tracking(0.6)
+                .foregroundStyle(StudioTheme.text.opacity(0.32))
+                .padding(.top, 2)
+            Toggle("Clip edges", isOn: Binding(
+                get: { model.proSettings.snapToClipEdges },
+                set: { value in model.updateProSettings { $0.snapToClipEdges = value } }
+            ))
+            .toggleStyle(.checkbox)
+            Toggle("Playhead", isOn: Binding(
+                get: { model.proSettings.snapToPlayhead },
+                set: { value in model.updateProSettings { $0.snapToPlayhead = value } }
+            ))
+            .toggleStyle(.checkbox)
+            Toggle("Frame grid", isOn: Binding(
+                get: { model.proSettings.snapToFrameGrid },
+                set: { value in model.updateProSettings { $0.snapToFrameGrid = value } }
+            ))
+            .toggleStyle(.checkbox)
+            HStack(spacing: 5) {
+                proMiniButton("Starts") { model.alignSelectedClips(.starts) }
+                proMiniButton("Ends") { model.alignSelectedClips(.ends) }
+                proMiniButton("Playhead") { model.alignSelectedClips(.playhead) }
+            }
+            proMiniButton("Distribute selected clips") {
+                model.alignSelectedClips(.distribute)
+            }
+        }
+        .font(.system(size: 10))
+        .foregroundStyle(StudioTheme.text.opacity(0.72))
+    }
+
+    private func proMiniButton(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(title, action: action)
+            .buttonStyle(.plain)
+            .font(.system(size: 9, weight: .medium))
+            .foregroundStyle(StudioTheme.text.opacity(0.72))
+            .padding(.horizontal, 6)
+            .frame(minHeight: 22)
+            .background(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(Color.white.opacity(0.055))
+            )
     }
 
     private func selectTrack(_ track: TimelineTrack) {
@@ -503,6 +613,169 @@ struct InspectorPane: View {
                     onEditingEnded: { model.commitEdit() }
                 )
             }
+            if model.isProMode {
+                proClipFields
+                    .padding(.top, 6)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var proClipFields: some View {
+        if model.selectedVideo != nil {
+            VStack(alignment: .leading, spacing: 8) {
+                sectionLabel("Transform & keyframes")
+                proSlider(
+                    "Scale",
+                    value: Binding(
+                        get: { model.selectedClipTransform.scale },
+                        set: { value in model.setSelectedTransform { $0.scale = value } }
+                    ),
+                    range: 0.05...4,
+                    valueText: { String(format: "%.2f×", $0) }
+                )
+                proSlider(
+                    "Position X",
+                    value: Binding(
+                        get: { model.selectedClipTransform.positionX },
+                        set: { value in model.setSelectedTransform { $0.positionX = value } }
+                    ),
+                    range: -1...1,
+                    valueText: { String(format: "%+.0f%%", $0 * 100) }
+                )
+                proSlider(
+                    "Position Y",
+                    value: Binding(
+                        get: { model.selectedClipTransform.positionY },
+                        set: { value in model.setSelectedTransform { $0.positionY = value } }
+                    ),
+                    range: -1...1,
+                    valueText: { String(format: "%+.0f%%", $0 * 100) }
+                )
+                proSlider(
+                    "Rotation",
+                    value: Binding(
+                        get: { model.selectedClipTransform.rotationDegrees },
+                        set: { value in model.setSelectedTransform { $0.rotationDegrees = value } }
+                    ),
+                    range: -180...180,
+                    valueText: { String(format: "%.0f°", $0) }
+                )
+                proSlider(
+                    "Opacity",
+                    value: Binding(
+                        get: { model.selectedClipTransform.opacity },
+                        set: { value in model.setSelectedTransform { $0.opacity = value } }
+                    ),
+                    range: 0...1,
+                    valueText: { "\(Int(($0 * 100).rounded()))%" }
+                )
+                HStack(spacing: 6) {
+                    proMiniButton("Add keyframe") { model.addTransformKeyframeAtPlayhead() }
+                    proMiniButton("Clear \(model.selectedKeyframeCount)") {
+                        model.clearSelectedTransformKeyframes()
+                    }
+                }
+                sectionLabel("Transitions")
+                    .padding(.top, 2)
+                transitionRow("In", transition: model.selectedTransitionIn, incoming: true)
+                transitionRow("Out", transition: model.selectedTransitionOut, incoming: false)
+            }
+        } else if model.selectedAudio != nil {
+            VStack(alignment: .leading, spacing: 8) {
+                sectionLabel("Pro audio")
+                proSlider(
+                    "Pan",
+                    value: Binding(
+                        get: { Double(model.selectedClipPan) },
+                        set: { model.setSelectedPan(Float($0)) }
+                    ),
+                    range: -1...1,
+                    valueText: {
+                        if abs($0) < 0.01 { return "C" }
+                        return $0 < 0
+                            ? "L\(Int(abs($0) * 100))"
+                            : "R\(Int($0 * 100))"
+                    }
+                )
+                StereoMeter(levels: model.selectedAudioMeter)
+                HStack(spacing: 6) {
+                    proMiniButton("Normalize") { model.normalizeSelectedAudio() }
+                    Text(model.selectedAudio?.isNormalized == true ? "Normalized" : "Peak target −1 dB")
+                        .font(.system(size: 9))
+                        .foregroundStyle(StudioTheme.text.opacity(0.36))
+                }
+            }
+        }
+    }
+
+    private func transitionRow(
+        _ title: String,
+        transition: ClipTransition,
+        incoming: Bool
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text(title)
+                    .font(.system(size: 10))
+                    .foregroundStyle(StudioTheme.text.opacity(0.55))
+                Spacer()
+                Picker("", selection: Binding(
+                    get: { transition.style },
+                    set: { style in
+                        var value = transition
+                        value.style = style
+                        if style != .none, value.duration <= 0 { value.duration = 0.35 }
+                        model.setSelectedTransition(value, incoming: incoming)
+                        model.commitEdit()
+                    }
+                )) {
+                    ForEach(ClipTransitionStyle.allCases) { style in
+                        Text(style.rawValue).tag(style)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 105)
+            }
+            if transition.style != .none {
+                proSlider(
+                    "Duration",
+                    value: Binding(
+                        get: { transition.duration },
+                        set: { duration in
+                            var value = transition
+                            value.duration = duration
+                            model.setSelectedTransition(value, incoming: incoming)
+                        }
+                    ),
+                    range: 0.05...max(0.05, (model.selectedVideo?.duration ?? 1) / 2),
+                    valueText: { String(format: "%.2fs", $0) }
+                )
+            }
+        }
+    }
+
+    private func proSlider(
+        _ title: String,
+        value: Binding<Double>,
+        range: ClosedRange<Double>,
+        valueText: @escaping (Double) -> String
+    ) -> some View {
+        VStack(spacing: 3) {
+            HStack {
+                Text(title)
+                    .font(.system(size: 10))
+                    .foregroundStyle(StudioTheme.text.opacity(0.55))
+                Spacer()
+                Text(valueText(value.wrappedValue))
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(StudioTheme.text.opacity(0.42))
+            }
+            Slider(value: value, in: range) { editing in
+                if !editing { model.commitEdit() }
+            }
+            .controlSize(.mini)
+            .tint(inspectorAccent)
         }
     }
 
@@ -552,6 +825,38 @@ struct InspectorPane: View {
         // Range is the clip's max fade. Floor 0.12 so a tiny clip still has a grabable
         // track; include current so a value already past clipMax doesn't sit past 100%.
         max(0.12, max(0, clipMax), current)
+    }
+}
+
+struct StereoMeter: View {
+    let levels: (left: Float, right: Float)
+
+    var body: some View {
+        VStack(spacing: 3) {
+            meterRow("L", level: levels.left)
+            meterRow("R", level: levels.right)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Stereo level")
+        .accessibilityValue("Left \(Int(levels.left * 100)) percent, right \(Int(levels.right * 100)) percent")
+    }
+
+    private func meterRow(_ channel: String, level: Float) -> some View {
+        HStack(spacing: 5) {
+            Text(channel)
+                .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                .foregroundStyle(StudioTheme.text.opacity(0.38))
+                .frame(width: 8)
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.white.opacity(0.055))
+                    Capsule()
+                        .fill(level > 0.9 ? Color.red.opacity(0.85) : StudioTheme.audioWave.opacity(0.85))
+                        .frame(width: geo.size.width * CGFloat(min(max(level, 0), 1)))
+                }
+            }
+            .frame(height: 5)
+        }
     }
 }
 

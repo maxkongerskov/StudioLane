@@ -334,6 +334,30 @@ struct TimelineView: View {
                 .padding(.vertical, 2)
                 .background(.black.opacity(0.4), in: Capsule())
                 .padding(.leading, 8)
+            if model.isProMode {
+                ForEach(clip.transformKeyframes) { keyframe in
+                    Rectangle()
+                        .fill(Color.yellow.opacity(0.95))
+                        .frame(width: 6, height: 6)
+                        .rotationEffect(.degrees(45))
+                        .offset(
+                            x: max(3, min(
+                                clipWidth - 3,
+                                CGFloat(keyframe.time / max(clip.duration, 0.000_1)) * clipWidth
+                            )),
+                            y: 18
+                        )
+                        .allowsHitTesting(false)
+                }
+                if clip.transitionIn.style != .none {
+                    Text(clip.transitionIn.style.rawValue)
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.65))
+                        .padding(.leading, 6)
+                        .offset(y: -18)
+                        .allowsHitTesting(false)
+                }
+            }
             FadeHandle(isAudio: false)
                 .offset(x: max(0, fadeInW - 4))
                 .highPriorityGesture(fadeDrag(kind: .videoFadeIn, clipID: clip.id, width: laneWidth, origin: { clip.fadeIn }) { model.setVideoFadeIn($0) })

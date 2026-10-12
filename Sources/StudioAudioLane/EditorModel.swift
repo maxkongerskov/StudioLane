@@ -41,6 +41,15 @@ struct MediaClip: Identifiable, Codable {
     var trackID: UUID
     /// Full-source peak map covering `0...sourceDuration`. Drawing windows by inPoint/duration (Logic-style mask).
     var waveform: [Float] = []
+    /// Pro video controls. Kept on every clip so projects remain round-trippable
+    /// when Pro mode is switched off.
+    var transform: ClipTransform = .identity
+    var transformKeyframes: [ClipTransformKeyframe] = []
+    var transitionIn: ClipTransition = ClipTransition()
+    var transitionOut: ClipTransition = ClipTransition()
+    /// Pro audio controls.
+    var pan: Float = 0
+    var isNormalized = false
 
     var timelineEnd: TimeInterval { timelineStart + duration }
 
@@ -64,6 +73,7 @@ struct MediaClip: Identifiable, Codable {
     enum CodingKeys: String, CodingKey {
         case id, url, name, sourceDuration, inPoint, timelineStart, duration
         case fadeIn, fadeOut, muted, gain, trackID, waveform
+        case transform, transformKeyframes, transitionIn, transitionOut, pan, isNormalized
     }
 
     init(
@@ -79,7 +89,13 @@ struct MediaClip: Identifiable, Codable {
         muted: Bool = false,
         gain: Float = 1,
         trackID: UUID = UUID(),
-        waveform: [Float] = []
+        waveform: [Float] = [],
+        transform: ClipTransform = .identity,
+        transformKeyframes: [ClipTransformKeyframe] = [],
+        transitionIn: ClipTransition = ClipTransition(),
+        transitionOut: ClipTransition = ClipTransition(),
+        pan: Float = 0,
+        isNormalized: Bool = false
     ) {
         self.id = id
         self.url = url
@@ -94,6 +110,12 @@ struct MediaClip: Identifiable, Codable {
         self.gain = gain
         self.trackID = trackID
         self.waveform = waveform
+        self.transform = transform
+        self.transformKeyframes = transformKeyframes
+        self.transitionIn = transitionIn
+        self.transitionOut = transitionOut
+        self.pan = pan
+        self.isNormalized = isNormalized
     }
 
     init(from decoder: Decoder) throws {
@@ -111,6 +133,12 @@ struct MediaClip: Identifiable, Codable {
         gain = try c.decodeIfPresent(Float.self, forKey: .gain) ?? 1
         trackID = try c.decodeIfPresent(UUID.self, forKey: .trackID) ?? UUID()
         waveform = try c.decodeIfPresent([Float].self, forKey: .waveform) ?? []
+        transform = try c.decodeIfPresent(ClipTransform.self, forKey: .transform) ?? .identity
+        transformKeyframes = try c.decodeIfPresent([ClipTransformKeyframe].self, forKey: .transformKeyframes) ?? []
+        transitionIn = try c.decodeIfPresent(ClipTransition.self, forKey: .transitionIn) ?? ClipTransition()
+        transitionOut = try c.decodeIfPresent(ClipTransition.self, forKey: .transitionOut) ?? ClipTransition()
+        pan = try c.decodeIfPresent(Float.self, forKey: .pan) ?? 0
+        isNormalized = try c.decodeIfPresent(Bool.self, forKey: .isNormalized) ?? false
     }
 
     func encode(to encoder: Encoder) throws {
@@ -128,6 +156,12 @@ struct MediaClip: Identifiable, Codable {
         try c.encode(gain, forKey: .gain)
         try c.encode(trackID, forKey: .trackID)
         try c.encode(waveform, forKey: .waveform)
+        try c.encode(transform, forKey: .transform)
+        try c.encode(transformKeyframes, forKey: .transformKeyframes)
+        try c.encode(transitionIn, forKey: .transitionIn)
+        try c.encode(transitionOut, forKey: .transitionOut)
+        try c.encode(pan, forKey: .pan)
+        try c.encode(isNormalized, forKey: .isNormalized)
     }
 
     func sanitized() -> MediaClip? {
@@ -151,7 +185,13 @@ struct MediaClip: Identifiable, Codable {
             trackID: trackID,
             waveform: waveform.count <= Self.maximumPersistedWaveformPoints
                 ? waveform.map { $0.isFinite ? min(max($0, 0), 1) : 0 }
-                : []
+                : [],
+            transform: transform,
+            transformKeyframes: transformKeyframes,
+            transitionIn: transitionIn,
+            transitionOut: transitionOut,
+            pan: pan.isFinite ? min(max(pan, -1), 1) : 0,
+            isNormalized: isNormalized
         )
         var sanitized = clip
         // Floors/ceilings go through the shared EditorModel constants (see
@@ -166,6 +206,14 @@ struct MediaClip: Identifiable, Codable {
             inPoint: sanitized.inPoint
         )
         sanitized.timelineStart = max(0, timelineStart)
+        sanitized.transform.sanitize()
+        sanitized.transformKeyframes = transformKeyframes.map {
+            var keyframe = $0
+            keyframe.sanitize(clipDuration: sanitized.duration)
+            return keyframe
+        }.sorted { $0.time < $1.time }
+        sanitized.transitionIn.sanitize(clipDuration: sanitized.duration)
+        sanitized.transitionOut.sanitize(clipDuration: sanitized.duration)
         sanitized.clampFades()
         return sanitized
     }
@@ -183,6 +231,8 @@ struct EditorSnapshot: Codable {
     var musicVolume: Float
     var isDuckingMusic: Bool
     var audioLayoutMode: Int
+    var isProMode: Bool
+    var proSettings: ProProjectSettings
 }
 
 struct ProjectClips: Codable {
@@ -204,10 +254,13 @@ struct ProjectDocument: Codable {
     var timelineSpan: TimeInterval?
     /// Playhead in seconds. Absent in older files, which open at the start.
     var playhead: TimeInterval?
+    var isProMode: Bool?
+    var proSettings: ProProjectSettings?
 
     enum CodingKeys: String, CodingKey {
         case clips, tracks, focusedLane, focusedTrackID, selectedClipID, selectedClipIDs
         case videoVolume, musicVolume, isDuckingMusic, audioLayoutMode, timelineSpan, playhead
+        case isProMode, proSettings
     }
 
     init(
@@ -222,7 +275,9 @@ struct ProjectDocument: Codable {
         isDuckingMusic: Bool,
         audioLayoutMode: Int? = 0,
         timelineSpan: TimeInterval? = nil,
-        playhead: TimeInterval? = nil
+        playhead: TimeInterval? = nil,
+        isProMode: Bool? = nil,
+        proSettings: ProProjectSettings? = nil
     ) {
         self.clips = clips
         self.tracks = tracks
@@ -236,6 +291,8 @@ struct ProjectDocument: Codable {
         self.audioLayoutMode = audioLayoutMode
         self.timelineSpan = timelineSpan
         self.playhead = playhead
+        self.isProMode = isProMode
+        self.proSettings = proSettings
     }
 
     init(from decoder: Decoder) throws {
@@ -252,6 +309,8 @@ struct ProjectDocument: Codable {
         audioLayoutMode = try c.decodeIfPresent(Int.self, forKey: .audioLayoutMode)
         timelineSpan = try c.decodeIfPresent(TimeInterval.self, forKey: .timelineSpan)
         playhead = try c.decodeIfPresent(TimeInterval.self, forKey: .playhead)
+        isProMode = try c.decodeIfPresent(Bool.self, forKey: .isProMode)
+        proSettings = try c.decodeIfPresent(ProProjectSettings.self, forKey: .proSettings)
     }
 }
 
@@ -298,6 +357,8 @@ final class EditorModel {
     var timelineZoom: CGFloat = 1
     var timelineViewportWidth: CGFloat = 1100
     var isSnapEnabled = true
+    var isProMode = false
+    var proSettings = ProProjectSettings()
     /// Playlist = abut/ripple music; Layer = free overlaps.
     var audioLayoutMode: AudioLayoutMode = .playlist
     var loopEnabled = false
@@ -311,6 +372,7 @@ final class EditorModel {
 
     static let defaultVideoTrackID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
     static let defaultAudioTrackID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
+    private static let proModeDefaultsKey = "StudioAudioLane.ProMode"
 
     enum Lane: Int, Hashable, CaseIterable {
         case video = 0
@@ -326,6 +388,24 @@ final class EditorModel {
 
     func trackIndex(_ id: UUID) -> Int? {
         tracks.firstIndex { $0.id == id }
+    }
+
+    func setProMode(_ enabled: Bool) {
+        isProMode = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.proModeDefaultsKey)
+        scheduleAutosave()
+        scheduleRebuild()
+    }
+
+    func updateProSettings(_ update: (inout ProProjectSettings) -> Void) {
+        pushHistory()
+        update(&proSettings)
+        proSettings.sanitize()
+        frameDuration = CMTime(
+            seconds: 1 / max(1, proSettings.frameRate),
+            preferredTimescale: 60_000
+        )
+        rebuild()
     }
 
     func clips(on trackID: UUID) -> [MediaClip] {
@@ -608,6 +688,7 @@ final class EditorModel {
     }
 
     var exportSourceFPS: Double {
+        if isProMode { return proSettings.frameRate }
         let seconds = frameDuration.seconds
         guard seconds > 0 else { return 30 }
         return 1.0 / seconds
@@ -762,7 +843,8 @@ final class EditorModel {
                 videoComposition: videoComposition,
                 audioMix: audioMix
             )
-        case .video where settings.prefersWriterPipeline:
+        case .video where settings.prefersWriterPipeline
+            || (isProMode && abs(proSettings.sampleRate - 48_000) > 1):
             status = "Exporting… (writer, \(settings.codec.rawValue)/\(settings.container.rawValue))"
             startWriterExport(
                 asset: item.asset,
@@ -919,7 +1001,9 @@ final class EditorModel {
             isDuckingMusic: isDuckingMusic,
             audioLayoutMode: audioLayoutMode.rawValue,
             timelineSpan: timelineSpan,
-            playhead: currentTime
+            playhead: currentTime,
+            isProMode: isProMode,
+            proSettings: proSettings
         )
     }
 
@@ -1094,6 +1178,12 @@ final class EditorModel {
         if let mode = project.audioLayoutMode {
             audioLayoutMode = AudioLayoutMode(rawValue: mode) ?? .playlist
         }
+        isProMode = project.isProMode
+            ?? UserDefaults.standard.bool(forKey: Self.proModeDefaultsKey)
+        if var savedSettings = project.proSettings {
+            savedSettings.sanitize()
+            proSettings = savedSettings
+        }
         ensureDefaultTracks()
         // Prefer saved primary volumes when tracks were synthesized.
         if let i = tracks.firstIndex(where: { $0.kind == .video }) { tracks[i].volume = videoVolume }
@@ -1190,7 +1280,9 @@ final class EditorModel {
             videoVolume: videoVolume,
             musicVolume: musicVolume,
             isDuckingMusic: isDuckingMusic,
-            audioLayoutMode: audioLayoutMode.rawValue
+            audioLayoutMode: audioLayoutMode.rawValue,
+            isProMode: isProMode,
+            proSettings: proSettings
         )
     }
 
@@ -1208,6 +1300,9 @@ final class EditorModel {
         musicVolume = snapshot.musicVolume
         isDuckingMusic = snapshot.isDuckingMusic
         audioLayoutMode = AudioLayoutMode(rawValue: snapshot.audioLayoutMode) ?? .playlist
+        isProMode = snapshot.isProMode
+        proSettings = snapshot.proSettings
+        proSettings.sanitize()
         ensureDefaultTracks()
         isEditingClip = false
         timelineSpan = max(timelineSpan, duration)
@@ -1865,9 +1960,11 @@ final class EditorModel {
     }
 
     func nudgeSelectedByFrames(_ frames: Int) -> Bool {
-        let seconds = frameDuration.seconds.isFinite && frameDuration.seconds > 0
-            ? frameDuration.seconds
-            : 1.0 / 30.0
+        let seconds = isProMode
+            ? 1 / max(1, proSettings.frameRate)
+            : frameDuration.seconds.isFinite && frameDuration.seconds > 0
+                ? frameDuration.seconds
+                : 1.0 / 30.0
         return nudgeSelectedClips(by: Double(frames) * seconds)
     }
 
@@ -1877,6 +1974,7 @@ final class EditorModel {
 
     func nudgeSelectedAudio(samples: Int) -> Bool {
         let sampleRate: Double = {
+            if isProMode { return max(1, proSettings.sampleRate) }
             guard let clip = primarySelectedClip,
                   audioIndex(clip.id) != nil,
                   let file = try? AVAudioFile(forReading: clip.url) else { return 48_000 }
@@ -1905,9 +2003,18 @@ final class EditorModel {
     func snapTime(_ time: TimeInterval, excluding: [TimeInterval] = []) -> TimeInterval {
         guard isSnapEnabled else { return time }
         let threshold = max(0.02, 7 * layoutDuration / max(timelineWidthPoints, 1))
-        var candidates: [TimeInterval] = [0, currentTime, layoutDuration]
-        candidates += videoClips.flatMap { [$0.timelineStart, $0.timelineEnd] }
-        candidates += audioClips.flatMap { [$0.timelineStart, $0.timelineEnd] }
+        var candidates: [TimeInterval] = [0, layoutDuration]
+        if !isProMode || proSettings.snapToPlayhead {
+            candidates.append(currentTime)
+        }
+        if !isProMode || proSettings.snapToClipEdges {
+            candidates += videoClips.flatMap { [$0.timelineStart, $0.timelineEnd] }
+            candidates += audioClips.flatMap { [$0.timelineStart, $0.timelineEnd] }
+        }
+        if isProMode, proSettings.snapToFrameGrid {
+            let frame = 1 / max(1, proSettings.frameRate)
+            candidates.append((time / frame).rounded() * frame)
+        }
         let filtered = candidates.filter { candidate in
             excluding.allSatisfy { abs($0 - candidate) > 0.0005 }
         }
@@ -2283,6 +2390,184 @@ final class EditorModel {
         primarySelectedClip?.gain ?? 1
     }
 
+    var selectedClipTransform: ClipTransform {
+        selectedVideo?.transform ?? .identity
+    }
+
+    var selectedClipPan: Float {
+        selectedAudio?.pan ?? 0
+    }
+
+    var selectedTransitionIn: ClipTransition {
+        selectedVideo?.transitionIn ?? ClipTransition()
+    }
+
+    var selectedTransitionOut: ClipTransition {
+        selectedVideo?.transitionOut ?? ClipTransition()
+    }
+
+    var selectedKeyframeCount: Int {
+        selectedVideo?.transformKeyframes.count ?? 0
+    }
+
+    func setSelectedTransform(_ update: (inout ClipTransform) -> Void) {
+        guard isProMode else { return }
+        beginEdit()
+        let ids = selectedClipIDs.isEmpty ? Set([selectedClipID].compactMap { $0 }) : selectedClipIDs
+        for id in ids {
+            guard let i = videoIndex(id) else { continue }
+            update(&videoClips[i].transform)
+            videoClips[i].transform.sanitize()
+        }
+        applyFades()
+        scheduleAutosave()
+        isEditingClip = true
+    }
+
+    func setSelectedTransition(_ transition: ClipTransition, incoming: Bool) {
+        guard isProMode else { return }
+        beginEdit()
+        let ids = selectedClipIDs.isEmpty ? Set([selectedClipID].compactMap { $0 }) : selectedClipIDs
+        for id in ids {
+            guard let i = videoIndex(id) else { continue }
+            var value = transition
+            value.sanitize(clipDuration: videoClips[i].duration)
+            if incoming {
+                videoClips[i].transitionIn = value
+            } else {
+                videoClips[i].transitionOut = value
+            }
+        }
+        applyFades()
+        scheduleAutosave()
+        isEditingClip = true
+    }
+
+    func addTransformKeyframeAtPlayhead() {
+        guard isProMode else { return }
+        pushHistory()
+        let ids = selectedClipIDs.isEmpty ? Set([selectedClipID].compactMap { $0 }) : selectedClipIDs
+        for id in ids {
+            guard let i = videoIndex(id) else { continue }
+            let localTime = min(max(0, currentTime - videoClips[i].timelineStart), videoClips[i].duration)
+            let keyframe = ClipTransformKeyframe(time: localTime, transform: videoClips[i].transform)
+            if let existing = videoClips[i].transformKeyframes.firstIndex(where: { abs($0.time - localTime) < 0.5 / max(proSettings.frameRate, 1) }) {
+                videoClips[i].transformKeyframes[existing] = keyframe
+            } else {
+                videoClips[i].transformKeyframes.append(keyframe)
+                videoClips[i].transformKeyframes.sort { $0.time < $1.time }
+            }
+        }
+        rebuild()
+    }
+
+    func clearSelectedTransformKeyframes() {
+        guard isProMode else { return }
+        pushHistory()
+        let ids = selectedClipIDs.isEmpty ? Set([selectedClipID].compactMap { $0 }) : selectedClipIDs
+        for id in ids {
+            guard let i = videoIndex(id) else { continue }
+            videoClips[i].transformKeyframes = []
+        }
+        rebuild()
+    }
+
+    func setSelectedPan(_ pan: Float) {
+        guard isProMode else { return }
+        beginEdit()
+        let value = min(max(pan, -1), 1)
+        let ids = selectedClipIDs.isEmpty ? Set([selectedClipID].compactMap { $0 }) : selectedClipIDs
+        for id in ids {
+            guard let i = audioIndex(id) else { continue }
+            audioClips[i].pan = value
+        }
+        applyFades()
+        scheduleAutosave()
+        isEditingClip = true
+    }
+
+    func normalizeSelectedAudio(targetPeak: Float = 0.89) {
+        guard isProMode else { return }
+        pushHistory()
+        let ids = selectedClipIDs.isEmpty ? Set([selectedClipID].compactMap { $0 }) : selectedClipIDs
+        var normalizedAny = false
+        for id in ids {
+            guard let i = audioIndex(id), let peak = audioClips[i].waveform.max(), peak > 0.000_1 else { continue }
+            audioClips[i].gain = ProFeatureMath.normalizedGain(
+                current: audioClips[i].gain,
+                peak: peak,
+                targetPeak: targetPeak
+            )
+            audioClips[i].isNormalized = true
+            normalizedAny = true
+        }
+        status = normalizedAny ? "Normalized selected audio" : "Waveform analysis is still loading"
+        applyFades()
+        rebuild()
+    }
+
+    var selectedAudioMeter: (left: Float, right: Float) {
+        guard isProMode, let clip = selectedAudio, !clip.waveform.isEmpty else { return (0, 0) }
+        let local = min(max(0, currentTime - clip.timelineStart), max(clip.duration, 0.000_1))
+        let sourceTime = clip.inPoint + local
+        let ratio = min(max(sourceTime / max(clip.sourceDuration, 0.000_1), 0), 0.999_999)
+        let index = min(clip.waveform.count - 1, max(0, Int(ratio * Double(clip.waveform.count))))
+        let level = min(max(clip.waveform[index] * clip.gain, 0), 1)
+        let pan = ProFeatureMath.equalPowerPan(clip.pan)
+        return (level * pan.left, level * pan.right)
+    }
+
+    func alignSelectedClips(_ alignment: ClipAlignment) {
+        guard isProMode else { return }
+        let ids = selectedClipIDs
+        let selected = (videoClips + audioClips).filter { ids.contains($0.id) }
+        guard selected.count > 1 else { return }
+        pushHistory()
+        switch alignment {
+        case .starts:
+            let target = selected.map(\.timelineStart).min() ?? 0
+            setSelectedStarts(ids, target: target)
+        case .ends:
+            let target = selected.map(\.timelineEnd).max() ?? 0
+            for id in ids {
+                if let i = videoIndex(id) {
+                    videoClips[i].timelineStart = max(0, target - videoClips[i].duration)
+                } else if let i = audioIndex(id) {
+                    audioClips[i].timelineStart = max(0, target - audioClips[i].duration)
+                }
+            }
+        case .playhead:
+            setSelectedStarts(ids, target: currentTime)
+        case .distribute:
+            let ordered = selected.sorted { $0.timelineStart < $1.timelineStart }
+            guard let first = ordered.first, let last = ordered.last else { break }
+            let totalDuration = ordered.reduce(0) { $0 + $1.duration }
+            let available = max(0, last.timelineEnd - first.timelineStart - totalDuration)
+            let gap = available / Double(max(1, ordered.count - 1))
+            var cursor = first.timelineStart
+            for clip in ordered {
+                if let i = videoIndex(clip.id) {
+                    videoClips[i].timelineStart = cursor
+                } else if let i = audioIndex(clip.id) {
+                    audioClips[i].timelineStart = cursor
+                }
+                cursor += clip.duration + gap
+            }
+        }
+        growTimelineSpan()
+        rebuild()
+    }
+
+    private func setSelectedStarts(_ ids: Set<UUID>, target: TimeInterval) {
+        for id in ids {
+            if let i = videoIndex(id) {
+                videoClips[i].timelineStart = max(0, target)
+            } else if let i = audioIndex(id) {
+                audioClips[i].timelineStart = max(0, target)
+            }
+        }
+    }
+
     /// Inspector display values — primary clip; writes go to all selected.
     var inspectorFadeIn: TimeInterval { primarySelectedClip?.fadeIn ?? 0 }
     var inspectorFadeOut: TimeInterval { primarySelectedClip?.fadeOut ?? 0 }
@@ -2587,6 +2872,7 @@ final class EditorModel {
                     fps: 30,
                     videoBitRate: videoBitRate,
                     audioBitRate: 128_000,
+                    sampleRate: 48_000,
                     videoComposition: unsafeVideoComposition,
                     audioMix: unsafeAudioMix,
                     isCancelled: { cancelFlag.value },
@@ -2796,8 +3082,9 @@ final class EditorModel {
         let sourceSize = exportSourceSize
         let targetSize = settings.targetSize(source: sourceSize)
         let fps = settings.frameRate.seconds.map { 1.0 / $0 } ?? exportSourceFPS
-        let videoBitRate = settings.quality.approximateBitRate(pixelCount: targetSize.width * targetSize.height)
+        let videoBitRate = settings.videoBitRate(pixelCount: targetSize.width * targetSize.height)
         let audioBitRate = settings.audioBitrate.bitsPerSecond ?? 192_000
+        let sampleRate = isProMode ? proSettings.sampleRate : 48_000
         let codec = settings.codec
         let fileType = settings.container.fileType
 
@@ -2829,6 +3116,7 @@ final class EditorModel {
                     fps: fps,
                     videoBitRate: videoBitRate,
                     audioBitRate: audioBitRate,
+                    sampleRate: sampleRate,
                     videoComposition: unsafeVideoComposition,
                     audioMix: unsafeAudioMix,
                     isCancelled: { cancelFlag.value },
@@ -2862,6 +3150,7 @@ final class EditorModel {
         fps: Double,
         videoBitRate: Int,
         audioBitRate: Int,
+        sampleRate: Double,
         videoComposition: AVVideoComposition?,
         audioMix: AVAudioMix?,
         isCancelled: @escaping @Sendable () -> Bool,
@@ -2938,7 +3227,7 @@ final class EditorModel {
             AVLinearPCMIsFloatKey: false,
             AVLinearPCMIsNonInterleaved: false,
             AVNumberOfChannelsKey: 2,
-            AVSampleRateKey: 48_000
+            AVSampleRateKey: sampleRate
         ]
 
         var writerAudio: AVAssetWriterInput?
@@ -2947,7 +3236,7 @@ final class EditorModel {
             let audioSettings: [String: Any] = [
                 AVFormatIDKey: kAudioFormatMPEG4AAC,
                 AVNumberOfChannelsKey: 2,
-                AVSampleRateKey: 48_000,
+                AVSampleRateKey: sampleRate,
                 AVEncoderBitRateKey: audioBitRate
             ]
             let input = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
@@ -3243,10 +3532,11 @@ final class EditorModel {
         }()
 
         let hasFades = videoClips.contains { $0.fadeIn > 0.01 || $0.fadeOut > 0.01 }
+        let hasEffects = hasFades || hasProVideoEffects
         let sizeChanged = abs(targetSize.width - sourceSize.width) > 0.5
             || abs(targetSize.height - sourceSize.height) > 0.5
         let fpsChanged = settings.frameRate != .original || settings.mode == .animatedGIF
-        guard hasFades || sizeChanged || fpsChanged else {
+        guard hasEffects || sizeChanged || fpsChanged else {
             // Keep any existing preview composition (fade ramps).
             return player.currentItem?.videoComposition
         }
@@ -3264,9 +3554,8 @@ final class EditorModel {
         var instructions: [AVVideoCompositionInstructionProtocol] = []
         let timelineEnd = max(videoClips.map(\.timelineEnd).max() ?? 0.05, 0.05)
 
-        if hasFades {
+        if hasEffects {
             for segment in renderSegments() {
-                let clip = segment.clip
                 // Instruction ranges come from the *actual* on-track segment (same rule as
                 // preview), so export can't diverge from the preview or hand AVFoundation
                 // overlapping instructions when clips overlap on the single composition track.
@@ -3276,31 +3565,12 @@ final class EditorModel {
                     duration: CMTime(seconds: segment.duration, preferredTimescale: 600)
                 )
                 let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
-                if sizeChanged {
-                    layer.setTransform(transform, at: .zero)
-                }
-                let fadeIn = min(max(0, clip.fadeIn), segment.duration / 2)
-                let fadeOut = min(max(0, clip.fadeOut), segment.duration - fadeIn)
-                if fadeIn > 0.01 {
-                    layer.setOpacityRamp(
-                        fromStartOpacity: 0,
-                        toEndOpacity: 1,
-                        timeRange: CMTimeRange(
-                            start: CMTime(seconds: segment.at, preferredTimescale: 600),
-                            duration: CMTime(seconds: fadeIn, preferredTimescale: 600)
-                        )
-                    )
-                }
-                if fadeOut > 0.01 {
-                    layer.setOpacityRamp(
-                        fromStartOpacity: 1,
-                        toEndOpacity: 0,
-                        timeRange: CMTimeRange(
-                            start: CMTime(seconds: segment.at + segment.duration - fadeOut, preferredTimescale: 600),
-                            duration: CMTime(seconds: fadeOut, preferredTimescale: 600)
-                        )
-                    )
-                }
+                configureVideoLayer(
+                    layer,
+                    segment: segment,
+                    canvasSize: targetSize,
+                    baseTransform: sizeChanged ? transform : .identity
+                )
                 instruction.layerInstructions = [layer]
                 instructions.append(instruction)
             }
@@ -3325,6 +3595,7 @@ final class EditorModel {
     private func loadDefaults() async {
         isLoading = true
         status = "Opening…"
+        isProMode = UserDefaults.standard.bool(forKey: Self.proModeDefaultsKey)
         ensureDefaultTracks()
         if !restoreAutosave() {
             status = "Drop media to begin"
@@ -3718,6 +3989,12 @@ final class EditorModel {
 
     private func rebuildComposition() async {
         growTimelineSpan()
+        if isProMode {
+            frameDuration = CMTime(
+                seconds: 1 / max(1, proSettings.frameRate),
+                preferredTimescale: 60_000
+            )
+        }
         if Task.isCancelled { return }
         do {
             let rebuiltMix = AVMutableComposition()
@@ -3754,7 +4031,7 @@ final class EditorModel {
                         if placed.renderSize.width > 1, placed.renderSize.height > 1 {
                             renderSize = placed.renderSize
                         }
-                        if placed.frameRate > 1 {
+                        if !isProMode, placed.frameRate > 1 {
                             frameDuration = CMTime(value: 1, timescale: CMTimeScale(max(1, Int(placed.frameRate.rounded()))))
                         }
                     } catch {
@@ -3775,7 +4052,7 @@ final class EditorModel {
                 let rendered = CGRect(origin: .zero, size: natural).applying(transform)
                 renderSize = CGSize(width: abs(rendered.width), height: abs(rendered.height))
                 let fps = try await src.load(.nominalFrameRate)
-                if fps > 1 {
+                if !isProMode, fps > 1 {
                     frameDuration = CMTime(value: 1, timescale: CMTimeScale(max(1, Int(fps.rounded()))))
                 }
             }
@@ -3880,6 +4157,13 @@ final class EditorModel {
             } else {
                 p.setVolume(vol, at: CMTime(seconds: start, preferredTimescale: 600))
             }
+            if isProMode,
+               let tap = ProAudioProcessor.makeTap(
+                   pan: clip.pan,
+                   limiterEnabled: proSettings.limiterEnabled
+               ) {
+                p.audioTapProcessor = tap
+            }
             if fadeOut > 0.01 && vol > 0 {
                 p.setVolumeRamp(
                     fromStartVolume: vol,
@@ -3944,9 +4228,192 @@ final class EditorModel {
         return segments
     }
 
+    private var hasProVideoEffects: Bool {
+        guard isProMode else { return false }
+        return videoClips.contains {
+            $0.transform != .identity
+                || !$0.transformKeyframes.isEmpty
+                || $0.transitionIn.style != .none
+                || $0.transitionOut.style != .none
+        }
+    }
+
+    private func transformValue(for clip: MediaClip, at localTime: TimeInterval) -> ClipTransform {
+        let keyframes = clip.transformKeyframes.sorted { $0.time < $1.time }
+        guard !keyframes.isEmpty else { return clip.transform }
+        if localTime <= keyframes[0].time {
+            guard keyframes[0].time > 0 else { return keyframes[0].transform }
+            return .interpolated(
+                from: clip.transform,
+                to: keyframes[0].transform,
+                progress: localTime / keyframes[0].time
+            )
+        }
+        for pair in zip(keyframes, keyframes.dropFirst()) where localTime <= pair.1.time {
+            let span = max(0.000_1, pair.1.time - pair.0.time)
+            return .interpolated(
+                from: pair.0.transform,
+                to: pair.1.transform,
+                progress: (localTime - pair.0.time) / span
+            )
+        }
+        return keyframes.last?.transform ?? clip.transform
+    }
+
+    private func configureVideoLayer(
+        _ layer: AVMutableVideoCompositionLayerInstruction,
+        segment: VideoRenderSegment,
+        canvasSize: CGSize,
+        baseTransform: CGAffineTransform = .identity
+    ) {
+        let clip = segment.clip
+        let localStart = max(0, segment.at - clip.timelineStart)
+        let localEnd = localStart + segment.duration
+        let segmentStart = CMTime(seconds: segment.at, preferredTimescale: 600)
+        let baseAtStart = transformValue(for: clip, at: localStart)
+
+        if isProMode, !clip.transformKeyframes.isEmpty {
+            var points: [(TimeInterval, ClipTransform)] = [(localStart, baseAtStart)]
+            points += clip.transformKeyframes
+                .filter { $0.time > localStart + 0.000_1 && $0.time < localEnd - 0.000_1 }
+                .map { ($0.time, $0.transform) }
+            points.append((localEnd, transformValue(for: clip, at: localEnd)))
+            for pair in zip(points, points.dropFirst()) {
+                let start = segment.at + pair.0.0 - localStart
+                let span = max(0.000_1, pair.1.0 - pair.0.0)
+                let range = CMTimeRange(
+                    start: CMTime(seconds: start, preferredTimescale: 600),
+                    duration: CMTime(seconds: span, preferredTimescale: 600)
+                )
+                layer.setTransformRamp(
+                    fromStart: pair.0.1.affineTransform(canvasSize: canvasSize, base: baseTransform),
+                    toEnd: pair.1.1.affineTransform(canvasSize: canvasSize, base: baseTransform),
+                    timeRange: range
+                )
+                layer.setOpacityRamp(
+                    fromStartOpacity: Float(pair.0.1.opacity),
+                    toEndOpacity: Float(pair.1.1.opacity),
+                    timeRange: range
+                )
+            }
+        } else {
+            layer.setTransform(
+                baseAtStart.affineTransform(canvasSize: canvasSize, base: baseTransform),
+                at: segmentStart
+            )
+            layer.setOpacity(Float(baseAtStart.opacity), at: segmentStart)
+        }
+
+        let fadeIn = min(max(0, clip.fadeIn), segment.duration / 2)
+        let fadeOut = min(max(0, clip.fadeOut), segment.duration - fadeIn)
+        if fadeIn > 0.01 {
+            layer.setOpacityRamp(
+                fromStartOpacity: 0,
+                toEndOpacity: Float(baseAtStart.opacity),
+                timeRange: CMTimeRange(
+                    start: segmentStart,
+                    duration: CMTime(seconds: fadeIn, preferredTimescale: 600)
+                )
+            )
+        }
+        if fadeOut > 0.01 {
+            let endOpacity = transformValue(for: clip, at: localEnd).opacity
+            layer.setOpacityRamp(
+                fromStartOpacity: Float(endOpacity),
+                toEndOpacity: 0,
+                timeRange: CMTimeRange(
+                    start: CMTime(seconds: segment.at + segment.duration - fadeOut, preferredTimescale: 600),
+                    duration: CMTime(seconds: fadeOut, preferredTimescale: 600)
+                )
+            )
+        }
+
+        guard isProMode else { return }
+        if localStart < 0.000_1 {
+            applyTransition(
+                clip.transitionIn,
+                incoming: true,
+                layer: layer,
+                clip: clip,
+                canvasSize: canvasSize,
+                baseTransform: baseTransform,
+                timelineStart: segment.at,
+                localTime: 0,
+                maximumDuration: segment.duration
+            )
+        }
+        if abs(localEnd - clip.duration) < 0.001 {
+            applyTransition(
+                clip.transitionOut,
+                incoming: false,
+                layer: layer,
+                clip: clip,
+                canvasSize: canvasSize,
+                baseTransform: baseTransform,
+                timelineStart: segment.at + segment.duration,
+                localTime: clip.duration,
+                maximumDuration: segment.duration
+            )
+        }
+    }
+
+    private func applyTransition(
+        _ transition: ClipTransition,
+        incoming: Bool,
+        layer: AVMutableVideoCompositionLayerInstruction,
+        clip: MediaClip,
+        canvasSize: CGSize,
+        baseTransform: CGAffineTransform,
+        timelineStart: TimeInterval,
+        localTime: TimeInterval,
+        maximumDuration: TimeInterval
+    ) {
+        guard transition.style != .none else { return }
+        let duration = min(max(0, transition.duration), maximumDuration / 2)
+        guard duration > 0.001 else { return }
+        let rangeStart = incoming ? timelineStart : timelineStart - duration
+        let range = CMTimeRange(
+            start: CMTime(seconds: rangeStart, preferredTimescale: 600),
+            duration: CMTime(seconds: duration, preferredTimescale: 600)
+        )
+        let settled = transformValue(for: clip, at: localTime)
+        let settledTransform = settled.affineTransform(canvasSize: canvasSize, base: baseTransform)
+        switch transition.style {
+        case .none:
+            break
+        case .dissolve:
+            layer.setOpacityRamp(
+                fromStartOpacity: incoming ? 0 : Float(settled.opacity),
+                toEndOpacity: incoming ? Float(settled.opacity) : 0,
+                timeRange: range
+            )
+        case .slide:
+            let displaced = settledTransform.translatedBy(
+                x: incoming ? -canvasSize.width * 0.18 : canvasSize.width * 0.18,
+                y: 0
+            )
+            layer.setTransformRamp(
+                fromStart: incoming ? displaced : settledTransform,
+                toEnd: incoming ? settledTransform : displaced,
+                timeRange: range
+            )
+        case .zoom:
+            let zoomed = settledTransform
+                .translatedBy(x: canvasSize.width / 2, y: canvasSize.height / 2)
+                .scaledBy(x: incoming ? 0.82 : 1.18, y: incoming ? 0.82 : 1.18)
+                .translatedBy(x: -canvasSize.width / 2, y: -canvasSize.height / 2)
+            layer.setTransformRamp(
+                fromStart: incoming ? zoomed : settledTransform,
+                toEnd: incoming ? settledTransform : zoomed,
+                timeRange: range
+            )
+        }
+    }
+
     private func makeVideoComposition() -> AVVideoComposition? {
         guard let track = mix.track(withTrackID: 1), !videoClips.isEmpty else { return nil }
-        guard videoClips.contains(where: { $0.fadeIn > 0.01 || $0.fadeOut > 0.01 }) else { return nil }
+        guard videoClips.contains(where: { $0.fadeIn > 0.01 || $0.fadeOut > 0.01 })
+                || hasProVideoEffects else { return nil }
         let composition = AVMutableVideoComposition()
         composition.renderSize = renderSize.width > 1 ? renderSize : CGSize(width: 1080, height: 1920)
         composition.frameDuration = frameDuration
@@ -3962,28 +4429,7 @@ final class EditorModel {
                 duration: CMTime(seconds: segment.duration, preferredTimescale: 600)
             )
             let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
-            let fadeIn = min(max(0, clip.fadeIn), segment.duration / 2)
-            let fadeOut = min(max(0, clip.fadeOut), segment.duration - fadeIn)
-            if fadeIn > 0.01 {
-                layer.setOpacityRamp(
-                    fromStartOpacity: 0,
-                    toEndOpacity: 1,
-                    timeRange: CMTimeRange(
-                        start: CMTime(seconds: segment.at, preferredTimescale: 600),
-                        duration: CMTime(seconds: fadeIn, preferredTimescale: 600)
-                    )
-                )
-            }
-            if fadeOut > 0.01 {
-                layer.setOpacityRamp(
-                    fromStartOpacity: 1,
-                    toEndOpacity: 0,
-                    timeRange: CMTimeRange(
-                        start: CMTime(seconds: segment.at + segment.duration - fadeOut, preferredTimescale: 600),
-                        duration: CMTime(seconds: fadeOut, preferredTimescale: 600)
-                    )
-                )
-            }
+            configureVideoLayer(layer, segment: segment, canvasSize: composition.renderSize)
             instruction.layerInstructions = [layer]
             instructions.append(instruction)
         }
