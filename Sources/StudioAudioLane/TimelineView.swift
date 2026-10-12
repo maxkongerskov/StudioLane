@@ -1124,8 +1124,8 @@ struct AddLaneMenuButton: View {
 
     var body: some View {
         Menu {
-            Button("Add Audio Lane") { model.addLane(kind: .audio) }
-            Button("Add Video Lane") { model.addLane(kind: .video) }
+            Button("Audio") { model.addLane(kind: .audio) }
+            Button("Video") { model.addLane(kind: .video) }
         } label: {
             Image(systemName: "plus")
                 .font(.system(size: 10, weight: .semibold))
