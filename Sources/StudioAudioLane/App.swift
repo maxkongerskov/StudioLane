@@ -106,6 +106,7 @@ struct StudioAudioLaneApp: App {
     init() {
         if CommandLine.arguments.contains("--mcp") {
         }
+
     }
 
     private func startMCPIfNeeded() {

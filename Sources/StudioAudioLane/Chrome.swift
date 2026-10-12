@@ -822,7 +822,7 @@ struct TitleBarOpenButton: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help("Load video or audio from Finder")
+        .help("Load video, image, or audio from Finder")
         .accessibilityLabel("Open media")
         .onHover { hovering = $0 }
     }

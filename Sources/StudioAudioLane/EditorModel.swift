@@ -832,7 +832,9 @@ final class EditorModel {
         let id = clip.id
         let url = clip.url
         let sourceDuration = max(clip.sourceDuration, 0.05)
-        let count = Self.filmstripFrameCount(for: sourceDuration)
+        // Stills repeat one picture. A short strip is enough; the lane masks it
+        // by in-point the same way a filmstrip is masked.
+        let count = StillImage.isStill(url) ? 12 : Self.filmstripFrameCount(for: sourceDuration)
         Task {
             // Full-source frames so trim only remasks the window — no live regenerate.
             let frames = await Filmstrip.generate(url: url, count: count, inPoint: 0, duration: sourceDuration)
@@ -1213,19 +1215,16 @@ final class EditorModel {
     /// Media-agnostic open: accepts video + audio and routes by type.
     func pickMediaFile(preferredKind: TimelineTrack.Kind? = nil, ontoTrackID: UUID? = nil) {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [
-            .movie, .mpeg4Movie, .quickTimeMovie, .avi,
-            .audio, .mp3, .wav, .aiff, .mpeg4Audio
-        ]
+        panel.allowedContentTypes = Self.openMediaTypes
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = true
         switch preferredKind {
         case .video:
-            panel.message = videoClips.isEmpty ? "Open media" : "Add video to the track"
+            panel.message = videoClips.isEmpty ? "Open video or image" : "Add a video or image to the track"
         case .audio:
             panel.message = "Add audio to the track"
         case nil:
-            panel.message = "Open media"
+            panel.message = "Open video, image, or audio"
         }
         guard panel.runModal() == .OK else { return }
         acceptDroppedFiles(panel.urls, at: nil, ontoTrackID: ontoTrackID, preferKind: preferredKind)
@@ -1264,20 +1263,33 @@ final class EditorModel {
         return audioTracks.first?.id ?? Self.defaultAudioTrackID
     }
 
-    static let audioExtensions: Set<String> = [
+    nonisolated static let audioExtensions: Set<String> = [
         "wav", "mp3", "m4a", "aac", "aiff", "aif", "caf", "flac", "ogg", "wma"
     ]
-    static let videoExtensions: Set<String> = [
+    nonisolated static let videoExtensions: Set<String> = [
         "mov", "mp4", "m4v", "avi", "mkv", "mpg", "mpeg", "mts", "m2ts", "webm"
     ]
 
-    static func mediaKind(for url: URL) -> TimelineTrack.Kind {
+    /// Movies, still images, and audio. Images land on a video lane.
+    static let openMediaTypes: [UTType] = [
+        .movie, .mpeg4Movie, .quickTimeMovie, .avi,
+        .image, .jpeg, .png, .gif, .tiff, .bmp, .heic, .heif, .webP,
+        .audio, .mp3, .wav, .aiff, .mpeg4Audio
+    ]
+
+    static let mediaDropTypes: [UTType] = [
+        .fileURL, .movie, .audio, .audiovisualContent, .image
+    ]
+
+    nonisolated static func mediaKind(for url: URL) -> TimelineTrack.Kind {
         let ext = url.pathExtension.lowercased()
         if audioExtensions.contains(ext) { return .audio }
         if videoExtensions.contains(ext) { return .video }
-        // UTI fallback
+        // Photos, screenshots, RAW, and anything else UniformTypeIdentifiers calls an image.
+        if StillImage.isStill(url) { return .video }
         if let values = try? url.resourceValues(forKeys: [.contentTypeKey]),
            let type = values.contentType {
+            if type.conforms(to: .image) { return .video }
             if type.conforms(to: .audiovisualContent) && !type.conforms(to: .audio) {
                 return .video
             }
@@ -2071,7 +2083,12 @@ final class EditorModel {
     }
     var inspectorMaxLength: TimeInterval {
         guard let clip = primarySelectedClip else { return 0.2 }
-        return max(0.2, clip.sourceDuration - clip.inPoint)
+        let mediaMax = max(0.2, clip.sourceDuration - clip.inPoint)
+        guard StillImage.isStill(clip.url) else { return mediaMax }
+        // A still's source is a long hold, not a file length. Keep the slider
+        // near the current hold; it grows as the picture is extended. Trim
+        // handles still reach `StillImage.maximumDuration`.
+        return min(mediaMax, max(60, clip.duration * 1.5))
     }
     var inspectorValuesAreMixed: Bool {
         let clips = allSelectedClips
@@ -2923,6 +2940,33 @@ final class EditorModel {
         trackID: UUID,
         requiresMediaType: AVMediaType? = nil
     ) async -> MediaClip? {
+        if StillImage.isStill(url) {
+            if requiresMediaType == .audio {
+                errorMessage = "“\(url.lastPathComponent)” is an image — place it on a video lane."
+                return nil
+            }
+            // Pictures have no duration of their own. Prepare the cached movie now
+            // so a file ImageIO cannot read never becomes an empty clip.
+            do {
+                _ = try await StillImage.movieURL(for: url)
+            } catch {
+                errorMessage = error.localizedDescription
+                return nil
+            }
+            let dur = StillImage.defaultDuration
+            return MediaClip(
+                id: UUID(),
+                url: url,
+                name: url.deletingPathExtension().lastPathComponent,
+                sourceDuration: StillImage.maximumDuration,
+                inPoint: 0,
+                timelineStart: start,
+                duration: dur,
+                fadeIn: min(fade, dur / 2),
+                fadeOut: min(fade, dur / 2),
+                trackID: trackID
+            )
+        }
         let asset = AVURLAsset(url: url)
         let source = (try? await asset.load(.duration).seconds) ?? 0
         guard source.isFinite, source > 0 else {
@@ -3137,8 +3181,31 @@ final class EditorModel {
             // its instructions from the same segments so they can't disagree.
             for segment in renderSegments() {
                 if Task.isCancelled { return }
+                guard let videoTrack else { continue }
+                if StillImage.isStill(segment.clip.url) {
+                    do {
+                        let movie = try await StillImage.movieURL(for: segment.clip.url)
+                        // The picture has no time axis. `segment.sourceStart` only records
+                        // a trim; reading it as a movie offset would run past the one-second cache.
+                        let placed = try await StillImage.place(
+                            movieURL: movie,
+                            on: videoTrack,
+                            at: segment.at,
+                            duration: segment.duration
+                        )
+                        if placed.renderSize.width > 1, placed.renderSize.height > 1 {
+                            renderSize = placed.renderSize
+                        }
+                        if placed.frameRate > 1 {
+                            frameDuration = CMTime(value: 1, timescale: CMTimeScale(max(1, Int(placed.frameRate.rounded()))))
+                        }
+                    } catch {
+                        errorMessage = error.localizedDescription
+                    }
+                    continue
+                }
                 let asset = AVURLAsset(url: segment.clip.url)
-                guard let src = try await asset.loadTracks(withMediaType: .video).first, let videoTrack else { continue }
+                guard let src = try await asset.loadTracks(withMediaType: .video).first else { continue }
                 try videoTrack.insertTimeRange(
                     CMTimeRange(start: CMTime(seconds: segment.sourceStart, preferredTimescale: 600), duration: CMTime(seconds: segment.duration, preferredTimescale: 600)),
                     of: src,
@@ -3159,6 +3226,9 @@ final class EditorModel {
             // `AVAudioMixInputParameters` per clip (a shared track drops earlier clips' fades).
             for clip in videoClips.sorted(by: { $0.timelineStart < $1.timelineStart }) {
                 if Task.isCancelled { return }
+                // A still has no soundtrack. Probing the image file for audio throws
+                // and would discard the whole preview composition.
+                if StillImage.isStill(clip.url) { continue }
                 let asset = AVURLAsset(url: clip.url)
                 guard let src = try await asset.loadTracks(withMediaType: .audio).first else { continue }
                 guard let track = rebuiltMix.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) else { continue }
@@ -3567,7 +3637,14 @@ enum Waveform {
 
 enum Filmstrip {
     nonisolated static func generate(url: URL, count: Int, inPoint: TimeInterval = 0, duration: TimeInterval? = nil) async -> [CGImage] {
-        await Task.detached(priority: .userInitiated) {
+        if StillImage.isStill(url) {
+            let frames = max(1, count)
+            return await Task.detached(priority: .userInitiated) {
+                guard let image = StillImage.thumbnail(at: url) else { return [] }
+                return Array(repeating: image, count: frames)
+            }.value
+        }
+        return await Task.detached(priority: .userInitiated) {
             let asset = AVURLAsset(url: url)
             let generator = AVAssetImageGenerator(asset: asset)
             generator.appliesPreferredTrackTransform = true
