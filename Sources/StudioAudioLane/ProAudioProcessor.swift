@@ -59,18 +59,18 @@ enum ProAudioProcessor {
                 _ = flags
             }
         )
-        var unmanagedTap: Unmanaged<MTAudioProcessingTap>?
+        var tap: MTAudioProcessingTap?
         let status = MTAudioProcessingTapCreate(
             kCFAllocatorDefault,
             &callbacks,
             kMTAudioProcessingTapCreationFlag_PreEffects,
-            &unmanagedTap
+            &tap
         )
-        guard status == noErr, let unmanagedTap else {
+        guard status == noErr, let tap else {
             retainedContext.release()
             return nil
         }
-        return unmanagedTap.takeRetainedValue()
+        return tap
     }
 
     private static func process(

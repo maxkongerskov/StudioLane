@@ -4419,7 +4419,6 @@ final class EditorModel {
         composition.frameDuration = frameDuration
         var instructions: [AVVideoCompositionInstructionProtocol] = []
         for segment in renderSegments() {
-            let clip = segment.clip
             // Instruction ranges come from the *actual* on-track segment, not the model's
             // timeline range — a partially-overlapped clip only owns its rendered tail, and a
             // fully-overlapped clip isn't in `segments` at all, so no two instructions overlap.
