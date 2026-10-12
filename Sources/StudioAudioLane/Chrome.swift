@@ -420,6 +420,49 @@ struct InspectorPane: View {
     private var clipFields: some View {
         if selectedClip != nil {
             let accent = inspectorAccent
+            VStack(alignment: .leading, spacing: 6) {
+                Text("PRECISION")
+                    .font(.system(size: 9, weight: .semibold))
+                    .tracking(0.7)
+                    .foregroundStyle(StudioTheme.text.opacity(0.32))
+                PrecisionNumericField(
+                    title: "Start",
+                    value: model.inspectorTimelineStart,
+                    kind: .time
+                ) {
+                    model.setSelectedTimelineStart($0)
+                    model.commitPrecisionEdit()
+                }
+                PrecisionNumericField(
+                    title: "In-point",
+                    value: model.inspectorInPoint,
+                    kind: .time
+                ) {
+                    model.setSelectedInPoint($0)
+                    model.commitPrecisionEdit()
+                }
+                PrecisionNumericField(
+                    title: "Duration",
+                    value: model.inspectorLength,
+                    kind: .time
+                ) {
+                    model.setClipLength($0)
+                    model.commitPrecisionEdit()
+                }
+                PrecisionNumericField(
+                    title: "Gain",
+                    value: TimeInterval(model.selectedClipGain),
+                    kind: .gain
+                ) {
+                    model.setSelectedClipGain(Float($0))
+                    model.commitPrecisionEdit()
+                }
+                Text("←/→ frame · ⇧ 10 frames · ⌥ audio ms · ⌃⌥ audio sample")
+                    .font(.system(size: 9))
+                    .foregroundStyle(StudioTheme.text.opacity(0.34))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.bottom, 4)
             parameterStack {
                 ParameterSlider(
                     title: "Fade in",
@@ -509,6 +552,85 @@ struct InspectorPane: View {
         // Range is the clip's max fade. Floor 0.12 so a tiny clip still has a grabable
         // track; include current so a value already past clipMax doesn't sit past 100%.
         max(0.12, max(0, clipMax), current)
+    }
+}
+
+struct PrecisionNumericField: View {
+    enum Kind {
+        case time, gain
+    }
+
+    let title: String
+    let value: TimeInterval
+    let kind: Kind
+    let commit: (TimeInterval) -> Void
+    @State private var draft = ""
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(title)
+                .font(.system(size: 11))
+                .foregroundStyle(StudioTheme.text.opacity(0.52))
+            Spacer(minLength: 4)
+            TextField("", text: $draft)
+                .textFieldStyle(.plain)
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .multilineTextAlignment(.trailing)
+                .focused($focused)
+                .onSubmit { submit() }
+                .onExitCommand {
+                    focused = false
+                    draft = formatted(value)
+                }
+                .frame(width: 92, height: 24)
+                .padding(.horizontal, 7)
+                .background(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(Color.white.opacity(focused ? 0.09 : 0.055))
+                )
+        }
+        .onAppear { draft = formatted(value) }
+        .onChange(of: value) { _, newValue in
+            if !focused { draft = formatted(newValue) }
+        }
+    }
+
+    private func submit() {
+        guard let parsed else {
+            draft = formatted(value)
+            focused = false
+            return
+        }
+        commit(parsed)
+        draft = formatted(parsed)
+        focused = false
+    }
+
+    private var parsed: TimeInterval? {
+        switch kind {
+        case .time:
+            return StudioFormat.parseTimecode(
+                draft.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .replacingOccurrences(of: "s", with: "", options: .caseInsensitive)
+            )
+        case .gain:
+            let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+            let percent = trimmed.hasSuffix("%")
+            let number = trimmed.replacingOccurrences(of: "%", with: "")
+            guard let raw = Double(number), raw.isFinite else { return nil }
+            let normalized = percent || raw > 1 ? raw / 100 : raw
+            return min(max(normalized, 0), 1)
+        }
+    }
+
+    private func formatted(_ value: TimeInterval) -> String {
+        switch kind {
+        case .time:
+            String(format: "%.3f s", max(0, value))
+        case .gain:
+            String(format: "%.1f%%", min(max(value, 0), 1) * 100)
+        }
     }
 }
 

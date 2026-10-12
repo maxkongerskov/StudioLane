@@ -42,6 +42,16 @@ struct StudioAudioLaneApp: App {
                 .keyboardShortcut("e", modifiers: [.command])
                 .disabled(!model.hasVideo || model.isExporting)
             }
+            CommandMenu("Timeline") {
+                Button("Zoom In") { model.zoomIn() }
+                    .keyboardShortcut("+", modifiers: [.command])
+                Button("Zoom Out") { model.zoomOut() }
+                    .keyboardShortcut("-", modifiers: [.command])
+                Button("Zoom to Fit") {
+                    model.zoomToFit(viewportWidth: model.timelineViewportWidth)
+                }
+                    .keyboardShortcut("0", modifiers: [.command])
+            }
             CommandMenu("Audio") {
                 Button("Add Audio Track…") {
                     model.pickAudioFile()

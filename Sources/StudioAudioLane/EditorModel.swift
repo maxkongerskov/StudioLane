@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import ImageIO
 import Observation
 import UniformTypeIdentifiers
 
@@ -671,6 +672,7 @@ final class EditorModel {
     private var exportCancelFlag: ExportCancelFlag?
     private var exportProgressTimer: Timer?
     private var exportWriterTask: Task<Void, Never>?
+    private var exportTemporaryURLs: Set<URL> = []
     /// Destination of the in-flight export; used to delete incomplete files on cancel/failure.
     var exportDestinationURL: URL?
 
@@ -738,13 +740,30 @@ final class EditorModel {
         }
         try? FileManager.default.removeItem(at: destination)
         exportDestinationURL = destination
-        let pipeline = settings.prefersWriterPipeline ? "writer" : "session"
-        status = "Exporting… (\(pipeline), \(settings.codec.rawValue)/\(settings.container.rawValue))"
 
         let videoComposition = makeExportVideoComposition(settings: settings)
         let audioMix = item.audioMix ?? makeAudioMix()
 
-        if settings.prefersWriterPipeline {
+        switch settings.mode {
+        case .animatedGIF:
+            status = "Exporting… (animated GIF)"
+            startGIFExport(
+                asset: item.asset,
+                settings: settings,
+                destination: destination,
+                videoComposition: videoComposition
+            )
+        case .xLoop:
+            status = "Exporting… (X loop H.264/AAC)"
+            startXLoopExport(
+                asset: item.asset,
+                settings: settings,
+                destination: destination,
+                videoComposition: videoComposition,
+                audioMix: audioMix
+            )
+        case .video where settings.prefersWriterPipeline:
+            status = "Exporting… (writer, \(settings.codec.rawValue)/\(settings.container.rawValue))"
             startWriterExport(
                 asset: item.asset,
                 settings: settings,
@@ -752,7 +771,8 @@ final class EditorModel {
                 videoComposition: videoComposition,
                 audioMix: audioMix
             )
-        } else {
+        case .video:
+            status = "Exporting… (session, \(settings.codec.rawValue)/\(settings.container.rawValue))"
             startSessionExport(
                 asset: item.asset,
                 settings: settings,
@@ -1632,27 +1652,27 @@ final class EditorModel {
         }
     }
 
-    func trimIn(clipID: UUID, toTimelineTime time: TimeInterval) {
+    func trimIn(clipID: UUID, toTimelineTime time: TimeInterval, snapping: Bool = true) {
         beginEdit()
         if let i = audioIndex(clipID) {
             let end = audioClips[i].timelineEnd
-            trimInOn(&audioClips[i], time: snapTime(time, excluding: [end]))
+            trimInOn(&audioClips[i], time: snapping ? snapTime(time, excluding: [end]) : time)
         } else if let i = videoIndex(clipID) {
             let end = videoClips[i].timelineEnd
-            trimInOn(&videoClips[i], time: snapTime(time, excluding: [end]))
+            trimInOn(&videoClips[i], time: snapping ? snapTime(time, excluding: [end]) : time)
         }
         isEditingClip = true
     }
 
-    func trimOut(clipID: UUID, toTimelineTime time: TimeInterval) {
+    func trimOut(clipID: UUID, toTimelineTime time: TimeInterval, snapping: Bool = true) {
         beginEdit()
         if let i = audioIndex(clipID) {
             let start = audioClips[i].timelineStart
-            trimOutOn(&audioClips[i], time: snapTime(time, excluding: [start]))
+            trimOutOn(&audioClips[i], time: snapping ? snapTime(time, excluding: [start]) : time)
         } else if let i = videoIndex(clipID) {
             let start = videoClips[i].timelineStart
             var clip = videoClips[i]
-            trimOutOn(&clip, time: snapTime(time, excluding: [start]))
+            trimOutOn(&clip, time: snapping ? snapTime(time, excluding: [start]) : time)
             videoClips[i] = clip
         }
         isEditingClip = true
@@ -1662,15 +1682,129 @@ final class EditorModel {
         moveClip(clipID: clipID, toStart: time)
     }
 
-    func moveClip(clipID: UUID, toStart time: TimeInterval) {
+    func moveClip(clipID: UUID, toStart time: TimeInterval, snapping: Bool = true) {
         beginEdit()
-        let start = snapTime(max(0, time))
+        let proposed = max(0, time)
+        let start = snapping ? snapTime(proposed) : proposed
         if let i = audioIndex(clipID) {
             audioClips[i].timelineStart = start
         } else if let i = videoIndex(clipID) {
             videoClips[i].timelineStart = start
         }
         isEditingClip = true
+    }
+
+    /// Slip changes which source media is visible without moving or resizing the clip.
+    func slipClip(clipID: UUID, toInPoint time: TimeInterval) {
+        beginEdit()
+        if let i = audioIndex(clipID) {
+            audioClips[i].inPoint = min(
+                max(0, time),
+                max(0, audioClips[i].sourceDuration - audioClips[i].duration)
+            )
+        } else if let i = videoIndex(clipID) {
+            videoClips[i].inPoint = min(
+                max(0, time),
+                max(0, videoClips[i].sourceDuration - videoClips[i].duration)
+            )
+        }
+        isEditingClip = true
+    }
+
+    var inspectorTimelineStart: TimeInterval { primarySelectedClip?.timelineStart ?? 0 }
+    var inspectorInPoint: TimeInterval { primarySelectedClip?.inPoint ?? 0 }
+
+    /// Numeric start entry shifts all selected clips by the same delta so a
+    /// multi-selection keeps its internal spacing.
+    func setSelectedTimelineStart(_ start: TimeInterval) {
+        guard let primary = primarySelectedClip else { return }
+        beginEdit()
+        let ids = selectedClipIDs.isEmpty ? Set([primary.id]) : selectedClipIDs
+        let requestedDelta = max(0, start) - primary.timelineStart
+        let selected = (videoClips + audioClips).filter { ids.contains($0.id) }
+        let minimumStart = selected.map(\.timelineStart).min() ?? 0
+        let delta = max(requestedDelta, -minimumStart)
+        for id in ids {
+            if let i = videoIndex(id) {
+                videoClips[i].timelineStart += delta
+            } else if let i = audioIndex(id) {
+                audioClips[i].timelineStart += delta
+            }
+        }
+        isEditingClip = true
+    }
+
+    /// Numeric in-point entry is a slip edit: timeline position and duration stay fixed.
+    func setSelectedInPoint(_ inPoint: TimeInterval) {
+        guard let primary = primarySelectedClip else { return }
+        beginEdit()
+        let ids = selectedClipIDs.isEmpty ? Set([primary.id]) : selectedClipIDs
+        let delta = max(0, inPoint) - primary.inPoint
+        for id in ids {
+            if let i = videoIndex(id) {
+                let maximum = max(0, videoClips[i].sourceDuration - videoClips[i].duration)
+                videoClips[i].inPoint = min(max(0, videoClips[i].inPoint + delta), maximum)
+            } else if let i = audioIndex(id) {
+                let maximum = max(0, audioClips[i].sourceDuration - audioClips[i].duration)
+                audioClips[i].inPoint = min(max(0, audioClips[i].inPoint + delta), maximum)
+            }
+        }
+        isEditingClip = true
+    }
+
+    /// Commits a precision edit without playlist normalization. Fine nudges and
+    /// numeric offsets are intentional gaps/overlaps and must not be rippled away.
+    func commitPrecisionEdit() {
+        isEditingClip = false
+        growTimelineSpan()
+        rebuild()
+    }
+
+    @discardableResult
+    func nudgeSelectedClips(by delta: TimeInterval, audioOnly: Bool = false) -> Bool {
+        var ids = selectedClipIDs
+        if ids.isEmpty, let selectedClipID { ids = [selectedClipID] }
+        if audioOnly {
+            ids = ids.filter { audioIndex($0) != nil }
+        }
+        let clips = (videoClips + audioClips).filter { ids.contains($0.id) }
+        guard !clips.isEmpty, delta.isFinite, delta != 0 else { return false }
+        isEditingClip = false
+        pushHistory()
+        let minimumStart = clips.map(\.timelineStart).min() ?? 0
+        let applied = max(delta, -minimumStart)
+        for id in ids {
+            if let i = videoIndex(id) {
+                videoClips[i].timelineStart += applied
+            } else if let i = audioIndex(id) {
+                audioClips[i].timelineStart += applied
+            }
+        }
+        growTimelineSpan()
+        scheduleAutosave()
+        scheduleRebuild()
+        return true
+    }
+
+    func nudgeSelectedByFrames(_ frames: Int) -> Bool {
+        let seconds = frameDuration.seconds.isFinite && frameDuration.seconds > 0
+            ? frameDuration.seconds
+            : 1.0 / 30.0
+        return nudgeSelectedClips(by: Double(frames) * seconds)
+    }
+
+    func nudgeSelectedAudio(milliseconds: Double) -> Bool {
+        nudgeSelectedClips(by: milliseconds / 1_000, audioOnly: true)
+    }
+
+    func nudgeSelectedAudio(samples: Int) -> Bool {
+        let sampleRate: Double = {
+            guard let clip = primarySelectedClip,
+                  audioIndex(clip.id) != nil,
+                  let file = try? AVAudioFile(forReading: clip.url) else { return 48_000 }
+            return max(1, file.processingFormat.sampleRate)
+        }()
+        return nudgeSelectedClips(by: Double(samples) / sampleRate, audioOnly: true)
     }
 
     func setClipLength(_ length: TimeInterval) {
@@ -1710,12 +1844,16 @@ final class EditorModel {
         max(timelineViewportWidth, 1) * max(timelineZoom, 1)
     }
 
+    func setTimelineZoom(_ zoom: CGFloat) {
+        timelineZoom = min(max(zoom, Self.minTimelineZoom), Self.maxTimelineZoom)
+    }
+
     func zoomIn() {
-        timelineZoom = min(Self.maxTimelineZoom, timelineZoom * 1.35)
+        setTimelineZoom(timelineZoom * 1.35)
     }
 
     func zoomOut() {
-        timelineZoom = max(Self.minTimelineZoom, timelineZoom / 1.35)
+        setTimelineZoom(timelineZoom / 1.35)
     }
 
     func zoomToFit(viewportWidth: CGFloat) {
@@ -2129,14 +2267,14 @@ final class EditorModel {
         let panel = NSSavePanel()
         panel.canCreateDirectories = true
         panel.isExtensionHidden = false
-        panel.title = "Export Video"
-        panel.nameFieldStringValue = "\(settings.fileBaseName).\(settings.container.pathExtension)"
-        panel.allowedContentTypes = [settings.container.contentType]
+        panel.title = settings.mode == .animatedGIF ? "Export Animated GIF" : "Export Video"
+        panel.nameFieldStringValue = "\(settings.fileBaseName).\(settings.pathExtension)"
+        panel.allowedContentTypes = [settings.contentType]
         panel.allowsOtherFileTypes = false
         guard panel.runModal() == .OK, let dest = panel.url else { return }
 
         let finalURL: URL = {
-            let ext = settings.container.pathExtension
+            let ext = settings.pathExtension
             if dest.pathExtension.lowercased() == ext { return dest }
             return dest.deletingPathExtension().appendingPathExtension(ext)
         }()
@@ -2168,6 +2306,7 @@ final class EditorModel {
         if let dest = exportDestinationURL {
             try? FileManager.default.removeItem(at: dest)
         }
+        removeExportTemporaryFiles()
         exportDestinationURL = nil
         if isExporting {
             isExporting = false
@@ -2182,6 +2321,326 @@ final class EditorModel {
             .replacingOccurrences(of: "/", with: "-")
             .replacingOccurrences(of: ":", with: "-")
         return cleaned.isEmpty ? "StudioLane" : cleaned
+    }
+
+    private func startGIFExport(
+        asset: AVAsset,
+        settings: ExportSettings,
+        destination: URL,
+        videoComposition: AVVideoComposition?
+    ) {
+        nonisolated(unsafe) let unsafeAsset = asset
+        let unsafeVideoComposition = videoComposition
+        let cancelFlag = ExportCancelFlag()
+        exportCancelFlag = cancelFlag
+        let intent = exportIntent
+        exportWriterTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await EditorModel.performGIFExport(
+                    asset: unsafeAsset,
+                    destination: destination,
+                    targetSize: settings.targetSize(source: self.exportSourceSize),
+                    fps: settings.gifFrameRate.value,
+                    compressionQuality: settings.gifPaletteQuality.compressionQuality,
+                    videoComposition: unsafeVideoComposition,
+                    byteLimit: 15_000_000,
+                    isCancelled: { cancelFlag.value },
+                    onProgress: { [weak self] value in
+                        Task { @MainActor in self?.exportProgress = value }
+                    }
+                )
+                guard self.exportIntent == intent else { return }
+                self.finishExport(success: true, destination: destination, message: nil)
+            } catch is CancellationError {
+                guard self.exportIntent == intent else { return }
+                self.finishExport(success: false, destination: destination, message: "Export cancelled", reveal: false)
+            } catch {
+                guard self.exportIntent == intent else { return }
+                self.finishExport(
+                    success: false,
+                    destination: destination,
+                    message: "GIF export failed: \(error.localizedDescription)"
+                )
+            }
+        }
+    }
+
+    /// Encodes an infinitely looping GIF and retries progressively smaller/fewer
+    /// frames when necessary to stay under X's 15 MB upload limit.
+    nonisolated static func performGIFExport(
+        asset: AVAsset,
+        destination: URL,
+        targetSize: CGSize,
+        fps: Double,
+        compressionQuality: Double,
+        videoComposition: AVVideoComposition?,
+        byteLimit: Int,
+        isCancelled: @escaping @Sendable () -> Bool,
+        onProgress: @escaping @Sendable (Double) -> Void
+    ) async throws {
+        let duration = max(0.05, try await asset.load(.duration).seconds)
+        let requestedFPS = min(max(fps, 1), 30)
+        let attempts: [(scale: CGFloat, fps: Double)] = [
+            (1, requestedFPS),
+            (0.84, min(requestedFPS, 12)),
+            (0.68, min(requestedFPS, 10)),
+            (0.52, min(requestedFPS, 8))
+        ]
+
+        for (attemptIndex, attempt) in attempts.enumerated() {
+            if isCancelled() { throw CancellationError() }
+            try? FileManager.default.removeItem(at: destination)
+
+            let generator = AVAssetImageGenerator(asset: asset)
+            generator.appliesPreferredTrackTransform = true
+            generator.videoComposition = videoComposition
+            generator.maximumSize = CGSize(
+                width: max(2, targetSize.width * attempt.scale),
+                height: max(2, targetSize.height * attempt.scale)
+            )
+            generator.requestedTimeToleranceBefore = CMTime(
+                seconds: 0.5 / attempt.fps,
+                preferredTimescale: 600
+            )
+            generator.requestedTimeToleranceAfter = generator.requestedTimeToleranceBefore
+
+            let frameCount = max(1, Int(ceil(duration * attempt.fps)))
+            guard let gif = CGImageDestinationCreateWithURL(
+                destination as CFURL,
+                UTType.gif.identifier as CFString,
+                frameCount,
+                nil
+            ) else {
+                throw NSError(
+                    domain: "StudioAudioLane.GIF",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Could not create the GIF destination."]
+                )
+            }
+            CGImageDestinationSetProperties(gif, [
+                kCGImagePropertyGIFDictionary: [
+                    kCGImagePropertyGIFLoopCount: 0
+                ]
+            ] as CFDictionary)
+
+            let delay = 1 / attempt.fps
+            let frameProperties: [CFString: Any] = [
+                kCGImagePropertyGIFDictionary: [
+                    kCGImagePropertyGIFUnclampedDelayTime: delay,
+                    kCGImagePropertyGIFDelayTime: delay
+                ],
+                kCGImageDestinationLossyCompressionQuality: min(max(compressionQuality, 0), 1)
+            ]
+            for frame in 0..<frameCount {
+                if isCancelled() { throw CancellationError() }
+                let seconds = min(
+                    max(0, duration - 1.0 / 600.0),
+                    (Double(frame) + 0.5) / attempt.fps
+                )
+                let (image, _) = try await generator.image(at: CMTime(
+                    seconds: seconds,
+                    preferredTimescale: 600
+                ))
+                CGImageDestinationAddImage(gif, image, frameProperties as CFDictionary)
+                let attemptBase = Double(attemptIndex) / Double(attempts.count)
+                let attemptSpan = 1 / Double(attempts.count)
+                onProgress(min(0.99, attemptBase + attemptSpan * Double(frame + 1) / Double(frameCount)))
+            }
+            guard CGImageDestinationFinalize(gif) else {
+                throw NSError(
+                    domain: "StudioAudioLane.GIF",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "ImageIO could not finalize the GIF."]
+                )
+            }
+
+            let bytes = (try? destination.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? Int.max
+            if bytes <= byteLimit {
+                onProgress(1)
+                return
+            }
+        }
+
+        let bytes = (try? destination.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        try? FileManager.default.removeItem(at: destination)
+        throw NSError(
+            domain: "StudioAudioLane.GIF",
+            code: 3,
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    String(format: "The smallest retry was %.1f MB. Shorten the timeline or choose 480 px / 8 fps.", Double(bytes) / 1_000_000)
+            ]
+        )
+    }
+
+    private func startXLoopExport(
+        asset: AVAsset,
+        settings: ExportSettings,
+        destination: URL,
+        videoComposition: AVVideoComposition?,
+        audioMix: AVAudioMix?
+    ) {
+        let temporary = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StudioLane-XLoop-\(UUID().uuidString)")
+            .appendingPathExtension("mp4")
+        try? FileManager.default.removeItem(at: temporary)
+        exportTemporaryURLs.insert(temporary)
+
+        let targetSize = settings.targetSize(source: exportSourceSize)
+        let videoBitRate = settings.quality.approximateBitRate(
+            pixelCount: targetSize.width * targetSize.height
+        )
+        nonisolated(unsafe) let unsafeAsset = asset
+        let unsafeVideoComposition = videoComposition
+        nonisolated(unsafe) let unsafeAudioMix = audioMix
+        let cancelFlag = ExportCancelFlag()
+        exportCancelFlag = cancelFlag
+        let intent = exportIntent
+        exportWriterTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await EditorModel.performWriterExport(
+                    asset: unsafeAsset,
+                    destination: temporary,
+                    fileType: .mp4,
+                    codec: .h264,
+                    targetSize: targetSize,
+                    fps: 30,
+                    videoBitRate: videoBitRate,
+                    audioBitRate: 128_000,
+                    videoComposition: unsafeVideoComposition,
+                    audioMix: unsafeAudioMix,
+                    isCancelled: { cancelFlag.value },
+                    onProgress: { [weak self] value in
+                        Task { @MainActor in self?.exportProgress = value * 0.8 }
+                    }
+                )
+                guard self.exportIntent == intent else { return }
+                if settings.xLoopCount == 1 {
+                    try? FileManager.default.removeItem(at: destination)
+                    try FileManager.default.moveItem(at: temporary, to: destination)
+                    self.exportTemporaryURLs.remove(temporary)
+                    self.finishExport(success: true, destination: destination, message: nil)
+                } else {
+                    await self.finishRepeatedXLoop(
+                        flattenedURL: temporary,
+                        count: settings.xLoopCount,
+                        destination: destination,
+                        intent: intent
+                    )
+                }
+            } catch is CancellationError {
+                guard self.exportIntent == intent else { return }
+                self.finishExport(
+                    success: false,
+                    destination: destination,
+                    message: "Export cancelled",
+                    reveal: false
+                )
+            } catch {
+                guard self.exportIntent == intent else { return }
+                self.finishExport(
+                    success: false,
+                    destination: destination,
+                    message: "X loop encoding failed: \(error.localizedDescription)"
+                )
+            }
+        }
+    }
+
+    private func finishRepeatedXLoop(
+        flattenedURL: URL,
+        count: Int,
+        destination: URL,
+        intent: Int
+    ) async {
+        do {
+            let flattened = AVURLAsset(url: flattenedURL)
+            let repeated = try await Self.makeRepeatedComposition(from: flattened, count: count)
+
+            guard exportIntent == intent, isExporting else { return }
+            try? FileManager.default.removeItem(at: destination)
+            guard let exporter = AVAssetExportSession(
+                asset: repeated,
+                presetName: AVAssetExportPresetPassthrough
+            ) else {
+                throw NSError(
+                    domain: "StudioAudioLane.XLoop",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Could not create the repeated MP4 export."]
+                )
+            }
+            exporter.outputURL = destination
+            exporter.outputFileType = .mp4
+            exporter.shouldOptimizeForNetworkUse = true
+            activeExportSession = exporter
+            startExportProgressTimer(base: 0.8, span: 0.2)
+            let exporterID = ObjectIdentifier(exporter)
+            exporter.exportAsynchronously { [weak self] in
+                let result = exporter.status
+                let message = exporter.error?.localizedDescription
+                Task { @MainActor in
+                    guard let self,
+                          self.exportIntent == intent,
+                          self.activeExportSession.map(ObjectIdentifier.init) == exporterID else { return }
+                    self.activeExportSession = nil
+                    if result == .completed {
+                        self.finishExport(success: true, destination: destination, message: nil)
+                    } else {
+                        self.finishExport(
+                            success: false,
+                            destination: destination,
+                            message: result == .cancelled ? "Export cancelled" : (message ?? "Could not repeat the X loop"),
+                            reveal: result != .cancelled
+                        )
+                    }
+                }
+            }
+        } catch {
+            guard exportIntent == intent else { return }
+            finishExport(
+                success: false,
+                destination: destination,
+                message: "Could not repeat X loop: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    static func makeRepeatedComposition(from asset: AVAsset, count: Int) async throws -> AVMutableComposition {
+        let repetitions = max(1, min(10, count))
+        let sourceDuration = try await asset.load(.duration)
+        let sourceRange = CMTimeRange(start: .zero, duration: sourceDuration)
+        let repeated = AVMutableComposition()
+
+        for source in try await asset.loadTracks(withMediaType: .video) {
+            guard let track = repeated.addMutableTrack(
+                withMediaType: .video,
+                preferredTrackID: source.trackID
+            ) else { continue }
+            track.preferredTransform = try await source.load(.preferredTransform)
+            for repetition in 0..<repetitions {
+                try track.insertTimeRange(
+                    sourceRange,
+                    of: source,
+                    at: CMTimeMultiply(sourceDuration, multiplier: Int32(repetition))
+                )
+            }
+        }
+        for source in try await asset.loadTracks(withMediaType: .audio) {
+            guard let track = repeated.addMutableTrack(
+                withMediaType: .audio,
+                preferredTrackID: source.trackID
+            ) else { continue }
+            for repetition in 0..<repetitions {
+                try track.insertTimeRange(
+                    sourceRange,
+                    of: source,
+                    at: CMTimeMultiply(sourceDuration, multiplier: Int32(repetition))
+                )
+            }
+        }
+        return repeated
     }
 
     private func startSessionExport(
@@ -2620,12 +3079,13 @@ final class EditorModel {
         }
     }
 
-    private func startExportProgressTimer() {
+    private func startExportProgressTimer(base: Double = 0, span: Double = 1) {
         stopExportProgressTimer()
         exportProgressTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
-                self.exportProgress = min(0.99, max(0, Double(self.activeExportSession?.progress ?? 0)))
+                let progress = Double(self.activeExportSession?.progress ?? 0)
+                self.exportProgress = min(0.99, max(0, base + progress * span))
             }
         }
     }
@@ -2640,6 +3100,7 @@ final class EditorModel {
         activeExportSession = nil
         exportWriterTask = nil
         exportCancelFlag = nil
+        removeExportTemporaryFiles()
         isExporting = false
         exportDestinationURL = nil
 
@@ -2648,7 +3109,10 @@ final class EditorModel {
 
         if ok {
             let bytes = (try? FileManager.default.attributesOfItem(atPath: destination.path)[.size] as? NSNumber)?.intValue ?? 0
-            if bytes < 1024 {
+            // A small, flat-color GIF can legitimately be only a few hundred
+            // bytes; movie containers need a larger floor to catch truncation.
+            let minimumBytes = destination.pathExtension.lowercased() == "gif" ? 32 : 1024
+            if bytes < minimumBytes {
                 ok = false
                 failMessage = "Export produced an empty or truncated file (\(bytes) bytes)"
                 try? FileManager.default.removeItem(at: destination)
@@ -2679,11 +3143,21 @@ final class EditorModel {
         }
     }
 
+    private func removeExportTemporaryFiles() {
+        for url in exportTemporaryURLs {
+            try? FileManager.default.removeItem(at: url)
+        }
+        exportTemporaryURLs.removeAll()
+    }
+
     private func makeExportVideoComposition(settings: ExportSettings) -> AVVideoComposition? {
         guard let track = mix.track(withTrackID: 1), !videoClips.isEmpty else { return nil }
         let sourceSize = exportSourceSize
         let targetSize = settings.targetSize(source: sourceSize)
         let outFrameDuration: CMTime = {
+            if settings.mode == .animatedGIF {
+                return CMTime(seconds: 1 / settings.gifFrameRate.value, preferredTimescale: 600)
+            }
             if let seconds = settings.frameRate.seconds {
                 return CMTime(seconds: seconds, preferredTimescale: 600)
             }
@@ -2693,7 +3167,7 @@ final class EditorModel {
         let hasFades = videoClips.contains { $0.fadeIn > 0.01 || $0.fadeOut > 0.01 }
         let sizeChanged = abs(targetSize.width - sourceSize.width) > 0.5
             || abs(targetSize.height - sourceSize.height) > 0.5
-        let fpsChanged = settings.frameRate != .original
+        let fpsChanged = settings.frameRate != .original || settings.mode == .animatedGIF
         guard hasFades || sizeChanged || fpsChanged else {
             // Keep any existing preview composition (fade ramps).
             return player.currentItem?.videoComposition
@@ -3479,18 +3953,37 @@ final class EditorModel {
             }
             let command = event.modifierFlags.contains(.command)
             let option = event.modifierFlags.contains(.option)
+            let control = event.modifierFlags.contains(.control)
             let shift = event.modifierFlags.contains(.shift)
             // Undo = ⌘Z (keyCode 6); redo = ⇧⌘Z (keyCode 6 + shift) or ⌘Y (keyCode 16).
             // keyCode 7 is ⌘X (Cut) — never map it to redo, so Cut stays free.
             if command && !shift && event.keyCode == 6 { self.undo(); return nil }
             if (command && shift && event.keyCode == 6) || (command && event.keyCode == 16) { self.redo(); return nil }
             if command && event.keyCode == 2 { self.duplicateSelectedClip(); return nil }
+            // Standard Mac +/= and - keys. Accept either shifted + or unshifted =
+            // so keyboard layout details do not make zoom-in unreachable.
+            if command && event.keyCode == 24 { self.zoomIn(); return nil }
+            if command && event.keyCode == 27 { self.zoomOut(); return nil }
             if event.keyCode == 1 && !command { self.splitSelectedAtPlayhead(); return nil } // S (not ⌘S)
-            // Option+← / Option+→ — previous / next music clip
-            if option && event.keyCode == 124 { self.seekToNextMusicClip(); return nil }
-            if option && event.keyCode == 123 { self.seekToPreviousMusicClip(); return nil }
-            if event.keyCode == 124 { self.selectNextClip(); return nil }
-            if event.keyCode == 123 { self.selectPreviousClip(); return nil }
+            if event.keyCode == 123 || event.keyCode == 124 {
+                let direction = event.keyCode == 124 ? 1 : -1
+                if command {
+                    direction > 0 ? self.selectNextClip() : self.selectPreviousClip()
+                    return nil
+                }
+                if option && control {
+                    if self.nudgeSelectedAudio(samples: direction * (shift ? 10 : 1)) { return nil }
+                } else if option {
+                    if self.nudgeSelectedAudio(milliseconds: Double(direction * (shift ? 10 : 1))) { return nil }
+                    direction > 0 ? self.seekToNextMusicClip() : self.seekToPreviousMusicClip()
+                    return nil
+                } else if self.nudgeSelectedByFrames(direction * (shift ? 10 : 1)) {
+                    return nil
+                } else {
+                    direction > 0 ? self.selectNextClip() : self.selectPreviousClip()
+                    return nil
+                }
+            }
             // I / O — mark loop in/out; L — toggle loop
             if event.keyCode == 34 && !command { self.markLoopIn(); return nil }
             if event.keyCode == 31 && !command { self.markLoopOut(); return nil }
@@ -3499,7 +3992,6 @@ final class EditorModel {
                 self.deleteSelectedClips(preferringLane: self.focusedLane)
                 return nil
             }
-            _ = shift // reserved; Shift+click handled in views
             return event
         }
     }
