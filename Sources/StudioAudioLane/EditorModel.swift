@@ -2813,66 +2813,11 @@ final class EditorModel {
         let scaled = CGSize(width: sourceSize.width * scale, height: sourceSize.height * scale)
         let tx = (targetSize.width - scaled.width) * 0.5
         let ty = (targetSize.height - scaled.height) * 0.5
-        let transform = CGAffineTransform(a: scale, b: 0, c: 0, d: scale, tx: tx, ty: ty)
-
-        var instructions: [AVVideoCompositionInstructionProtocol] = []
-        let timelineEnd = max(videoClips.map(\.timelineEnd).max() ?? 0.05, 0.05)
-
-        if hasFades {
-            for segment in renderSegments() {
-                let clip = segment.clip
-                // Instruction ranges come from the *actual* on-track segment (same rule as
-                // preview), so export can't diverge from the preview or hand AVFoundation
-                // overlapping instructions when clips overlap on the single composition track.
-                let instruction = AVMutableVideoCompositionInstruction()
-                instruction.timeRange = CMTimeRange(
-                    start: CMTime(seconds: segment.at, preferredTimescale: 600),
-                    duration: CMTime(seconds: segment.duration, preferredTimescale: 600)
-                )
-                let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
-                if sizeChanged {
-                    layer.setTransform(transform, at: .zero)
-                }
-                let fadeIn = min(max(0, clip.fadeIn), segment.duration / 2)
-                let fadeOut = min(max(0, clip.fadeOut), segment.duration - fadeIn)
-                if fadeIn > 0.01 {
-                    layer.setOpacityRamp(
-                        fromStartOpacity: 0,
-                        toEndOpacity: 1,
-                        timeRange: CMTimeRange(
-                            start: CMTime(seconds: segment.at, preferredTimescale: 600),
-                            duration: CMTime(seconds: fadeIn, preferredTimescale: 600)
-                        )
-                    )
-                }
-                if fadeOut > 0.01 {
-                    layer.setOpacityRamp(
-                        fromStartOpacity: 1,
-                        toEndOpacity: 0,
-                        timeRange: CMTimeRange(
-                            start: CMTime(seconds: segment.at + segment.duration - fadeOut, preferredTimescale: 600),
-                            duration: CMTime(seconds: fadeOut, preferredTimescale: 600)
-                        )
-                    )
-                }
-                instruction.layerInstructions = [layer]
-                instructions.append(instruction)
-            }
-        } else {
-            let instruction = AVMutableVideoCompositionInstruction()
-            instruction.timeRange = CMTimeRange(
-                start: .zero,
-                duration: CMTime(seconds: timelineEnd, preferredTimescale: 600)
-            )
-            let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
-            if sizeChanged {
-                layer.setTransform(transform, at: .zero)
-            }
-            instruction.layerInstructions = [layer]
-            instructions.append(instruction)
-        }
-
-        composition.instructions = instructions
+        let scaleTransform = CGAffineTransform(a: scale, b: 0, c: 0, d: scale, tx: tx, ty: ty)
+        composition.instructions = compositionInstructions(
+            on: track,
+            extraTransform: sizeChanged ? scaleTransform : nil
+        )
         return composition
     }
 
@@ -3260,8 +3205,19 @@ final class EditorModel {
                 let transform = try await src.load(.preferredTransform)
                 videoTrack.preferredTransform = transform
                 let natural = try await src.load(.naturalSize)
-                let rendered = CGRect(origin: .zero, size: natural).applying(transform)
-                renderSize = CGSize(width: abs(rendered.width), height: abs(rendered.height))
+                let oriented = VideoCompositionPlan.displaySize(
+                    naturalWidth: Double(natural.width),
+                    naturalHeight: Double(natural.height),
+                    transform: VideoCompositionPlan.PictureTransform(
+                        a: Double(transform.a),
+                        b: Double(transform.b),
+                        c: Double(transform.c),
+                        d: Double(transform.d),
+                        tx: Double(transform.tx),
+                        ty: Double(transform.ty)
+                    )
+                )
+                renderSize = CGSize(width: oriented.width, height: oriented.height)
                 let fps = try await src.load(.nominalFrameRate)
                 if fps > 1 {
                     frameDuration = CMTime(value: 1, timescale: CMTimeScale(max(1, Int(fps.rounded()))))
@@ -3437,45 +3393,87 @@ final class EditorModel {
         let composition = AVMutableVideoComposition()
         composition.renderSize = renderSize.width > 1 ? renderSize : CGSize(width: 1080, height: 1920)
         composition.frameDuration = frameDuration
-        var instructions: [AVVideoCompositionInstructionProtocol] = []
-        for segment in renderSegments() {
-            let clip = segment.clip
-            // Instruction ranges come from the *actual* on-track segment, not the model's
-            // timeline range — a partially-overlapped clip only owns its rendered tail, and a
-            // fully-overlapped clip isn't in `segments` at all, so no two instructions overlap.
-            let instruction = AVMutableVideoCompositionInstruction()
-            instruction.timeRange = CMTimeRange(
-                start: CMTime(seconds: segment.at, preferredTimescale: 600),
-                duration: CMTime(seconds: segment.duration, preferredTimescale: 600)
+        composition.instructions = compositionInstructions(on: track, extraTransform: nil)
+        return composition
+    }
+
+    /// Picture layers get the track's preferredTransform at time zero, then the
+    /// existing 0→1 / 1→0 ramps. Ranges with no picture are empty instructions
+    /// so the list starts at time zero and covers the whole item.
+    private func compositionInstructions(
+        on track: AVAssetTrack,
+        extraTransform: CGAffineTransform?
+    ) -> [AVVideoCompositionInstructionProtocol] {
+        let segments = renderSegments().map {
+            VideoCompositionPlan.Segment(
+                start: $0.at,
+                duration: $0.duration,
+                fadeIn: $0.clip.fadeIn,
+                fadeOut: $0.clip.fadeOut
             )
-            let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
-            let fadeIn = min(max(0, clip.fadeIn), segment.duration / 2)
-            let fadeOut = min(max(0, clip.fadeOut), segment.duration - fadeIn)
-            if fadeIn > 0.01 {
-                layer.setOpacityRamp(
-                    fromStartOpacity: 0,
-                    toEndOpacity: 1,
-                    timeRange: CMTimeRange(
-                        start: CMTime(seconds: segment.at, preferredTimescale: 600),
-                        duration: CMTime(seconds: fadeIn, preferredTimescale: 600)
+        }
+        let compositionEnd = max(duration, segments.map { $0.start + $0.duration }.max() ?? 0)
+        let preferred = track.preferredTransform
+        let placed = VideoCompositionPlan.PictureTransform.atTimeZero(
+            preferred: VideoCompositionPlan.PictureTransform(
+                a: Double(preferred.a),
+                b: Double(preferred.b),
+                c: Double(preferred.c),
+                d: Double(preferred.d),
+                tx: Double(preferred.tx),
+                ty: Double(preferred.ty)
+            )
+        )
+        var layerTransform = CGAffineTransform(
+            a: CGFloat(placed.a),
+            b: CGFloat(placed.b),
+            c: CGFloat(placed.c),
+            d: CGFloat(placed.d),
+            tx: CGFloat(placed.tx),
+            ty: CGFloat(placed.ty)
+        )
+        if let extraTransform {
+            layerTransform = layerTransform.concatenating(extraTransform)
+        }
+
+        let slots = VideoCompositionPlan.slots(segments: segments, compositionEnd: compositionEnd)
+        var instructions: [AVVideoCompositionInstructionProtocol] = []
+        var cursor = CMTime.zero
+        let endTime = CMTime(seconds: max(compositionEnd, 0.05), preferredTimescale: 600)
+        for (index, slot) in slots.enumerated() {
+            let stop = index == slots.count - 1
+                ? endTime
+                : CMTime(seconds: slot.end, preferredTimescale: 600)
+            guard CMTimeCompare(stop, cursor) > 0 else { continue }
+            let instruction = AVMutableVideoCompositionInstruction()
+            instruction.timeRange = CMTimeRange(start: cursor, duration: stop - cursor)
+            cursor = stop
+            switch slot.body {
+            case .empty:
+                instruction.layerInstructions = []
+            case .picture(let fadeIn, let fadeOut):
+                let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
+                layer.setTransform(layerTransform, at: .zero)
+                for ramp in VideoCompositionPlan.opacityRamps(
+                    start: slot.start,
+                    duration: slot.duration,
+                    fadeIn: fadeIn,
+                    fadeOut: fadeOut
+                ) {
+                    layer.setOpacityRamp(
+                        fromStartOpacity: Float(ramp.from),
+                        toEndOpacity: Float(ramp.to),
+                        timeRange: CMTimeRange(
+                            start: CMTime(seconds: ramp.start, preferredTimescale: 600),
+                            duration: CMTime(seconds: ramp.duration, preferredTimescale: 600)
+                        )
                     )
-                )
+                }
+                instruction.layerInstructions = [layer]
             }
-            if fadeOut > 0.01 {
-                layer.setOpacityRamp(
-                    fromStartOpacity: 1,
-                    toEndOpacity: 0,
-                    timeRange: CMTimeRange(
-                        start: CMTime(seconds: segment.at + segment.duration - fadeOut, preferredTimescale: 600),
-                        duration: CMTime(seconds: fadeOut, preferredTimescale: 600)
-                    )
-                )
-            }
-            instruction.layerInstructions = [layer]
             instructions.append(instruction)
         }
-        composition.instructions = instructions
-        return composition
+        return instructions
     }
 
     private func installTimeObserver() {
