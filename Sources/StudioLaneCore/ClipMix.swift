@@ -286,7 +286,9 @@ public enum VideoCompositionCoverage {
             guard stop - start > tick else { continue }
             switch slice.body {
             case .empty:
-                append(start, .set(0))
+                // Opacity 0 at time zero blanks the whole composition, including the
+                // picture that starts later. Hide the gap one tick in.
+                append(max(start, tick), .set(0))
             case .picture(let fadeIn, let fadeOut):
                 let room = stop - start
                 var rise = min(max(0, fadeIn), room / 2)
@@ -297,8 +299,11 @@ public enum VideoCompositionCoverage {
                     let overflow = rise + fall - (room - tick)
                     fall = max(0, fall - overflow)
                 }
+                // A fade-in ramp that starts at zero has the same effect: the layer
+                // stays invisible for the rest of the timeline.
+                let riseAt = start < tick ? tick : start
                 if rise >= tick {
-                    append(start, .ramp(from: 0, to: 1, duration: rise))
+                    append(riseAt, .ramp(from: 0, to: 1, duration: rise))
                 }
                 let hold = start + (rise >= tick ? rise + tick : 0)
                 let fallStart = stop - fall

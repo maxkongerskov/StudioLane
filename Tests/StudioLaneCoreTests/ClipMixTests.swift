@@ -139,6 +139,24 @@ final class ClipMixTests: XCTestCase {
         XCTAssertEqual(VideoCompositionCoverage.opacity(at: 4, segments: [left, right], compositionEnd: 8), 1, accuracy: 0.0001)
     }
 
+    func testClipThatStartsLateStaysVisibleUnderThePlayhead() {
+        // The open project: picture begins at 12.7s, fade-out is 1.6s, playhead is at 19.3s.
+        let picture = VideoCompositionCoverage.PictureSpan(start: 12.748, duration: 27.726, fadeIn: 0, fadeOut: 1.6)
+        let commands = VideoCompositionCoverage.opacityCommands(segments: [picture], compositionEnd: 40.474)
+        assertCommandsDoNotOverlap(commands, end: 40.474)
+        for command in commands {
+            if case .set(let opacity) = command.action, opacity < 0.01 {
+                XCTAssertGreaterThan(command.time, 0.001)
+            }
+            if case .ramp(let from, _, _) = command.action, from < 0.01 {
+                XCTAssertGreaterThan(command.time, 0.001)
+            }
+        }
+        XCTAssertGreaterThan(VideoCompositionCoverage.opacity(at: 19.3, commands: commands), 0.95)
+        XCTAssertLessThan(VideoCompositionCoverage.opacity(at: 6, commands: commands), 0.05)
+        XCTAssertLessThan(VideoCompositionCoverage.opacity(at: 40.2, commands: commands), 0.35)
+    }
+
     func testOpacityCommandsKeepThePictureUpAndTheTailClear() {
         let picture = VideoCompositionCoverage.PictureSpan(start: 0, duration: 4, fadeIn: 0.5, fadeOut: 0.5)
         let commands = VideoCompositionCoverage.opacityCommands(segments: [picture], compositionEnd: 10)

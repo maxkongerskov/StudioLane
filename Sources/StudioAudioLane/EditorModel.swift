@@ -3267,6 +3267,9 @@ final class EditorModel {
             if Task.isCancelled { return }
             if let videoTrack, let holdTrack, let holdAsset {
                 extendVideoTrack(videoTrack, from: videoCursor, until: rebuiltMix.duration, sample: holdTrack, frame: holdFrame, retaining: holdAsset)
+                // A leading hole (this project starts the picture at 12.7s) makes the
+                // player draw black for every frame, including over the filmstrip.
+                fillEmptyVideoSegments(videoTrack, sample: holdTrack, frame: holdFrame, retaining: holdAsset)
             }
             // Commit `mix` and the track-ID maps together BEFORE building the player
             // item: makeAudioMix()/makeVideoComposition() read them (track IDs, layer
@@ -3458,11 +3461,16 @@ final class EditorModel {
             // a phone video is drawn outside the portrait frame and the preview is black.
             layer.setTransform(track.preferredTransform, at: .zero)
         }
-        applyOpacityCommands(
-            layer,
-            VideoCompositionCoverage.opacityCommands(segments: pictureSpans(), compositionEnd: endSeconds),
-            within: instruction.timeRange
-        )
+        let commands = VideoCompositionCoverage.opacityCommands(segments: pictureSpans(), compositionEnd: endSeconds)
+        if let picture = VideoCompositionCoverage.slices(segments: pictureSpans(), compositionEnd: endSeconds).first(where: { slice in
+            if case .picture = slice.body { return true }
+            return false
+        }) {
+            let mid = picture.start + picture.duration / 2
+            // A composition that hides the middle of the picture is what blanks the preview.
+            if VideoCompositionCoverage.opacity(at: mid, commands: commands) < 0.5 { return nil }
+        }
+        applyOpacityCommands(layer, commands, within: instruction.timeRange)
         instruction.layerInstructions = [layer]
         composition.instructions = [instruction]
 
@@ -3522,6 +3530,46 @@ final class EditorModel {
             }
         } catch {
             // Leave the hole. The preview then skips the fade composition and shows the raw picture.
+        }
+    }
+
+    /// Replaces empty edits with a held frame. Inserting into a hole pushes the
+    /// picture later; removing the shifted hole puts the picture back where it was.
+    private func fillEmptyVideoSegments(
+        _ track: AVMutableCompositionTrack,
+        sample: AVAssetTrack,
+        frame: CMTimeRange,
+        retaining source: AVAsset
+    ) {
+        _ = source
+        guard frame.isValid, CMTimeCompare(frame.duration, .zero) == 1 else { return }
+        for _ in 0..<12 {
+            guard let empty = track.segments.last(where: { $0.isEmpty }) else { return }
+            let gap = empty.timeMapping.target
+            guard gap.isValid, CMTimeCompare(gap.duration, .zero) == 1 else { return }
+            let tick = CMTime(value: 1, timescale: 600)
+            if CMTimeCompare(gap.duration, tick) <= 0 {
+                track.removeTimeRange(gap)
+                continue
+            }
+            let start = gap.start
+            do {
+                try track.insertTimeRange(frame, of: sample, at: start)
+            } catch {
+                return
+            }
+            guard let inserted = track.segments.first(where: { segment in
+                !segment.isEmpty && CMTimeCompare(segment.timeMapping.target.start, start) == 0
+            }) else { return }
+            let insertedRange = inserted.timeMapping.target
+            if CMTimeCompare(insertedRange.duration, gap.duration) != 0 {
+                track.scaleTimeRange(insertedRange, toDuration: gap.duration)
+            }
+            let emptyStart = CMTimeAdd(start, gap.duration)
+            guard let shifted = track.segments.first(where: { segment in
+                segment.isEmpty && CMTimeCompare(segment.timeMapping.target.start, CMTimeSubtract(emptyStart, tick)) >= 0
+            }) else { return }
+            track.removeTimeRange(shifted.timeMapping.target)
         }
     }
 
