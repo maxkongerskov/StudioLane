@@ -3192,15 +3192,36 @@ final class EditorModel {
             // composition duration stays bounded by the model's max end. `renderSegments()` is
             // the single source of truth for that collapse, and `makeVideoComposition` derives
             // its instructions from the same segments so they can't disagree.
+            //
+            // A hole in this track (the video ends, the music keeps going) makes a fade
+            // composition paint every frame black. Filler frames keep the track continuous;
+            // the composition turns those frames transparent so the tail still looks empty.
+            var holdAsset: AVURLAsset?
+            var holdTrack: AVAssetTrack?
+            var holdFrame = CMTimeRange.zero
+            var videoCursor = CMTime.zero
             for segment in renderSegments() {
                 if Task.isCancelled { return }
                 let asset = AVURLAsset(url: segment.clip.url)
                 guard let src = try await asset.loadTracks(withMediaType: .video).first, let videoTrack else { continue }
+                let at = CMTime(seconds: segment.at, preferredTimescale: 600)
+                if CMTimeCompare(at, videoCursor) == 1 {
+                    let sampleTrack = holdTrack ?? src
+                    let sampleFrame = holdTrack == nil ? frameSlice(sourceStart: segment.sourceStart, duration: segment.duration, atEnd: false) : holdFrame
+                    extendVideoTrack(videoTrack, from: videoCursor, until: at, sample: sampleTrack, frame: sampleFrame, retaining: holdAsset ?? asset)
+                    videoCursor = videoTrack.timeRange.isValid ? CMTimeRangeGetEnd(videoTrack.timeRange) : at
+                }
+                let trackEnd = videoTrack.timeRange.isValid ? CMTimeRangeGetEnd(videoTrack.timeRange) : .zero
+                let insertAt = CMTimeCompare(CMTimeAbsoluteValue(CMTimeSubtract(at, trackEnd)), CMTime(value: 3, timescale: 600)) <= 0 ? trackEnd : at
                 try videoTrack.insertTimeRange(
                     CMTimeRange(start: CMTime(seconds: segment.sourceStart, preferredTimescale: 600), duration: CMTime(seconds: segment.duration, preferredTimescale: 600)),
                     of: src,
-                    at: CMTime(seconds: segment.at, preferredTimescale: 600)
+                    at: insertAt
                 )
+                videoCursor = videoTrack.timeRange.isValid ? CMTimeRangeGetEnd(videoTrack.timeRange) : CMTimeAdd(insertAt, CMTime(seconds: segment.duration, preferredTimescale: 600))
+                holdAsset = asset
+                holdTrack = src
+                holdFrame = frameSlice(sourceStart: segment.sourceStart, duration: segment.duration, atEnd: true)
                 let transform = try await src.load(.preferredTransform)
                 videoTrack.preferredTransform = transform
                 let natural = try await src.load(.naturalSize)
@@ -3244,6 +3265,9 @@ final class EditorModel {
             }
 
             if Task.isCancelled { return }
+            if let videoTrack, let holdTrack, let holdAsset {
+                extendVideoTrack(videoTrack, from: videoCursor, until: rebuiltMix.duration, sample: holdTrack, frame: holdFrame, retaining: holdAsset)
+            }
             // Commit `mix` and the track-ID maps together BEFORE building the player
             // item: makeAudioMix()/makeVideoComposition() read them (track IDs, layer
             // instructions), so assigning after would pair the new item with the
@@ -3379,7 +3403,19 @@ final class EditorModel {
 
     private func makeVideoComposition() -> AVVideoComposition? {
         guard let track = mix.track(withTrackID: 1), !videoClips.isEmpty else { return nil }
-        guard videoClips.contains(where: { $0.fadeIn > 0.01 || $0.fadeOut > 0.01 }) else { return nil }
+        let endSeconds = mix.duration.seconds
+        guard mix.duration.isValid, endSeconds.isFinite, endSeconds > 0.01 else { return nil }
+        let spans = pictureSpans()
+        let slices = VideoCompositionCoverage.slices(segments: spans, compositionEnd: endSeconds)
+        let hasEmpty = slices.contains { slice in
+            if case .empty = slice.body { return true }
+            return false
+        }
+        let hasFades = videoClips.contains { $0.fadeIn > 0.01 || $0.fadeOut > 0.01 }
+        guard hasFades || hasEmpty else { return nil }
+        // A composition on a track that stops early blanks every frame, audio included
+        // in the sense that the picture never returns. Skip it and show the raw frames.
+        guard videoTrackSpans(track, mix.duration) else { return nil }
         let size = renderSize.width > 1 ? renderSize : CGSize(width: 1080, height: 1920)
         return makeCoveredVideoComposition(
             renderSize: size,
@@ -3389,11 +3425,10 @@ final class EditorModel {
         )
     }
 
-    /// One instruction list that tiles `mix.duration`. Picture slices carry the
-    /// fade ramps. Gaps — including an audio tail past a shorter video — get an
-    /// empty instruction so AVFoundation does not reject the composition and
-    /// paint every frame black. An invalid result is dropped; the raw picture
-    /// stays up and the audio mix is untouched.
+    /// One instruction covering `mix.duration`. The video track has a real frame
+    /// in every gap, so the layer instruction is legal. Fades run only inside
+    /// the picture; filler frames stay at opacity 0. An invalid composition is
+    /// dropped and the raw picture stays on screen.
     private func makeCoveredVideoComposition(
         renderSize: CGSize,
         frameDuration: CMTime,
@@ -3403,50 +3438,7 @@ final class EditorModel {
         let compositionDuration = mix.duration
         let endSeconds = compositionDuration.seconds
         guard compositionDuration.isValid, endSeconds.isFinite, endSeconds > 0.01 else { return nil }
-
-        let spans = renderSegments().map { segment in
-            VideoCompositionCoverage.PictureSpan(
-                start: segment.at,
-                duration: segment.duration,
-                fadeIn: segment.clip.fadeIn,
-                fadeOut: segment.clip.fadeOut
-            )
-        }
-        let slices = VideoCompositionCoverage.slices(segments: spans, compositionEnd: endSeconds)
-        guard !slices.isEmpty else { return nil }
-
-        var drafted: [(instruction: AVMutableVideoCompositionInstruction, fadeIn: Double, fadeOut: Double)] = []
-        for slice in slices {
-            let instruction = AVMutableVideoCompositionInstruction()
-            instruction.timeRange = CMTimeRange(
-                start: CMTime(seconds: slice.start, preferredTimescale: 600),
-                duration: CMTime(seconds: max(slice.duration, 0), preferredTimescale: 600)
-            )
-            instruction.backgroundColor = CGColor(gray: 0, alpha: 1)
-            if case .picture(let fadeIn, let fadeOut) = slice.body {
-                let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
-                if let transform {
-                    layer.setTransform(transform, at: .zero)
-                }
-                instruction.layerInstructions = [layer]
-                drafted.append((instruction, fadeIn, fadeOut))
-            } else {
-                instruction.layerInstructions = []
-                drafted.append((instruction, 0, 0))
-            }
-        }
-
-        let tiled = tile(drafted.map(\.instruction), through: compositionDuration)
-        guard tiled.count == drafted.count else { return nil }
-        for index in tiled.indices where !tiled[index].layerInstructions.isEmpty {
-            guard let layer = tiled[index].layerInstructions.first as? AVMutableVideoCompositionLayerInstruction else { continue }
-            applyPictureOpacity(
-                layer,
-                range: tiled[index].timeRange,
-                fadeIn: drafted[index].fadeIn,
-                fadeOut: drafted[index].fadeOut
-            )
-        }
+        guard videoTrackSpans(track, compositionDuration) else { return nil }
 
         let composition = AVMutableVideoComposition()
         composition.renderSize = renderSize.width > 1 && renderSize.height > 1
@@ -3455,96 +3447,118 @@ final class EditorModel {
         composition.frameDuration = frameDuration.isValid && frameDuration.seconds > 0
             ? frameDuration
             : CMTime(value: 1, timescale: 30)
-        composition.instructions = tiled
+
+        let instruction = AVMutableVideoCompositionInstruction()
+        instruction.timeRange = CMTimeRange(start: .zero, duration: compositionDuration)
+        let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
+        if let transform {
+            layer.setTransform(transform, at: .zero)
+        } else if track.preferredTransform != .identity {
+            // A composition ignores the track's preferredTransform. Without this,
+            // a phone video is drawn outside the portrait frame and the preview is black.
+            layer.setTransform(track.preferredTransform, at: .zero)
+        }
+        applyOpacityCommands(
+            layer,
+            VideoCompositionCoverage.opacityCommands(segments: pictureSpans(), compositionEnd: endSeconds),
+            within: instruction.timeRange
+        )
+        instruction.layerInstructions = [layer]
+        composition.instructions = [instruction]
 
         let full = CMTimeRange(start: .zero, duration: compositionDuration)
-        let hasGap = slices.contains { slice in
-            if case .empty = slice.body { return true }
+        guard composition.isValid(for: mix, timeRange: full, validationDelegate: nil) else { return nil }
+        return composition
+    }
+
+    private func pictureSpans() -> [VideoCompositionCoverage.PictureSpan] {
+        renderSegments().map { segment in
+            VideoCompositionCoverage.PictureSpan(
+                start: segment.at,
+                duration: segment.duration,
+                fadeIn: segment.clip.fadeIn,
+                fadeOut: segment.clip.fadeOut
+            )
+        }
+    }
+
+    /// True when the track has samples from the start through `duration`, with no holes.
+    private func videoTrackSpans(_ track: AVAssetTrack, _ duration: CMTime) -> Bool {
+        guard duration.isValid, CMTimeCompare(duration, .zero) == 1 else { return false }
+        guard let compositionTrack = track as? AVCompositionTrack else { return false }
+        if compositionTrack.segments.isEmpty || compositionTrack.segments.contains(where: { $0.isEmpty }) {
             return false
         }
-        if composition.isValid(for: mix, timeRange: full, validationDelegate: nil) {
-            return composition
-        }
-        // A hole used to fail validation and blank every frame. Drop that composition.
-        // A gap-free list matches the previous preview, so keep it if validation disagrees.
-        return hasGap ? nil : composition
+        let slop = CMTime(value: 3, timescale: 600)
+        let start = compositionTrack.timeRange.start
+        let stop = CMTimeRangeGetEnd(compositionTrack.timeRange)
+        if CMTimeCompare(start, slop) == 1 { return false }
+        return CMTimeCompare(CMTimeAdd(stop, slop), duration) >= 0
     }
 
-    /// Closes sub-frame gaps and makes the last instruction end on `end`, so the
-    /// list covers the composition duration exactly.
-    private func tile(
-        _ instructions: [AVMutableVideoCompositionInstruction],
-        through end: CMTime
-    ) -> [AVMutableVideoCompositionInstruction] {
-        guard !instructions.isEmpty, end.isValid, CMTimeCompare(end, .zero) == 1 else { return [] }
-        var items = instructions
-        let firstEnd = CMTimeRangeGetEnd(items[0].timeRange)
-        if CMTimeCompare(firstEnd, .zero) == 1 {
-            items[0].timeRange = CMTimeRange(start: .zero, end: firstEnd)
-        } else {
-            let tick = CMTime(value: 1, timescale: 600)
-            let forced = CMTimeMinimum(tick, end)
-            items[0].timeRange = CMTimeRange(start: .zero, duration: forced)
-        }
-
-        for index in 0..<(items.count - 1) {
-            let nextStart = items[index + 1].timeRange.start
-            let nextEnd = CMTimeRangeGetEnd(items[index + 1].timeRange)
-            let thisStart = items[index].timeRange.start
-            guard CMTimeCompare(nextStart, thisStart) == 1, CMTimeCompare(nextEnd, nextStart) == 1 else { continue }
-            items[index].timeRange = CMTimeRange(start: thisStart, end: nextStart)
-            items[index + 1].timeRange = CMTimeRange(start: nextStart, end: nextEnd)
-        }
-
-        let lastStart = items[items.count - 1].timeRange.start
-        guard CMTimeCompare(end, lastStart) == 1 else { return [] }
-        items[items.count - 1].timeRange = CMTimeRange(start: lastStart, end: end)
-        return items
-    }
-
-    /// Fade ramps live inside the picture instruction. The middle holds at full
-    /// opacity; a ramp is omitted when it would be shorter than a frame.
-    private func applyPictureOpacity(
-        _ layer: AVMutableVideoCompositionLayerInstruction,
-        range: CMTimeRange,
-        fadeIn: Double,
-        fadeOut: Double
+    /// Appends a held source frame so `track` has samples across `[from, until)`.
+    /// Inserting at the current end does not push later picture down the timeline.
+    private func extendVideoTrack(
+        _ track: AVMutableCompositionTrack,
+        from cursor: CMTime,
+        until end: CMTime,
+        sample: AVAssetTrack,
+        frame: CMTimeRange,
+        retaining source: AVAsset
     ) {
-        let span = range.duration.seconds
-        guard span.isFinite, span > 0 else { return }
-        let fades = VideoCompositionCoverage.clampedFades(fadeIn: fadeIn, fadeOut: fadeOut, duration: span)
-        if fades.in > 0.01 {
-            layer.setOpacityRamp(
-                fromStartOpacity: 0,
-                toEndOpacity: 1,
-                timeRange: CMTimeRange(
-                    start: range.start,
-                    duration: CMTime(seconds: fades.in, preferredTimescale: 600)
+        _ = source
+        guard frame.isValid, CMTimeCompare(frame.duration, .zero) == 1 else { return }
+        guard CMTimeCompare(end, cursor) == 1 else { return }
+        let gap = CMTimeSubtract(end, cursor)
+        let before = track.timeRange.isValid ? CMTimeRangeGetEnd(track.timeRange) : .zero
+        guard CMTimeCompare(before, cursor) != 1 else { return }
+        do {
+            try track.insertTimeRange(frame, of: sample, at: before)
+            let after = CMTimeRangeGetEnd(track.timeRange)
+            let inserted = CMTimeSubtract(after, before)
+            guard CMTimeCompare(inserted, .zero) == 1 else { return }
+            if CMTimeCompare(inserted, gap) != 0 {
+                track.scaleTimeRange(CMTimeRange(start: before, duration: inserted), toDuration: gap)
+            }
+        } catch {
+            // Leave the hole. The preview then skips the fade composition and shows the raw picture.
+        }
+    }
+
+    private func frameSlice(sourceStart: TimeInterval, duration: TimeInterval, atEnd: Bool) -> CMTimeRange {
+        let start = CMTime(seconds: max(0, sourceStart), preferredTimescale: 600)
+        let span = CMTime(seconds: max(duration, 1.0 / 600.0), preferredTimescale: 600)
+        let frame = CMTime(value: 1, timescale: 600)
+        let sample = CMTimeMinimum(frame, span)
+        let sampleStart = atEnd ? CMTimeMaximum(start, CMTimeSubtract(CMTimeAdd(start, span), sample)) : start
+        return CMTimeRange(start: sampleStart, duration: sample)
+    }
+
+    private func applyOpacityCommands(
+        _ layer: AVMutableVideoCompositionLayerInstruction,
+        _ commands: [VideoCompositionCoverage.OpacityCommand],
+        within range: CMTimeRange
+    ) {
+        let end = CMTimeRangeGetEnd(range)
+        var cursor = CMTimeSubtract(range.start, CMTime(value: 1, timescale: 600))
+        for command in commands {
+            let time = CMTime(seconds: command.time, preferredTimescale: 600)
+            guard CMTimeCompare(time, cursor) == 1, CMTimeCompare(time, end) == -1 else { continue }
+            switch command.action {
+            case .set(let value):
+                layer.setOpacity(value, at: time)
+                cursor = time
+            case .ramp(let from, let to, let duration):
+                let ramp = CMTime(seconds: duration, preferredTimescale: 600)
+                let rampEnd = CMTimeAdd(time, ramp)
+                guard CMTimeCompare(ramp, .zero) == 1, CMTimeCompare(rampEnd, end) <= 0 else { continue }
+                layer.setOpacityRamp(
+                    fromStartOpacity: from,
+                    toEndOpacity: to,
+                    timeRange: CMTimeRange(start: time, duration: ramp)
                 )
-            )
-        }
-        let hold = span - fades.in - fades.out
-        if hold > 0.02 {
-            let at = CMTimeAdd(range.start, CMTime(seconds: fades.in + hold / 2, preferredTimescale: 600))
-            if CMTimeCompare(at, range.start) == 1, CMTimeCompare(at, CMTimeRangeGetEnd(range)) == -1 {
-                layer.setOpacity(1, at: at)
+                cursor = rampEnd
             }
-        } else if fades.in <= 0.01 && fades.out <= 0.01 {
-            layer.setOpacity(1, at: range.start)
-        }
-        if fades.out > 0.01 {
-            let fadeDur = CMTime(seconds: fades.out, preferredTimescale: 600)
-            var fadeStart = CMTimeSubtract(CMTimeRangeGetEnd(range), fadeDur)
-            if CMTimeCompare(fadeStart, range.start) == -1 {
-                fadeStart = range.start
-            }
-            let room = CMTimeSubtract(CMTimeRangeGetEnd(range), fadeStart)
-            guard CMTimeCompare(room, .zero) == 1 else { return }
-            layer.setOpacityRamp(
-                fromStartOpacity: 1,
-                toEndOpacity: 0,
-                timeRange: CMTimeRange(start: fadeStart, duration: CMTimeMinimum(fadeDur, room))
-            )
         }
     }
 

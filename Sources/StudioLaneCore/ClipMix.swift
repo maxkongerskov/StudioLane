@@ -228,4 +228,111 @@ public enum VideoCompositionCoverage {
         }
         return 0
     }
+
+    /// One tick at the composition timescale. Ramps and holds stay this far apart
+    /// so AVFoundation does not treat them as overlapping and reject the frame.
+    public static let commandTick: Double = 1.0 / 600.0
+
+    public struct OpacityCommand: Equatable, Sendable {
+        public enum Action: Equatable, Sendable {
+            case set(Float)
+            case ramp(from: Float, to: Float, duration: Double)
+        }
+
+        public var time: Double
+        public var action: Action
+
+        public init(time: Double, action: Action) {
+            self.time = time
+            self.action = action
+        }
+
+        public var end: Double {
+            switch action {
+            case .set:
+                return time
+            case .ramp(_, _, let duration):
+                return time + duration
+            }
+        }
+    }
+
+    /// Opacity operations for one instruction that spans the whole composition.
+    /// Picture holds at full opacity between its fades. A gap holds at 0 so a
+    /// filler frame in that gap stays black. Commands never overlap.
+    public static func opacityCommands(segments: [PictureSpan], compositionEnd: Double) -> [OpacityCommand] {
+        guard compositionEnd.isFinite, compositionEnd > commandTick else { return [] }
+        let tick = commandTick
+        var commands: [OpacityCommand] = []
+
+        func append(_ time: Double, _ action: OpacityCommand.Action) {
+            guard time.isFinite, time >= 0, time < compositionEnd - tick * 0.25 else { return }
+            var command = OpacityCommand(time: time, action: action)
+            if let last = commands.last, command.time < last.end + tick * 0.5 {
+                let shifted = last.end + tick
+                guard shifted < compositionEnd - tick * 0.25 else { return }
+                command.time = shifted
+            }
+            if case .ramp(_, _, let duration) = command.action {
+                guard duration > tick * 0.5, command.time + duration <= compositionEnd + 0.000_0001 else { return }
+            }
+            commands.append(command)
+        }
+
+        let tiled = slices(segments: segments, compositionEnd: compositionEnd)
+        for (index, slice) in tiled.enumerated() {
+            let start = slice.start
+            let stop = min(slice.end, compositionEnd)
+            guard stop - start > tick else { continue }
+            switch slice.body {
+            case .empty:
+                append(start, .set(0))
+            case .picture(let fadeIn, let fadeOut):
+                let room = stop - start
+                var rise = min(max(0, fadeIn), room / 2)
+                var fall = min(max(0, fadeOut), max(0, room - rise))
+                if rise > 0, rise < tick { rise = 0 }
+                if fall > 0, fall < tick { fall = 0 }
+                if rise + fall > room - tick {
+                    let overflow = rise + fall - (room - tick)
+                    fall = max(0, fall - overflow)
+                }
+                if rise >= tick {
+                    append(start, .ramp(from: 0, to: 1, duration: rise))
+                }
+                let hold = start + (rise >= tick ? rise + tick : 0)
+                let fallStart = stop - fall
+                if fall < tick || hold < fallStart - tick * 0.25 {
+                    append(min(hold, stop - tick), .set(1))
+                }
+                if fall >= tick {
+                    append(fallStart, .ramp(from: 1, to: 0, duration: fall))
+                } else if index + 1 < tiled.count, case .empty = tiled[index + 1].body {
+                    append(max(hold + tick, stop - tick), .set(0))
+                }
+            }
+        }
+        return commands
+    }
+
+    /// Opacity produced by `opacityCommands`. The default before the first command is full.
+    public static func opacity(at time: Double, commands: [OpacityCommand]) -> Float {
+        guard time.isFinite else { return 0 }
+        var value: Float = 1
+        for command in commands {
+            switch command.action {
+            case .set(let opacity):
+                if time >= command.time { value = opacity }
+            case .ramp(let from, let to, let duration):
+                guard duration > 0 else { continue }
+                if time >= command.end {
+                    value = to
+                } else if time >= command.time {
+                    let t = Float((time - command.time) / duration)
+                    value = from + (to - from) * min(max(t, 0), 1)
+                }
+            }
+        }
+        return value
+    }
 }

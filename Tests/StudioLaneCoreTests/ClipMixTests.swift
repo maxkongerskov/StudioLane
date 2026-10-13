@@ -139,6 +139,22 @@ final class ClipMixTests: XCTestCase {
         XCTAssertEqual(VideoCompositionCoverage.opacity(at: 4, segments: [left, right], compositionEnd: 8), 1, accuracy: 0.0001)
     }
 
+    func testOpacityCommandsKeepThePictureUpAndTheTailClear() {
+        let picture = VideoCompositionCoverage.PictureSpan(start: 0, duration: 4, fadeIn: 0.5, fadeOut: 0.5)
+        let commands = VideoCompositionCoverage.opacityCommands(segments: [picture], compositionEnd: 10)
+        assertCommandsDoNotOverlap(commands, end: 10)
+        XCTAssertGreaterThan(VideoCompositionCoverage.opacity(at: 2, commands: commands), 0.95)
+        XCTAssertLessThan(VideoCompositionCoverage.opacity(at: 6, commands: commands), 0.05)
+        XCTAssertEqual(VideoCompositionCoverage.opacity(at: 0.25, commands: commands), 0.5, accuracy: 0.02)
+
+        let left = VideoCompositionCoverage.PictureSpan(start: 0, duration: 4, fadeIn: 0, fadeOut: 0)
+        let right = VideoCompositionCoverage.PictureSpan(start: 4, duration: 4, fadeIn: 0, fadeOut: 0)
+        let abutting = VideoCompositionCoverage.opacityCommands(segments: [left, right], compositionEnd: 8)
+        assertCommandsDoNotOverlap(abutting, end: 8)
+        XCTAssertGreaterThan(VideoCompositionCoverage.opacity(at: 3.9, commands: abutting), 0.95)
+        XCTAssertGreaterThan(VideoCompositionCoverage.opacity(at: 4, commands: abutting), 0.95)
+    }
+
     func testFadesStayInsideThePictureSlice() {
         let fades = VideoCompositionCoverage.clampedFades(fadeIn: 10, fadeOut: 10, duration: 4)
         XCTAssertLessThanOrEqual(fades.in, 2)
@@ -152,6 +168,22 @@ final class ClipMixTests: XCTestCase {
         XCTAssertEqual(fadeIn, fades.in, accuracy: 0.0001)
         XCTAssertEqual(fadeOut, fades.out, accuracy: 0.0001)
         XCTAssertLessThanOrEqual(slices[0].end, 4.0001)
+    }
+
+    private func assertCommandsDoNotOverlap(_ commands: [VideoCompositionCoverage.OpacityCommand], end: Double) {
+        XCTAssertFalse(commands.isEmpty)
+        var cursor = -1.0
+        for command in commands {
+            XCTAssertGreaterThan(command.time, cursor)
+            XCTAssertLessThan(command.time, end)
+            if case .ramp(_, _, let duration) = command.action {
+                XCTAssertGreaterThan(duration, 0)
+                XCTAssertLessThanOrEqual(command.end, end + 0.0001)
+                cursor = command.end - 0.000_0001
+            } else {
+                cursor = command.time
+            }
+        }
     }
 
     private func assertTiles(_ slices: [VideoCompositionCoverage.Slice], end: Double) {
