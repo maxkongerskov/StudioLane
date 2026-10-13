@@ -2219,10 +2219,7 @@ final class EditorModel {
     func applyFades() {
         guard let item = player.currentItem else { return }
         item.audioMix = makeAudioMix()
-        // A video composition blanks every frame when the picture does not cover the
-        // whole timeline. The preview plays the video track directly. Audio fades stay
-        // on the mix.
-        item.videoComposition = nil
+        item.videoComposition = makeVideoComposition()
     }
 
     func presentExportSheet() {
@@ -2788,10 +2785,95 @@ final class EditorModel {
         }
     }
 
-    private func makeExportVideoComposition(settings _: ExportSettings) -> AVVideoComposition? {
-        // Same rule as the preview. A composition here exported a black picture while
-        // the audio survived. The exporter uses the video track directly.
-        nil
+    private func makeExportVideoComposition(settings: ExportSettings) -> AVVideoComposition? {
+        guard let track = mix.track(withTrackID: 1), !videoClips.isEmpty else { return nil }
+        let sourceSize = exportSourceSize
+        let targetSize = settings.targetSize(source: sourceSize)
+        let outFrameDuration: CMTime = {
+            if let seconds = settings.frameRate.seconds {
+                return CMTime(seconds: seconds, preferredTimescale: 600)
+            }
+            return frameDuration
+        }()
+
+        let hasFades = videoClips.contains { $0.fadeIn > 0.01 || $0.fadeOut > 0.01 }
+        let sizeChanged = abs(targetSize.width - sourceSize.width) > 0.5
+            || abs(targetSize.height - sourceSize.height) > 0.5
+        let fpsChanged = settings.frameRate != .original
+        guard hasFades || sizeChanged || fpsChanged else {
+            // Keep any existing preview composition (fade ramps).
+            return player.currentItem?.videoComposition
+        }
+
+        let composition = AVMutableVideoComposition()
+        composition.renderSize = targetSize
+        composition.frameDuration = outFrameDuration
+
+        let scale = min(targetSize.width / max(sourceSize.width, 1), targetSize.height / max(sourceSize.height, 1))
+        let scaled = CGSize(width: sourceSize.width * scale, height: sourceSize.height * scale)
+        let tx = (targetSize.width - scaled.width) * 0.5
+        let ty = (targetSize.height - scaled.height) * 0.5
+        let transform = CGAffineTransform(a: scale, b: 0, c: 0, d: scale, tx: tx, ty: ty)
+
+        var instructions: [AVVideoCompositionInstructionProtocol] = []
+        let timelineEnd = max(videoClips.map(\.timelineEnd).max() ?? 0.05, 0.05)
+
+        if hasFades {
+            for segment in renderSegments() {
+                let clip = segment.clip
+                // Instruction ranges come from the *actual* on-track segment (same rule as
+                // preview), so export can't diverge from the preview or hand AVFoundation
+                // overlapping instructions when clips overlap on the single composition track.
+                let instruction = AVMutableVideoCompositionInstruction()
+                instruction.timeRange = CMTimeRange(
+                    start: CMTime(seconds: segment.at, preferredTimescale: 600),
+                    duration: CMTime(seconds: segment.duration, preferredTimescale: 600)
+                )
+                let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
+                if sizeChanged {
+                    layer.setTransform(transform, at: .zero)
+                }
+                let fadeIn = min(max(0, clip.fadeIn), segment.duration / 2)
+                let fadeOut = min(max(0, clip.fadeOut), segment.duration - fadeIn)
+                if fadeIn > 0.01 {
+                    layer.setOpacityRamp(
+                        fromStartOpacity: 0,
+                        toEndOpacity: 1,
+                        timeRange: CMTimeRange(
+                            start: CMTime(seconds: segment.at, preferredTimescale: 600),
+                            duration: CMTime(seconds: fadeIn, preferredTimescale: 600)
+                        )
+                    )
+                }
+                if fadeOut > 0.01 {
+                    layer.setOpacityRamp(
+                        fromStartOpacity: 1,
+                        toEndOpacity: 0,
+                        timeRange: CMTimeRange(
+                            start: CMTime(seconds: segment.at + segment.duration - fadeOut, preferredTimescale: 600),
+                            duration: CMTime(seconds: fadeOut, preferredTimescale: 600)
+                        )
+                    )
+                }
+                instruction.layerInstructions = [layer]
+                instructions.append(instruction)
+            }
+        } else {
+            let instruction = AVMutableVideoCompositionInstruction()
+            instruction.timeRange = CMTimeRange(
+                start: .zero,
+                duration: CMTime(seconds: timelineEnd, preferredTimescale: 600)
+            )
+            let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
+            if sizeChanged {
+                layer.setTransform(transform, at: .zero)
+            }
+            instruction.layerInstructions = [layer]
+            instructions.append(instruction)
+        }
+
+        composition.instructions = instructions
+        return composition
     }
 
     private func loadDefaults() async {
@@ -3164,7 +3246,8 @@ final class EditorModel {
             // duration (two clips at t=0 would become 2× long). Never insert before the running
             // track end: skip the overlapped head and lay only the fresh tail after it, so the
             // composition duration stays bounded by the model's max end. `renderSegments()` is
-            // the single source of truth for that collapse.
+            // the single source of truth for that collapse, and `makeVideoComposition` derives
+            // its instructions from the same segments so they can't disagree.
             for segment in renderSegments() {
                 if Task.isCancelled { return }
                 let asset = AVURLAsset(url: segment.clip.url)
@@ -3218,14 +3301,15 @@ final class EditorModel {
 
             if Task.isCancelled { return }
             // Commit `mix` and the track-ID maps together BEFORE building the player
-            // item: makeAudioMix() reads the track IDs. No video composition is attached;
-            // one that does not cover the timeline blanks the picture and leaves the audio.
+            // item: makeAudioMix()/makeVideoComposition() read them (track IDs, layer
+            // instructions), so assigning after would pair the new item with the
+            // PREVIOUS composition — video fades silently vanish after every edit.
             mix = rebuiltMix
             videoAudioTrackIDs = newVideoAudioTrackIDs
             musicTrackIDs = newMusicTrackIDs
             let item = AVPlayerItem(asset: rebuiltMix)
             item.audioMix = makeAudioMix()
-            item.videoComposition = nil
+            item.videoComposition = makeVideoComposition()
             let wasPlaying = isPlaying
             player.replaceCurrentItem(with: item)
             seek(to: min(currentTime, duration))
@@ -3254,8 +3338,6 @@ final class EditorModel {
         } catch {
             errorMessage = error.localizedDescription
             status = "Could not build timeline"
-            // A failed rebuild must not leave the fade composition that blanked the frame.
-            player.currentItem?.videoComposition = nil
         }
     }
 
@@ -3349,6 +3431,52 @@ final class EditorModel {
         return segments
     }
 
+    private func makeVideoComposition() -> AVVideoComposition? {
+        guard let track = mix.track(withTrackID: 1), !videoClips.isEmpty else { return nil }
+        guard videoClips.contains(where: { $0.fadeIn > 0.01 || $0.fadeOut > 0.01 }) else { return nil }
+        let composition = AVMutableVideoComposition()
+        composition.renderSize = renderSize.width > 1 ? renderSize : CGSize(width: 1080, height: 1920)
+        composition.frameDuration = frameDuration
+        var instructions: [AVVideoCompositionInstructionProtocol] = []
+        for segment in renderSegments() {
+            let clip = segment.clip
+            // Instruction ranges come from the *actual* on-track segment, not the model's
+            // timeline range — a partially-overlapped clip only owns its rendered tail, and a
+            // fully-overlapped clip isn't in `segments` at all, so no two instructions overlap.
+            let instruction = AVMutableVideoCompositionInstruction()
+            instruction.timeRange = CMTimeRange(
+                start: CMTime(seconds: segment.at, preferredTimescale: 600),
+                duration: CMTime(seconds: segment.duration, preferredTimescale: 600)
+            )
+            let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
+            let fadeIn = min(max(0, clip.fadeIn), segment.duration / 2)
+            let fadeOut = min(max(0, clip.fadeOut), segment.duration - fadeIn)
+            if fadeIn > 0.01 {
+                layer.setOpacityRamp(
+                    fromStartOpacity: 0,
+                    toEndOpacity: 1,
+                    timeRange: CMTimeRange(
+                        start: CMTime(seconds: segment.at, preferredTimescale: 600),
+                        duration: CMTime(seconds: fadeIn, preferredTimescale: 600)
+                    )
+                )
+            }
+            if fadeOut > 0.01 {
+                layer.setOpacityRamp(
+                    fromStartOpacity: 1,
+                    toEndOpacity: 0,
+                    timeRange: CMTimeRange(
+                        start: CMTime(seconds: segment.at + segment.duration - fadeOut, preferredTimescale: 600),
+                        duration: CMTime(seconds: fadeOut, preferredTimescale: 600)
+                    )
+                )
+            }
+            instruction.layerInstructions = [layer]
+            instructions.append(instruction)
+        }
+        composition.instructions = instructions
+        return composition
+    }
 
     private func installTimeObserver() {
         if let timeObserver { player.removeTimeObserver(timeObserver) }
