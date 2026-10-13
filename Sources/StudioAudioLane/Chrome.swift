@@ -268,10 +268,12 @@ struct InspectorPane: View {
                 } volume: {
                     TrackVolumeSlider(
                         value: Binding(
-                            get: { Double(model.track(id: track.id)?.volume ?? track.volume) },
-                            set: { model.setTrackVolume(track.id, Float($0)) }
+                            get: { Double(model.sliderFader(for: track.id)) },
+                            set: { model.setSliderFader(track.id, Float($0)) }
                         ),
-                        accent: accent
+                        accent: accent,
+                        label: model.primarySelectedClip?.trackID == track.id ? "Clip volume" : "Track volume",
+                        onEditingEnded: { model.commitFaderEdit() }
                     )
                 }
             }
@@ -394,7 +396,7 @@ struct InspectorPane: View {
                 .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
             if model.selectedClipIDs.count > 1 {
-                Text("\(model.selectedClipIDs.count) clips selected · editing all")
+                Text("\(model.selectedClipIDs.count) clips selected")
                     .font(.system(size: 11))
                     .foregroundStyle(StudioTheme.text.opacity(0.45))
             } else if model.inspectorValuesAreMixed {
@@ -445,6 +447,17 @@ struct InspectorPane: View {
                     ),
                     upper: model.inspectorMaxLength,
                     format: .seconds,
+                    accent: accent,
+                    onEditingEnded: { model.commitEdit() }
+                )
+                ParameterSlider(
+                    title: "Volume",
+                    value: Binding(
+                        get: { TimeInterval(model.selectedClipFader) },
+                        set: { model.setSelectedClipFader(Float($0)) }
+                    ),
+                    upper: 1,
+                    format: .percent,
                     accent: accent,
                     onEditingEnded: { model.commitEdit() }
                 )
@@ -542,28 +555,34 @@ struct TrackRow<Volume: View>: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Circle()
-                .fill(accent)
-                .frame(width: 6, height: 6)
-            if isRenaming {
-                TextField("Track name", text: $draftName)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(StudioTheme.text.opacity(0.95))
-                    .focused($nameFieldFocused)
-                    .onSubmit { commitRename() }
-                    .onExitCommand { cancelRename() }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            } else {
-                Text(name)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(StudioTheme.text.opacity(isSelected ? 0.95 : 0.68))
-                    .lineLimit(1)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .contentShape(Rectangle())
-                    .onTapGesture(count: 2) {
-                        beginRename()
-                    }
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(accent)
+                    .frame(width: 6, height: 6)
+                if isRenaming {
+                    TextField("Track name", text: $draftName)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(StudioTheme.text.opacity(0.95))
+                        .focused($nameFieldFocused)
+                        .onSubmit { commitRename() }
+                        .onExitCommand { cancelRename() }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    Text(name)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(StudioTheme.text.opacity(isSelected ? 0.95 : 0.68))
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                        .onTapGesture(count: 2) {
+                            beginRename()
+                        }
+                }
+            }
+            .contentShape(Rectangle())
+            .onTapGesture {
+                if !isRenaming { select() }
             }
             if !isRenaming {
                 volume
@@ -580,11 +599,7 @@ struct TrackRow<Volume: View>: View {
             RoundedRectangle(cornerRadius: 7, style: .continuous)
                 .stroke(isSelected ? accent.opacity(0.5) : Color.clear, lineWidth: 1)
         )
-        .contentShape(Rectangle())
         .onHover { hovering = $0 }
-        .onTapGesture {
-            if !isRenaming { select() }
-        }
         .onChange(of: nameFieldFocused) { _, focused in
             if isRenaming && !focused {
                 commitRename()
@@ -623,6 +638,8 @@ struct TrackRow<Volume: View>: View {
 struct TrackVolumeSlider: View {
     @Binding var value: Double
     var accent: Color = Color.white.opacity(0.85)
+    var label: String = "Track volume"
+    var onEditingEnded: (() -> Void)? = nil
 
     var body: some View {
         GeometryReader { geo in
@@ -644,15 +661,18 @@ struct TrackVolumeSlider: View {
             }
             .frame(maxHeight: .infinity)
             .contentShape(Rectangle())
-            .gesture(
+            .highPriorityGesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { drag in
                         value = Double(min(max(0, drag.location.x / width), 1))
                     }
+                    .onEnded { _ in
+                        onEditingEnded?()
+                    }
             )
         }
         .frame(height: 14)
-        .accessibilityLabel("Track volume")
+        .accessibilityLabel(label)
     }
 }
 

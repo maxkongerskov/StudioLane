@@ -31,10 +31,12 @@ enum MCPHandlers {
                 dict["source_in"] = clip.inPoint
                 dict["gain"] = Double(clip.gain)
                 dict["muted"] = clip.muted
+                if let fader = clip.fader { dict["fader"] = Double(fader) }
             } else {
                 if clip.inPoint > 0.001 { dict["source_in"] = clip.inPoint }
                 if abs(Double(clip.gain) - 1.0) > 0.001 { dict["gain"] = Double(clip.gain) }
                 if clip.muted { dict["muted"] = true }
+                if let fader = clip.fader { dict["fader"] = Double(fader) }
             }
             return dict
         }
