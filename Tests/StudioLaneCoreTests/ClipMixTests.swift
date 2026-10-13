@@ -85,6 +85,87 @@ final class ClipMixTests: XCTestCase {
         XCTAssertEqual(ClipMix.normalizedFader(1.4), 1)
         XCTAssertEqual(ClipMix.normalizedFader(-0.2), 0)
     }
+
+    func testInspectorEditHitsEveryHighlightedClip() {
+        let video = UUID()
+        let audio = UUID()
+        XCTAssertEqual(ClipMix.inspectorEditIDs(selected: [video, audio], primary: video), [video, audio])
+        XCTAssertEqual(ClipMix.inspectorEditIDs(selected: [video], primary: video), [video])
+        XCTAssertEqual(ClipMix.inspectorEditIDs(selected: [], primary: audio), [audio])
+        XCTAssertTrue(ClipMix.inspectorEditIDs(selected: [], primary: nil).isEmpty)
+    }
+
+    func testShorterVideoWithAFadeKeepsTheMiddleOpaqueAndTheAudioTailClear() {
+        let picture = VideoCompositionCoverage.PictureSpan(start: 0, duration: 4, fadeIn: 0.5, fadeOut: 0.5)
+        let slices = VideoCompositionCoverage.slices(segments: [picture], compositionEnd: 10)
+        XCTAssertEqual(slices.count, 2)
+        XCTAssertEqual(slices[0].body, .picture(fadeIn: 0.5, fadeOut: 0.5))
+        XCTAssertEqual(slices[1].body, .empty)
+        assertTiles(slices, end: 10)
+
+        XCTAssertEqual(VideoCompositionCoverage.opacity(at: 0, segments: [picture], compositionEnd: 10), 0, accuracy: 0.0001)
+        XCTAssertEqual(VideoCompositionCoverage.opacity(at: 0.25, segments: [picture], compositionEnd: 10), 0.5, accuracy: 0.0001)
+        XCTAssertEqual(VideoCompositionCoverage.opacity(at: 2, segments: [picture], compositionEnd: 10), 1, accuracy: 0.0001)
+        XCTAssertEqual(VideoCompositionCoverage.opacity(at: 3.75, segments: [picture], compositionEnd: 10), 0.5, accuracy: 0.0001)
+        XCTAssertEqual(VideoCompositionCoverage.opacity(at: 6, segments: [picture], compositionEnd: 10), 0, accuracy: 0.0001)
+    }
+
+    func testLeadingGapAndHoleBecomeEmptySlices() {
+        let leading = VideoCompositionCoverage.PictureSpan(start: 2, duration: 4, fadeIn: 0, fadeOut: 0)
+        let leadingSlices = VideoCompositionCoverage.slices(segments: [leading], compositionEnd: 10)
+        XCTAssertEqual(leadingSlices.map(\.body), [.empty, .picture(fadeIn: 0, fadeOut: 0), .empty])
+        assertTiles(leadingSlices, end: 10)
+        XCTAssertEqual(VideoCompositionCoverage.opacity(at: 1, segments: [leading], compositionEnd: 10), 0, accuracy: 0.0001)
+        XCTAssertEqual(VideoCompositionCoverage.opacity(at: 4, segments: [leading], compositionEnd: 10), 1, accuracy: 0.0001)
+
+        let first = VideoCompositionCoverage.PictureSpan(start: 0, duration: 2, fadeIn: 0, fadeOut: 0)
+        let second = VideoCompositionCoverage.PictureSpan(start: 5, duration: 2, fadeIn: 0.2, fadeOut: 0.2)
+        let hole = VideoCompositionCoverage.slices(segments: [second, first], compositionEnd: 10)
+        XCTAssertEqual(hole.count, 4)
+        XCTAssertEqual(hole[1].body, .empty)
+        assertTiles(hole, end: 10)
+        XCTAssertEqual(VideoCompositionCoverage.opacity(at: 3, segments: [first, second], compositionEnd: 10), 0, accuracy: 0.0001)
+        XCTAssertEqual(VideoCompositionCoverage.opacity(at: 6, segments: [first, second], compositionEnd: 10), 1, accuracy: 0.0001)
+    }
+
+    func testAbuttingPictureSlicesHaveNoEmptyGap() {
+        let left = VideoCompositionCoverage.PictureSpan(start: 0, duration: 4, fadeIn: 0, fadeOut: 0)
+        let right = VideoCompositionCoverage.PictureSpan(start: 4, duration: 4, fadeIn: 0, fadeOut: 0)
+        let slices = VideoCompositionCoverage.slices(segments: [left, right], compositionEnd: 8)
+        XCTAssertEqual(slices.count, 2)
+        XCTAssertFalse(slices.contains { if case .empty = $0.body { return true }; return false })
+        assertTiles(slices, end: 8)
+        XCTAssertEqual(VideoCompositionCoverage.opacity(at: 3.9, segments: [left, right], compositionEnd: 8), 1, accuracy: 0.0001)
+        XCTAssertEqual(VideoCompositionCoverage.opacity(at: 4, segments: [left, right], compositionEnd: 8), 1, accuracy: 0.0001)
+    }
+
+    func testFadesStayInsideThePictureSlice() {
+        let fades = VideoCompositionCoverage.clampedFades(fadeIn: 10, fadeOut: 10, duration: 4)
+        XCTAssertLessThanOrEqual(fades.in, 2)
+        XCTAssertLessThanOrEqual(fades.in + fades.out, 4)
+        let span = VideoCompositionCoverage.PictureSpan(start: 0, duration: 4, fadeIn: 10, fadeOut: 10)
+        let slices = VideoCompositionCoverage.slices(segments: [span], compositionEnd: 4)
+        XCTAssertEqual(slices.count, 1)
+        guard case .picture(let fadeIn, let fadeOut) = slices[0].body else {
+            return XCTFail("Expected a picture slice")
+        }
+        XCTAssertEqual(fadeIn, fades.in, accuracy: 0.0001)
+        XCTAssertEqual(fadeOut, fades.out, accuracy: 0.0001)
+        XCTAssertLessThanOrEqual(slices[0].end, 4.0001)
+    }
+
+    private func assertTiles(_ slices: [VideoCompositionCoverage.Slice], end: Double) {
+        XCTAssertFalse(slices.isEmpty)
+        XCTAssertEqual(slices[0].start, 0, accuracy: 0.0001)
+        var cursor = 0.0
+        for slice in slices {
+            XCTAssertEqual(slice.start, cursor, accuracy: 0.0001)
+            XCTAssertGreaterThan(slice.duration, 0)
+            XCTAssertLessThanOrEqual(slice.end, end + 0.0001)
+            cursor = slice.end
+        }
+        XCTAssertEqual(cursor, end, accuracy: 0.0001)
+    }
 }
 
 /// Mirrors `MediaClip`'s fader key: missing or non-finite stays nil, and nil is

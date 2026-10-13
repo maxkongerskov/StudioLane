@@ -97,4 +97,135 @@ public enum ClipMix {
         guard let primaryID else { return [] }
         return [primaryID]
     }
+
+    /// Inspector edits (length, fade, gain, fader) hit every highlighted clip.
+    /// An empty multi-set still edits the primary clip.
+    public static func inspectorEditIDs(selected: Set<UUID>, primary: UUID?) -> Set<UUID> {
+        if !selected.isEmpty { return selected }
+        if let primary { return [primary] }
+        return []
+    }
+}
+
+/// How a video composition stays valid when the timeline is longer than the picture.
+///
+/// AVFoundation rejects a composition whose instructions do not tile the whole
+/// duration. A rejected composition draws black for every frame while audio
+/// keeps playing. Picture slices keep their fades; every other span (a leading
+/// gap, a hole, or an audio tail) is an empty slice so the instruction list
+/// still reaches `compositionEnd`.
+public enum VideoCompositionCoverage {
+    public struct PictureSpan: Equatable, Sendable {
+        public var start: Double
+        public var duration: Double
+        public var fadeIn: Double
+        public var fadeOut: Double
+
+        public init(start: Double, duration: Double, fadeIn: Double, fadeOut: Double) {
+            self.start = start
+            self.duration = duration
+            self.fadeIn = fadeIn
+            self.fadeOut = fadeOut
+        }
+    }
+
+    public struct Slice: Equatable, Sendable {
+        public enum Body: Equatable, Sendable {
+            case empty
+            case picture(fadeIn: Double, fadeOut: Double)
+        }
+
+        public var start: Double
+        public var duration: Double
+        public var body: Body
+
+        public var end: Double { start + duration }
+
+        public init(start: Double, duration: Double, body: Body) {
+            self.start = start
+            self.duration = duration
+            self.body = body
+        }
+    }
+
+    /// Fade ramps share a segment without crossing. Fade-in takes at most half;
+    /// fade-out takes what remains.
+    public static func clampedFades(fadeIn: Double, fadeOut: Double, duration: Double) -> (in: Double, out: Double) {
+        let span = duration.isFinite ? max(0, duration) : 0
+        let fadeIn = fadeIn.isFinite ? min(max(0, fadeIn), span / 2) : 0
+        let fadeOut = fadeOut.isFinite ? min(max(0, fadeOut), max(0, span - fadeIn)) : 0
+        return (fadeIn, fadeOut)
+    }
+
+    /// Slices tile `[0, compositionEnd)` with no gaps and no overlaps.
+    /// Picture is clipped to that range. Adjacent empty spans collapse into one.
+    public static func slices(segments: [PictureSpan], compositionEnd: Double) -> [Slice] {
+        guard compositionEnd.isFinite, compositionEnd > 0.000_05 else { return [] }
+        let end = compositionEnd
+
+        var pictures: [(start: Double, end: Double, fadeIn: Double, fadeOut: Double)] = []
+        for segment in segments.sorted(by: { $0.start < $1.start }) {
+            guard segment.start.isFinite, segment.duration.isFinite else { continue }
+            let rawStart = min(max(0, segment.start), end)
+            let rawStop = min(max(rawStart, segment.start + max(0, segment.duration)), end)
+            let start = pictures.last.map { max(rawStart, $0.end) } ?? rawStart
+            let stop = max(start, rawStop)
+            guard stop - start > 0.000_05 else { continue }
+            let fades = clampedFades(fadeIn: segment.fadeIn, fadeOut: segment.fadeOut, duration: stop - start)
+            pictures.append((start, stop, fades.in, fades.out))
+        }
+
+        var slices: [Slice] = []
+        var cursor = 0.0
+        func append(from start: Double, to stop: Double, body: Slice.Body) {
+            let duration = stop - start
+            guard duration > 0.000_05 else { return }
+            if case .empty = body, let last = slices.last, case .empty = last.body, abs(last.end - start) < 0.000_05 {
+                slices[slices.count - 1].duration += duration
+                return
+            }
+            slices.append(Slice(start: start, duration: duration, body: body))
+        }
+
+        for picture in pictures {
+            if picture.start > cursor + 0.000_05 {
+                append(from: cursor, to: picture.start, body: .empty)
+            }
+            append(
+                from: picture.start,
+                to: picture.end,
+                body: .picture(fadeIn: picture.fadeIn, fadeOut: picture.fadeOut)
+            )
+            cursor = picture.end
+        }
+        if end > cursor + 0.000_05 {
+            append(from: cursor, to: end, body: .empty)
+        }
+        return slices
+    }
+
+    /// Opacity a full-timeline instruction would show. Empty spans are 0.
+    /// Inside a picture, fade-in rises 0→1, the middle holds 1, fade-out falls 1→0.
+    public static func opacity(at time: Double, segments: [PictureSpan], compositionEnd: Double) -> Float {
+        guard time.isFinite, time >= 0, compositionEnd.isFinite, time < compositionEnd else { return 0 }
+        for slice in slices(segments: segments, compositionEnd: compositionEnd) {
+            guard time >= slice.start, time < slice.end else { continue }
+            switch slice.body {
+            case .empty:
+                return 0
+            case .picture(let fadeIn, let fadeOut):
+                let local = time - slice.start
+                if fadeIn > 0.000_05, local < fadeIn {
+                    return Float(local / fadeIn)
+                }
+                let fadeOutStart = slice.duration - fadeOut
+                if fadeOut > 0.000_05, local > fadeOutStart {
+                    let t = (local - fadeOutStart) / fadeOut
+                    return Float(1 - min(max(t, 0), 1))
+                }
+                return 1
+            }
+        }
+        return 0
+    }
 }

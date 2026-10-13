@@ -396,7 +396,7 @@ struct InspectorPane: View {
                 .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
             if model.selectedClipIDs.count > 1 {
-                Text("\(model.selectedClipIDs.count) clips selected")
+                Text("\(model.selectedClipIDs.count) clips selected · editing all")
                     .font(.system(size: 11))
                     .foregroundStyle(StudioTheme.text.opacity(0.45))
             } else if model.inspectorValuesAreMixed {
