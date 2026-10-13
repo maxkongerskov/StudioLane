@@ -289,10 +289,10 @@ struct TimelineView: View {
                 .padding(.leading, 8)
             FadeHandle(isAudio: false)
                 .offset(x: max(0, fadeInW - 4))
-                .highPriorityGesture(fadeDrag(kind: .videoFadeIn, clipID: clip.id, width: laneWidth, origin: { clip.fadeIn }) { model.setVideoFadeIn($0) })
+                .highPriorityGesture(fadeDrag(kind: .videoFadeIn, clipID: clip.id, width: laneWidth, origin: { clip.fadeIn }) { model.setClipFadeIn(clip.id, $0) })
             FadeHandle(isAudio: false)
                 .offset(x: max(0, clipWidth - fadeOutW - 8))
-                .highPriorityGesture(fadeDrag(kind: .videoFadeOut, clipID: clip.id, width: laneWidth, origin: { clip.fadeOut }) { model.setVideoFadeOut($0) })
+                .highPriorityGesture(fadeDrag(kind: .videoFadeOut, clipID: clip.id, width: laneWidth, origin: { clip.fadeOut }) { model.setClipFadeOut(clip.id, $0) })
             TrimEdge()
                 .frame(width: 14)
                 .contentShape(Rectangle())
@@ -314,10 +314,12 @@ struct TimelineView: View {
         )
         .contentShape(Rectangle())
         .gesture(clipMoveGesture(kind: .videoMove, clipID: clip.id, laneWidth: laneWidth, origin: clip.timelineStart, isVideo: true))
+        .simultaneousGesture(
+            TapGesture().onEnded { _ in
+                model.selectVideoClip(clip.id, extending: NSEvent.modifierFlags.contains(.shift))
+            }
+        )
         .onTapGesture(count: 2) { showClipMenu(clipID: clip.id) }
-        .onTapGesture {
-            model.selectVideoClip(clip.id, extending: NSEvent.modifierFlags.contains(.shift))
-        }
     }
 
     private func audioLane(track: TimelineTrack, width: CGFloat) -> some View {
@@ -426,12 +428,12 @@ struct TimelineView: View {
             FadeHandle(isAudio: true)
                 .offset(x: max(0, fadeInW - 4))
                 .highPriorityGesture(fadeDrag(kind: .audioFadeIn, clipID: clip.id, width: laneWidth, origin: { clip.fadeIn }) { time in
-                    model.setAudioFadeIn(time)
+                    model.setClipFadeIn(clip.id, time)
                 })
             FadeHandle(isAudio: true)
                 .offset(x: max(0, clipWidth - fadeOutW - 8))
                 .highPriorityGesture(fadeDrag(kind: .audioFadeOut, clipID: clip.id, width: laneWidth, origin: { clip.fadeOut }) { time in
-                    model.setAudioFadeOut(time)
+                    model.setClipFadeOut(clip.id, time)
                 })
         }
         .overlay(
@@ -440,10 +442,12 @@ struct TimelineView: View {
         )
         .contentShape(Rectangle())
         .gesture(clipMoveGesture(kind: .audioMove, clipID: clip.id, laneWidth: laneWidth, origin: clip.timelineStart, isVideo: false))
+        .simultaneousGesture(
+            TapGesture().onEnded { _ in
+                model.selectAudioClip(clip.id, extending: NSEvent.modifierFlags.contains(.shift))
+            }
+        )
         .onTapGesture(count: 2) { showClipMenu(clipID: clip.id) }
-        .onTapGesture {
-            model.selectAudioClip(clip.id, extending: NSEvent.modifierFlags.contains(.shift))
-        }
     }
 
     private func clipMoveGesture(kind: DragKind, clipID: UUID, laneWidth: CGFloat, origin: TimeInterval, isVideo: Bool) -> some Gesture {
@@ -453,10 +457,11 @@ struct TimelineView: View {
                     dragKind = kind
                     dragClipID = clipID
                     dragOrigin = origin
+                    let extending = NSEvent.modifierFlags.contains(.shift)
                     if isVideo {
-                        model.selectVideoClip(clipID)
+                        model.selectVideoClip(clipID, extending: extending)
                     } else {
-                        model.selectAudioClip(clipID)
+                        model.selectAudioClip(clipID, extending: extending)
                     }
                 }
                 guard dragKind == kind, dragClipID == clipID, laneWidth > 0 else { return }

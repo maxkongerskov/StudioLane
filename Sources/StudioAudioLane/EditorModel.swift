@@ -1,6 +1,7 @@
 import AppKit
 import AVFoundation
 import Observation
+import StudioLaneCore
 import UniformTypeIdentifiers
 
 struct TimelineTrack: Identifiable, Codable, Hashable {
@@ -34,8 +35,12 @@ struct MediaClip: Identifiable, Codable {
     var fadeIn: TimeInterval
     var fadeOut: TimeInterval
     var muted: Bool = false
-    /// Per-clip gain 0…1, multiplied with track volume (and duck) in the mix.
+    /// Per-clip gain 0…1, multiplied with this clip's fader (or the lane volume
+    /// when `fader` is still nil) and ducking.
     var gain: Float = 1
+    /// Per-clip volume fader 0…1. Nil in projects saved before clips owned a
+    /// fader: the clip follows its lane volume until a segment is edited or cut.
+    var fader: Float? = nil
     /// Lane this clip belongs to (video or audio track).
     var trackID: UUID
     /// Full-source peak map covering `0...sourceDuration`. Drawing windows by inPoint/duration (Logic-style mask).
@@ -62,7 +67,7 @@ struct MediaClip: Identifiable, Codable {
 
     enum CodingKeys: String, CodingKey {
         case id, url, name, sourceDuration, inPoint, timelineStart, duration
-        case fadeIn, fadeOut, muted, gain, trackID, waveform
+        case fadeIn, fadeOut, muted, gain, fader, trackID, waveform
     }
 
     init(
@@ -77,6 +82,7 @@ struct MediaClip: Identifiable, Codable {
         fadeOut: TimeInterval,
         muted: Bool = false,
         gain: Float = 1,
+        fader: Float? = nil,
         trackID: UUID = UUID(),
         waveform: [Float] = []
     ) {
@@ -91,6 +97,7 @@ struct MediaClip: Identifiable, Codable {
         self.fadeOut = fadeOut
         self.muted = muted
         self.gain = gain
+        self.fader = fader
         self.trackID = trackID
         self.waveform = waveform
     }
@@ -108,6 +115,9 @@ struct MediaClip: Identifiable, Codable {
         fadeOut = try c.decode(TimeInterval.self, forKey: .fadeOut)
         muted = try c.decodeIfPresent(Bool.self, forKey: .muted) ?? false
         gain = try c.decodeIfPresent(Float.self, forKey: .gain) ?? 1
+        // Missing key (every project saved before per-clip faders) stays nil
+        // and continues to follow the lane volume. Non-finite values do too.
+        fader = ClipMix.normalizedFader(try c.decodeIfPresent(Float.self, forKey: .fader))
         trackID = try c.decodeIfPresent(UUID.self, forKey: .trackID) ?? UUID()
         waveform = try c.decodeIfPresent([Float].self, forKey: .waveform) ?? []
     }
@@ -125,6 +135,7 @@ struct MediaClip: Identifiable, Codable {
         try c.encode(fadeOut, forKey: .fadeOut)
         try c.encode(muted, forKey: .muted)
         try c.encode(gain, forKey: .gain)
+        try c.encodeIfPresent(fader, forKey: .fader)
         try c.encode(trackID, forKey: .trackID)
         try c.encode(waveform, forKey: .waveform)
     }
@@ -147,6 +158,7 @@ struct MediaClip: Identifiable, Codable {
             fadeOut: fadeOut,
             muted: muted,
             gain: gain.isFinite ? min(max(gain, 0), 1) : 1,
+            fader: ClipMix.normalizedFader(fader),
             trackID: trackID,
             waveform: waveform.count <= Self.maximumPersistedWaveformPoints
                 ? waveform.map { $0.isFinite ? min(max($0, 0), 1) : 0 }
@@ -1555,40 +1567,32 @@ final class EditorModel {
     }
 
     private func applySelection(_ id: UUID, extending: Bool) {
-        if extending {
-            if selectedClipIDs.contains(id) {
-                selectedClipIDs.remove(id)
-                if selectedClipID == id {
-                    selectedClipID = selectedClipIDs.first
-                }
-                // Drop track from explicit multi-select when it no longer has selected clips.
-                if let trackID = (videoClips.first(where: { $0.id == id })
-                    ?? audioClips.first(where: { $0.id == id }))?.trackID,
-                   !trackHasSelectedClip(trackID) {
-                    selectedTrackIDs.remove(trackID)
-                }
-            } else {
-                selectedClipIDs.insert(id)
-                selectedClipID = id
-                if let trackID = (videoClips.first(where: { $0.id == id })
-                    ?? audioClips.first(where: { $0.id == id }))?.trackID {
-                    selectedTrackIDs.insert(trackID)
-                }
-            }
-        } else {
-            selectedClipIDs = [id]
+        let next = ClipMix.selectionAfterClick(clipID: id, extending: extending, selected: selectedClipIDs)
+        selectedClipIDs = next
+        if next.contains(id) {
             selectedClipID = id
-            if let trackID = (videoClips.first(where: { $0.id == id })
-                ?? audioClips.first(where: { $0.id == id }))?.trackID {
-                selectedTrackIDs = [trackID]
-            } else {
+        } else if let sid = selectedClipID, next.contains(sid) {
+            // Primary is still in the set.
+        } else {
+            selectedClipID = next.first
+        }
+        let trackID = (videoClips.first(where: { $0.id == id }) ?? audioClips.first(where: { $0.id == id }))?.trackID
+        if next.contains(id) {
+            if let trackID {
+                selectedTrackIDs = extending ? selectedTrackIDs.union([trackID]) : [trackID]
+            } else if !extending {
                 selectedTrackIDs = []
             }
+        } else if let trackID, !trackHasSelectedClip(trackID) {
+            selectedTrackIDs.remove(trackID)
         }
     }
 
-    /// Select a track from the sidebar. Plain click replaces selection; Shift-click toggles the track
-    /// (and all of its clips) into/out of the multi-selection. Empty tracks stay highlighted via `selectedTrackIDs`.
+    /// Select a track from the sidebar. A plain click focuses the lane and leaves a
+    /// single clip selected (the one already current, or the first on the lane) so
+    /// volume and fades don't jump onto every clip. Shift-click still toggles the
+    /// whole lane into the multi-selection. Empty tracks stay highlighted via
+    /// `selectedTrackIDs`.
     func selectTrack(_ trackID: UUID, extending: Bool = false) {
         guard let t = track(id: trackID) else { return }
         focusedTrackID = trackID
@@ -1615,8 +1619,19 @@ final class EditorModel {
             }
         } else {
             selectedTrackIDs = [trackID]
-            selectedClipIDs = clipIDsOnTrack
-            selectedClipID = clipIDsOnTrack.first
+            let ordered = (videoClips + audioClips)
+                .filter { $0.trackID == trackID }
+                .sorted { $0.timelineStart < $1.timelineStart }
+            if let current = selectedClipID, ordered.contains(where: { $0.id == current }) {
+                selectedClipIDs = ClipMix.selectionAfterClick(clipID: current, extending: false, selected: selectedClipIDs)
+                selectedClipID = current
+            } else if let first = ordered.first?.id {
+                selectedClipIDs = ClipMix.selectionAfterClick(clipID: first, extending: false, selected: [])
+                selectedClipID = first
+            } else {
+                selectedClipIDs = []
+                selectedClipID = nil
+            }
         }
     }
 
@@ -1663,9 +1678,9 @@ final class EditorModel {
 
     func setClipLength(_ length: TimeInterval) {
         beginEdit()
-        let ids = selectedClipIDs.isEmpty
-            ? Set([selectedClipID].compactMap { $0 })
-            : selectedClipIDs
+        // Length follows every highlighted clip. A single click highlights one segment.
+        let ids = ClipMix.inspectorEditIDs(selected: selectedClipIDs, primary: selectedClipID)
+        guard !ids.isEmpty else { return }
         for id in ids {
             if let i = audioIndex(id) {
                 trimOutOn(&audioClips[i], time: audioClips[i].timelineStart + length)
@@ -1733,7 +1748,6 @@ final class EditorModel {
         guard !videoTargets.isEmpty || !audioTargets.isEmpty else { return }
 
         pushHistory()
-        var newSelection: Set<UUID> = []
         var primary: UUID?
 
         // Split from the end so insertions do not invalidate earlier indices.
@@ -1749,8 +1763,6 @@ final class EditorModel {
                 scheduleFilmstrip(for: parts.left)
                 scheduleFilmstrip(for: parts.right)
             }
-            newSelection.insert(parts.left.id)
-            newSelection.insert(parts.right.id)
             primary = parts.right.id
         }
 
@@ -1762,15 +1774,20 @@ final class EditorModel {
             right.waveform = audioClips[i].waveform
             audioClips[i] = parts.left
             audioClips.insert(right, at: i + 1)
-            newSelection.insert(parts.left.id)
-            newSelection.insert(right.id)
             primary = right.id
         }
 
-        selectedClipIDs = newSelection
-        selectedClipID = primary ?? newSelection.first
+        // The razor used to leave every piece selected, so the next gain/fade/volume
+        // edit rewrote all of them. Keep only the piece the playhead is on.
+        let kept = ClipMix.selectionAfterSplit(primaryID: primary)
+        selectedClipIDs = kept
+        selectedClipID = primary
         if let pid = selectedClipID {
             focusedLane = videoIndex(pid) != nil ? .video : .audio
+            if let clip = videoClips.first(where: { $0.id == pid }) ?? audioClips.first(where: { $0.id == pid }) {
+                focusedTrackID = clip.trackID
+                selectedTrackIDs = [clip.trackID]
+            }
         }
         rebuild()
     }
@@ -1791,9 +1808,6 @@ final class EditorModel {
 
         var left = original
         left.duration = leftDuration
-        // Hard cut at the razor: no fade across the join.
-        left.fadeOut = 0
-        left.clampFades()
 
         var right = original
         right.id = UUID()
@@ -1801,8 +1815,33 @@ final class EditorModel {
         right.timelineStart = left.timelineStart + left.duration
         right.inPoint = original.inPoint + leftDuration
         right.duration = rightDuration
-        right.fadeIn = 0
-        right.fadeOut = min(right.fadeOut, max(0, right.duration / 2))
+
+        // Value copies of mix settings, with the lane fader baked into each piece
+        // when the original was still inheriting it. Later edits of one side
+        // cannot reach the other, or any other clip on the lane.
+        let laneVolume = track(id: original.trackID)?.volume ?? 1
+        let mix = ClipMix.splitPieces(
+            from: ClipMix.Settings(
+                gain: original.gain,
+                fadeIn: original.fadeIn,
+                fadeOut: original.fadeOut,
+                muted: original.muted,
+                fader: original.fader
+            ),
+            laneVolume: laneVolume,
+            rightDuration: rightDuration
+        )
+        left.gain = mix.left.gain
+        left.fadeIn = mix.left.fadeIn
+        left.fadeOut = mix.left.fadeOut
+        left.muted = mix.left.muted
+        left.fader = mix.left.fader
+        right.gain = mix.right.gain
+        right.fadeIn = mix.right.fadeIn
+        right.fadeOut = mix.right.fadeOut
+        right.muted = mix.right.muted
+        right.fader = mix.right.fader
+        left.clampFades()
         right.clampFades()
         return (left, right)
     }
@@ -1979,39 +2018,60 @@ final class EditorModel {
 
     // Fade setters are called continuously during a drag; beginEdit() pushes
     // history once at drag start so undo returns to the pre-drag state.
-    // Multi-select: writes apply to every clip in `selectedClipIDs` (video + audio).
+    // Inspector writes hit every highlighted clip. A fade handle passes its
+    // own clip id so a drag on one segment does not rewrite the others.
     func setSelectedFadeIn(_ time: TimeInterval) {
         beginEdit()
-        let t = max(0, time)
-        let ids = selectedClipIDs.isEmpty ? Set([selectedClipID].compactMap { $0 }) : selectedClipIDs
-        for id in ids {
-            if let i = videoIndex(id) {
-                videoClips[i].fadeIn = min(t, max(0, videoClips[i].duration - videoClips[i].fadeOut))
-                videoClips[i].clampFades()
-            } else if let i = audioIndex(id) {
-                audioClips[i].fadeIn = min(t, max(0, audioClips[i].duration - audioClips[i].fadeOut))
-                audioClips[i].clampFades()
-            }
-        }
+        let ids = ClipMix.inspectorEditIDs(selected: selectedClipIDs, primary: selectedClipID)
+        guard !ids.isEmpty else { return }
+        for id in ids { writeFadeIn(id, time) }
         applyFades()
         isEditingClip = true
     }
 
     func setSelectedFadeOut(_ time: TimeInterval) {
         beginEdit()
-        let t = max(0, time)
-        let ids = selectedClipIDs.isEmpty ? Set([selectedClipID].compactMap { $0 }) : selectedClipIDs
-        for id in ids {
-            if let i = videoIndex(id) {
-                videoClips[i].fadeOut = min(t, max(0, videoClips[i].duration - videoClips[i].fadeIn))
-                videoClips[i].clampFades()
-            } else if let i = audioIndex(id) {
-                audioClips[i].fadeOut = min(t, max(0, audioClips[i].duration - audioClips[i].fadeIn))
-                audioClips[i].clampFades()
-            }
-        }
+        let ids = ClipMix.inspectorEditIDs(selected: selectedClipIDs, primary: selectedClipID)
+        guard !ids.isEmpty else { return }
+        for id in ids { writeFadeOut(id, time) }
         applyFades()
         isEditingClip = true
+    }
+
+    func setClipFadeIn(_ clipID: UUID, _ time: TimeInterval) {
+        beginEdit()
+        writeFadeIn(clipID, time)
+        applyFades()
+        isEditingClip = true
+    }
+
+    func setClipFadeOut(_ clipID: UUID, _ time: TimeInterval) {
+        beginEdit()
+        writeFadeOut(clipID, time)
+        applyFades()
+        isEditingClip = true
+    }
+
+    private func writeFadeIn(_ clipID: UUID, _ time: TimeInterval) {
+        let t = max(0, time)
+        if let i = videoIndex(clipID) {
+            videoClips[i].fadeIn = min(t, max(0, videoClips[i].duration - videoClips[i].fadeOut))
+            videoClips[i].clampFades()
+        } else if let i = audioIndex(clipID) {
+            audioClips[i].fadeIn = min(t, max(0, audioClips[i].duration - audioClips[i].fadeOut))
+            audioClips[i].clampFades()
+        }
+    }
+
+    private func writeFadeOut(_ clipID: UUID, _ time: TimeInterval) {
+        let t = max(0, time)
+        if let i = videoIndex(clipID) {
+            videoClips[i].fadeOut = min(t, max(0, videoClips[i].duration - videoClips[i].fadeIn))
+            videoClips[i].clampFades()
+        } else if let i = audioIndex(clipID) {
+            audioClips[i].fadeOut = min(t, max(0, audioClips[i].duration - audioClips[i].fadeIn))
+            audioClips[i].clampFades()
+        }
     }
 
     func setVideoFadeIn(_ time: TimeInterval) { setSelectedFadeIn(time) }
@@ -2039,7 +2099,8 @@ final class EditorModel {
     func setSelectedClipGain(_ gain: Float) {
         beginEdit()
         let g = min(max(0, gain), 1)
-        let ids = selectedClipIDs.isEmpty ? Set([selectedClipID].compactMap { $0 }) : selectedClipIDs
+        let ids = ClipMix.inspectorEditIDs(selected: selectedClipIDs, primary: selectedClipID)
+        guard !ids.isEmpty else { return }
         for id in ids {
             if let i = videoIndex(id) {
                 videoClips[i].gain = g
@@ -2055,7 +2116,64 @@ final class EditorModel {
         primarySelectedClip?.gain ?? 1
     }
 
-    /// Inspector display values — primary clip; writes go to all selected.
+    /// Fader shown for the highlighted clip. A clip that still inherits the lane
+    /// (`fader == nil`) displays that lane level so the slider matches playback.
+    var selectedClipFader: Float {
+        guard let clip = primarySelectedClip else { return 1 }
+        let lane = track(id: clip.trackID)?.volume ?? (videoClips.contains(where: { $0.id == clip.id }) ? videoVolume : musicVolume)
+        return ClipMix.faderOrLane(clip.fader, laneVolume: lane)
+    }
+
+    func setSelectedClipFader(_ value: Float) {
+        beginEdit()
+        let v = ClipMix.normalizedFader(value) ?? 0
+        let ids = ClipMix.inspectorEditIDs(selected: selectedClipIDs, primary: selectedClipID)
+        guard !ids.isEmpty else { return }
+        for id in ids { assignFader(id, v) }
+        applyFades()
+        isEditingClip = true
+    }
+
+    private func assignFader(_ clipID: UUID, _ value: Float) {
+        if let i = videoIndex(clipID) {
+            videoClips[i].fader = value
+        } else if let i = audioIndex(clipID) {
+            audioClips[i].fader = value
+        }
+    }
+
+    /// Lane-row slider. While a clip on that lane is the highlighted segment, the
+    /// slider is that clip's fader. Otherwise it is still the lane master, and
+    /// only clips that have not been given their own fader follow it.
+    func sliderFader(for trackID: UUID) -> Float {
+        let lane = track(id: trackID)?.volume ?? 1
+        if let clip = primarySelectedClip, clip.trackID == trackID {
+            return ClipMix.faderOrLane(clip.fader, laneVolume: lane)
+        }
+        return lane
+    }
+
+    func setSliderFader(_ trackID: UUID, _ value: Float) {
+        // The lane slider edits the highlighted clip on that lane only. The
+        // inspector Volume slider is what writes every highlighted clip.
+        if let clip = primarySelectedClip, clip.trackID == trackID {
+            beginEdit()
+            assignFader(clip.id, ClipMix.normalizedFader(value) ?? 0)
+            applyFades()
+            isEditingClip = true
+            return
+        }
+        setTrackVolume(trackID, value)
+    }
+
+    /// Ends a fader drag without rebuilding the timeline when the slider was the
+    /// lane master (that path never opened an edit).
+    func commitFaderEdit() {
+        guard isEditingClip else { return }
+        commitEdit()
+    }
+
+    /// Inspector display values come from the primary clip. Writes go to every highlighted clip.
     var inspectorFadeIn: TimeInterval { primarySelectedClip?.fadeIn ?? 0 }
     var inspectorFadeOut: TimeInterval { primarySelectedClip?.fadeOut ?? 0 }
     var inspectorLength: TimeInterval { primarySelectedClip?.duration ?? 0 }
@@ -2080,7 +2198,12 @@ final class EditorModel {
         let fo = clips[0].fadeOut
         let dur = clips[0].duration
         let g = clips[0].gain
-        return clips.contains { abs($0.fadeIn - fi) > 0.0005 || abs($0.fadeOut - fo) > 0.0005 || abs($0.duration - dur) > 0.0005 || abs($0.gain - g) > 0.0005 }
+        let fader = clips[0].fader
+        return clips.contains { clip in
+            abs(clip.fadeIn - fi) > 0.0005 || abs(clip.fadeOut - fo) > 0.0005
+                || abs(clip.duration - dur) > 0.0005 || abs(clip.gain - g) > 0.0005
+                || clip.fader != fader
+        }
     }
 
     func setDuckingMusic(_ enabled: Bool) {
@@ -2690,66 +2813,11 @@ final class EditorModel {
         let scaled = CGSize(width: sourceSize.width * scale, height: sourceSize.height * scale)
         let tx = (targetSize.width - scaled.width) * 0.5
         let ty = (targetSize.height - scaled.height) * 0.5
-        let transform = CGAffineTransform(a: scale, b: 0, c: 0, d: scale, tx: tx, ty: ty)
-
-        var instructions: [AVVideoCompositionInstructionProtocol] = []
-        let timelineEnd = max(videoClips.map(\.timelineEnd).max() ?? 0.05, 0.05)
-
-        if hasFades {
-            for segment in renderSegments() {
-                let clip = segment.clip
-                // Instruction ranges come from the *actual* on-track segment (same rule as
-                // preview), so export can't diverge from the preview or hand AVFoundation
-                // overlapping instructions when clips overlap on the single composition track.
-                let instruction = AVMutableVideoCompositionInstruction()
-                instruction.timeRange = CMTimeRange(
-                    start: CMTime(seconds: segment.at, preferredTimescale: 600),
-                    duration: CMTime(seconds: segment.duration, preferredTimescale: 600)
-                )
-                let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
-                if sizeChanged {
-                    layer.setTransform(transform, at: .zero)
-                }
-                let fadeIn = min(max(0, clip.fadeIn), segment.duration / 2)
-                let fadeOut = min(max(0, clip.fadeOut), segment.duration - fadeIn)
-                if fadeIn > 0.01 {
-                    layer.setOpacityRamp(
-                        fromStartOpacity: 0,
-                        toEndOpacity: 1,
-                        timeRange: CMTimeRange(
-                            start: CMTime(seconds: segment.at, preferredTimescale: 600),
-                            duration: CMTime(seconds: fadeIn, preferredTimescale: 600)
-                        )
-                    )
-                }
-                if fadeOut > 0.01 {
-                    layer.setOpacityRamp(
-                        fromStartOpacity: 1,
-                        toEndOpacity: 0,
-                        timeRange: CMTimeRange(
-                            start: CMTime(seconds: segment.at + segment.duration - fadeOut, preferredTimescale: 600),
-                            duration: CMTime(seconds: fadeOut, preferredTimescale: 600)
-                        )
-                    )
-                }
-                instruction.layerInstructions = [layer]
-                instructions.append(instruction)
-            }
-        } else {
-            let instruction = AVMutableVideoCompositionInstruction()
-            instruction.timeRange = CMTimeRange(
-                start: .zero,
-                duration: CMTime(seconds: timelineEnd, preferredTimescale: 600)
-            )
-            let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
-            if sizeChanged {
-                layer.setTransform(transform, at: .zero)
-            }
-            instruction.layerInstructions = [layer]
-            instructions.append(instruction)
-        }
-
-        composition.instructions = instructions
+        let scaleTransform = CGAffineTransform(a: scale, b: 0, c: 0, d: scale, tx: tx, ty: ty)
+        composition.instructions = compositionInstructions(
+            on: track,
+            extraTransform: sizeChanged ? scaleTransform : nil
+        )
         return composition
     }
 
@@ -3091,27 +3159,17 @@ final class EditorModel {
     private func videoIndex(_ id: UUID) -> Int? { videoClips.firstIndex(where: { $0.id == id }) }
 
     private func mutateSelectedVideo(_ body: (inout MediaClip) -> Void) {
-        let ids = selectedClipIDs.isEmpty ? Set([selectedVideo?.id].compactMap { $0 }) : selectedClipIDs
-        var any = false
-        for id in ids {
-            guard let i = videoIndex(id) else { continue }
-            body(&videoClips[i])
-            videoClips[i].clampFades()
-            any = true
-        }
-        if any { applyFades() }
+        guard let id = selectedClipID, let i = videoIndex(id) else { return }
+        body(&videoClips[i])
+        videoClips[i].clampFades()
+        applyFades()
     }
 
     private func mutateSelectedAudio(_ body: (inout MediaClip) -> Void) {
-        let ids = selectedClipIDs.isEmpty ? Set([selectedAudio?.id].compactMap { $0 }) : selectedClipIDs
-        var any = false
-        for id in ids {
-            guard let i = audioIndex(id) else { continue }
-            body(&audioClips[i])
-            audioClips[i].clampFades()
-            any = true
-        }
-        if any { applyFades() }
+        guard let id = selectedClipID, let i = audioIndex(id) else { return }
+        body(&audioClips[i])
+        audioClips[i].clampFades()
+        applyFades()
     }
 
     private func rebuildComposition() async {
@@ -3147,8 +3205,19 @@ final class EditorModel {
                 let transform = try await src.load(.preferredTransform)
                 videoTrack.preferredTransform = transform
                 let natural = try await src.load(.naturalSize)
-                let rendered = CGRect(origin: .zero, size: natural).applying(transform)
-                renderSize = CGSize(width: abs(rendered.width), height: abs(rendered.height))
+                let oriented = VideoCompositionPlan.displaySize(
+                    naturalWidth: Double(natural.width),
+                    naturalHeight: Double(natural.height),
+                    transform: VideoCompositionPlan.PictureTransform(
+                        a: Double(transform.a),
+                        b: Double(transform.b),
+                        c: Double(transform.c),
+                        d: Double(transform.d),
+                        tx: Double(transform.tx),
+                        ty: Double(transform.ty)
+                    )
+                )
+                renderSize = CGSize(width: oriented.width, height: oriented.height)
                 let fps = try await src.load(.nominalFrameRate)
                 if fps > 1 {
                     frameDuration = CMTime(value: 1, timescale: CMTimeScale(max(1, Int(fps.rounded()))))
@@ -3266,13 +3335,15 @@ final class EditorModel {
         }
         for clip in videoClips {
             if let id = videoAudioTrackIDs[clip.id] {
-                let vol = track(id: clip.trackID)?.volume ?? videoVolume
+                let lane = track(id: clip.trackID)?.volume ?? videoVolume
+                let vol = ClipMix.faderOrLane(clip.fader, laneVolume: lane)
                 addMix(for: clip, trackID: id, volume: vol, applyDuck: false)
             }
         }
         for clip in audioClips {
             if let id = musicTrackIDs[clip.id] {
-                let vol = track(id: clip.trackID)?.volume ?? musicVolume
+                let lane = track(id: clip.trackID)?.volume ?? musicVolume
+                let vol = ClipMix.faderOrLane(clip.fader, laneVolume: lane)
                 addMix(for: clip, trackID: id, volume: vol, applyDuck: true)
             }
         }
@@ -3322,45 +3393,87 @@ final class EditorModel {
         let composition = AVMutableVideoComposition()
         composition.renderSize = renderSize.width > 1 ? renderSize : CGSize(width: 1080, height: 1920)
         composition.frameDuration = frameDuration
-        var instructions: [AVVideoCompositionInstructionProtocol] = []
-        for segment in renderSegments() {
-            let clip = segment.clip
-            // Instruction ranges come from the *actual* on-track segment, not the model's
-            // timeline range — a partially-overlapped clip only owns its rendered tail, and a
-            // fully-overlapped clip isn't in `segments` at all, so no two instructions overlap.
-            let instruction = AVMutableVideoCompositionInstruction()
-            instruction.timeRange = CMTimeRange(
-                start: CMTime(seconds: segment.at, preferredTimescale: 600),
-                duration: CMTime(seconds: segment.duration, preferredTimescale: 600)
+        composition.instructions = compositionInstructions(on: track, extraTransform: nil)
+        return composition
+    }
+
+    /// Picture layers get the track's preferredTransform at time zero, then the
+    /// existing 0→1 / 1→0 ramps. Ranges with no picture are empty instructions
+    /// so the list starts at time zero and covers the whole item.
+    private func compositionInstructions(
+        on track: AVAssetTrack,
+        extraTransform: CGAffineTransform?
+    ) -> [AVVideoCompositionInstructionProtocol] {
+        let segments = renderSegments().map {
+            VideoCompositionPlan.Segment(
+                start: $0.at,
+                duration: $0.duration,
+                fadeIn: $0.clip.fadeIn,
+                fadeOut: $0.clip.fadeOut
             )
-            let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
-            let fadeIn = min(max(0, clip.fadeIn), segment.duration / 2)
-            let fadeOut = min(max(0, clip.fadeOut), segment.duration - fadeIn)
-            if fadeIn > 0.01 {
-                layer.setOpacityRamp(
-                    fromStartOpacity: 0,
-                    toEndOpacity: 1,
-                    timeRange: CMTimeRange(
-                        start: CMTime(seconds: segment.at, preferredTimescale: 600),
-                        duration: CMTime(seconds: fadeIn, preferredTimescale: 600)
+        }
+        let compositionEnd = max(duration, segments.map { $0.start + $0.duration }.max() ?? 0)
+        let preferred = track.preferredTransform
+        let placed = VideoCompositionPlan.PictureTransform.atTimeZero(
+            preferred: VideoCompositionPlan.PictureTransform(
+                a: Double(preferred.a),
+                b: Double(preferred.b),
+                c: Double(preferred.c),
+                d: Double(preferred.d),
+                tx: Double(preferred.tx),
+                ty: Double(preferred.ty)
+            )
+        )
+        var layerTransform = CGAffineTransform(
+            a: CGFloat(placed.a),
+            b: CGFloat(placed.b),
+            c: CGFloat(placed.c),
+            d: CGFloat(placed.d),
+            tx: CGFloat(placed.tx),
+            ty: CGFloat(placed.ty)
+        )
+        if let extraTransform {
+            layerTransform = layerTransform.concatenating(extraTransform)
+        }
+
+        let slots = VideoCompositionPlan.slots(segments: segments, compositionEnd: compositionEnd)
+        var instructions: [AVVideoCompositionInstructionProtocol] = []
+        var cursor = CMTime.zero
+        let endTime = CMTime(seconds: max(compositionEnd, 0.05), preferredTimescale: 600)
+        for (index, slot) in slots.enumerated() {
+            let stop = index == slots.count - 1
+                ? endTime
+                : CMTime(seconds: slot.end, preferredTimescale: 600)
+            guard CMTimeCompare(stop, cursor) > 0 else { continue }
+            let instruction = AVMutableVideoCompositionInstruction()
+            instruction.timeRange = CMTimeRange(start: cursor, duration: stop - cursor)
+            cursor = stop
+            switch slot.body {
+            case .empty:
+                instruction.layerInstructions = []
+            case .picture(let fadeIn, let fadeOut):
+                let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
+                layer.setTransform(layerTransform, at: .zero)
+                for ramp in VideoCompositionPlan.opacityRamps(
+                    start: slot.start,
+                    duration: slot.duration,
+                    fadeIn: fadeIn,
+                    fadeOut: fadeOut
+                ) {
+                    layer.setOpacityRamp(
+                        fromStartOpacity: Float(ramp.from),
+                        toEndOpacity: Float(ramp.to),
+                        timeRange: CMTimeRange(
+                            start: CMTime(seconds: ramp.start, preferredTimescale: 600),
+                            duration: CMTime(seconds: ramp.duration, preferredTimescale: 600)
+                        )
                     )
-                )
+                }
+                instruction.layerInstructions = [layer]
             }
-            if fadeOut > 0.01 {
-                layer.setOpacityRamp(
-                    fromStartOpacity: 1,
-                    toEndOpacity: 0,
-                    timeRange: CMTimeRange(
-                        start: CMTime(seconds: segment.at + segment.duration - fadeOut, preferredTimescale: 600),
-                        duration: CMTime(seconds: fadeOut, preferredTimescale: 600)
-                    )
-                )
-            }
-            instruction.layerInstructions = [layer]
             instructions.append(instruction)
         }
-        composition.instructions = instructions
-        return composition
+        return instructions
     }
 
     private func installTimeObserver() {
