@@ -162,10 +162,10 @@ final class MCPServer {
             toolDef("get_export_status", "Check if an export is running, its progress, and destination", [
                 "type": "object", "properties": [:]
             ]),
-            toolDef("add_clip", "Add a media file to the timeline", [
+            toolDef("add_clip", "Add a video, image, or audio file to the timeline", [
                 "type": "object",
                 "properties": [
-                    "file_path": ["type": "string", "description": "Absolute path to media file"],
+                    "file_path": ["type": "string", "description": "Absolute path to a video, image, or audio file. Images are placed on a video track."],
                     "track_kind": ["type": "string", "enum": ["video", "audio"], "description": "Defaults to detected kind"],
                     "start": ["type": "number", "description": "Timeline position in seconds (default: append to end)"],
                     "track_id": ["type": "string", "description": "UUID of target track (default: focused)"]

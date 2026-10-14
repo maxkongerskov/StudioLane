@@ -10,9 +10,24 @@ let package = Package(
         .executable(name: "StudioAudioLane", targets: ["StudioAudioLane"])
     ],
     targets: [
+        .target(
+            name: "StudioLaneCore",
+            path: "Sources/StudioLaneCore"
+        ),
         .executableTarget(
             name: "StudioAudioLane",
+            dependencies: ["StudioLaneCore"],
             path: "Sources/StudioAudioLane"
+        ),
+        .testTarget(
+            name: "StudioAudioLaneTests",
+            dependencies: ["StudioAudioLane"],
+            path: "Tests/StudioAudioLaneTests"
+        ),
+        .testTarget(
+            name: "StudioLaneCoreTests",
+            dependencies: ["StudioLaneCore"],
+            path: "Tests/StudioLaneCoreTests"
         )
     ]
 )

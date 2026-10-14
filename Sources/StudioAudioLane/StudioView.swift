@@ -58,7 +58,7 @@ struct StudioView: View {
                     Image(systemName: "film")
                         .font(.system(size: 28, weight: .light))
                         .foregroundStyle(StudioTheme.muted)
-                    Text("Drop media here")
+                    Text("Drop video, image, or audio")
                         .font(.system(size: 13))
                         .foregroundStyle(StudioTheme.muted)
                 }
