@@ -573,7 +573,9 @@ final class EditorModel {
         if tracks[i].kind == .audio, tracks.filter({ $0.kind == .audio }).first?.id == trackID {
             musicVolume = v
         }
-        applyFades()
+        // Lane volume is an audio-mix change. Replacing the video composition here
+        // tears down the preview while playback is running.
+        applyFades(refreshingVideo: false)
         scheduleAutosave()
     }
 
@@ -784,8 +786,8 @@ final class EditorModel {
     func rebuildCompositionPublic() async {
         await rebuildAndWait()
     }
-    func applyFadesPublic() {
-        applyFades()
+    func applyFadesPublic(refreshingVideo: Bool = true) {
+        applyFades(refreshingVideo: refreshingVideo)
     }
 
     /// MCP export entry point — bypasses the save panel.
@@ -2328,7 +2330,7 @@ final class EditorModel {
                 audioClips[i].clampFades()
             }
         }
-        applyFades()
+        applyFades(refreshingVideo: ids.contains { videoIndex($0) != nil })
         isEditingClip = true
     }
 
@@ -2345,7 +2347,7 @@ final class EditorModel {
                 audioClips[i].clampFades()
             }
         }
-        applyFades()
+        applyFades(refreshingVideo: ids.contains { videoIndex($0) != nil })
         isEditingClip = true
     }
 
@@ -2358,7 +2360,7 @@ final class EditorModel {
         if let i = tracks.firstIndex(where: { $0.kind == .audio }) {
             tracks[i].volume = musicVolume
         }
-        applyFades()
+        applyFades(refreshingVideo: false)
         scheduleAutosave()
     }
 
@@ -2367,7 +2369,7 @@ final class EditorModel {
         if let i = tracks.firstIndex(where: { $0.kind == .video }) {
             tracks[i].volume = videoVolume
         }
-        applyFades()
+        applyFades(refreshingVideo: false)
         scheduleAutosave()
     }
 
@@ -2382,7 +2384,7 @@ final class EditorModel {
                 audioClips[i].gain = g
             }
         }
-        applyFades()
+        applyFades(refreshingVideo: false)
         isEditingClip = true
     }
 
@@ -2481,7 +2483,7 @@ final class EditorModel {
             guard let i = audioIndex(id) else { continue }
             audioClips[i].pan = value
         }
-        applyFades()
+        applyFades(refreshingVideo: false)
         scheduleAutosave()
         isEditingClip = true
     }
@@ -2502,7 +2504,7 @@ final class EditorModel {
             normalizedAny = true
         }
         status = normalizedAny ? "Normalized selected audio" : "Waveform analysis is still loading"
-        applyFades()
+        applyFades(refreshingVideo: false)
         rebuild()
     }
 
@@ -2603,7 +2605,7 @@ final class EditorModel {
 
     func setDuckingMusic(_ enabled: Bool) {
         isDuckingMusic = enabled
-        applyFades()
+        applyFades(refreshingVideo: false)
         scheduleAutosave()
     }
 
@@ -2611,10 +2613,16 @@ final class EditorModel {
     var videoFadeOut: TimeInterval { selectedVideo?.fadeOut ?? 0 }
     var audioFadeIn: TimeInterval { selectedAudio?.fadeIn ?? 0 }
     var audioFadeOut: TimeInterval { selectedAudio?.fadeOut ?? 0 }
-    func applyFades() {
+    /// `refreshingVideo` is false for mix-only edits (gain, lane volume, pan, ducking,
+    /// audio fades). Those must not replace `videoComposition` while playback is running:
+    /// swapping the composition object drops the preview. Video fades and transforms
+    /// still rebuild it, and the replacement covers the whole item so the picture stays.
+    func applyFades(refreshingVideo: Bool = true) {
         guard let item = player.currentItem else { return }
         item.audioMix = makeAudioMix()
-        item.videoComposition = makeVideoComposition()
+        if refreshingVideo {
+            item.videoComposition = makeVideoComposition()
+        }
     }
 
     func presentExportSheet() {
@@ -3551,7 +3559,7 @@ final class EditorModel {
         let ty = (targetSize.height - scaled.height) * 0.5
         let transform = CGAffineTransform(a: scale, b: 0, c: 0, d: scale, tx: tx, ty: ty)
 
-        var instructions: [AVVideoCompositionInstructionProtocol] = []
+        var instructions: [AVMutableVideoCompositionInstruction] = []
         let timelineEnd = max(videoClips.map(\.timelineEnd).max() ?? 0.05, 0.05)
 
         if hasEffects {
@@ -3588,7 +3596,7 @@ final class EditorModel {
             instructions.append(instruction)
         }
 
-        composition.instructions = instructions
+        composition.instructions = instructionsCoveringPlayback(instructions)
         return composition
     }
 
@@ -3984,7 +3992,7 @@ final class EditorModel {
             audioClips[i].clampFades()
             any = true
         }
-        if any { applyFades() }
+        if any { applyFades(refreshingVideo: false) }
     }
 
     private func rebuildComposition() async {
@@ -4417,7 +4425,7 @@ final class EditorModel {
         let composition = AVMutableVideoComposition()
         composition.renderSize = renderSize.width > 1 ? renderSize : CGSize(width: 1080, height: 1920)
         composition.frameDuration = frameDuration
-        var instructions: [AVVideoCompositionInstructionProtocol] = []
+        var instructions: [AVMutableVideoCompositionInstruction] = []
         for segment in renderSegments() {
             // Instruction ranges come from the *actual* on-track segment, not the model's
             // timeline range — a partially-overlapped clip only owns its rendered tail, and a
@@ -4432,8 +4440,40 @@ final class EditorModel {
             instruction.layerInstructions = [layer]
             instructions.append(instruction)
         }
-        composition.instructions = instructions
+        guard !instructions.isEmpty else { return nil }
+        composition.instructions = instructionsCoveringPlayback(instructions)
         return composition
+    }
+
+    /// AVPlayer drops the entire preview when a video composition leaves any hole in
+    /// the player item, even a single tick past the video track where an audio edit
+    /// rounded longer. Fill those holes with empty instructions so the picture stays
+    /// up for the whole item. The empty spans are the regions with no video.
+    private func instructionsCoveringPlayback(
+        _ segmentInstructions: [AVMutableVideoCompositionInstruction]
+    ) -> [AVVideoCompositionInstructionProtocol] {
+        var covered: [AVMutableVideoCompositionInstruction] = []
+        var cursor = CMTime.zero
+        for instruction in segmentInstructions {
+            let start = instruction.timeRange.start
+            let end = instruction.timeRange.end
+            if CMTimeCompare(start, cursor) > 0 {
+                let gap = AVMutableVideoCompositionInstruction()
+                gap.timeRange = CMTimeRange(start: cursor, end: start)
+                gap.layerInstructions = []
+                covered.append(gap)
+            }
+            covered.append(instruction)
+            cursor = end
+        }
+        let itemEnd = mix.duration
+        if itemEnd.isNumeric, CMTimeCompare(itemEnd, cursor) > 0 {
+            let gap = AVMutableVideoCompositionInstruction()
+            gap.timeRange = CMTimeRange(start: cursor, end: itemEnd)
+            gap.layerInstructions = []
+            covered.append(gap)
+        }
+        return covered
     }
 
     private func installTimeObserver() {
