@@ -255,7 +255,7 @@ enum MCPHandlers {
             clip.gain = clamped
             model.videoClips[vi] = clip
             model.bumpMCPRevision()
-            model.applyFadesPublic()
+            model.applyFadesPublic(refreshingVideo: false)
             return nil
         }
         if let ai = model.audioIndexPublic(uuid) {
@@ -263,7 +263,7 @@ enum MCPHandlers {
             clip.gain = clamped
             model.audioClips[ai] = clip
             model.bumpMCPRevision()
-            model.applyFadesPublic()
+            model.applyFadesPublic(refreshingVideo: false)
             return nil
         }
         return MCPErrorResponse(error: "clip_not_found", message: "No clip with id \(clipId)", currentRevision: nil)
@@ -285,13 +285,13 @@ enum MCPHandlers {
         if let vi = model.videoIndexPublic(uuid) {
             model.videoClips[vi].muted.toggle()
             model.bumpMCPRevision()
-            model.applyFadesPublic()
+            model.applyFadesPublic(refreshingVideo: false)
             return nil
         }
         if let ai = model.audioIndexPublic(uuid) {
             model.audioClips[ai].muted.toggle()
             model.bumpMCPRevision()
-            model.applyFadesPublic()
+            model.applyFadesPublic(refreshingVideo: false)
             return nil
         }
         return MCPErrorResponse(error: "clip_not_found", message: "No clip with id \(clipId)", currentRevision: nil)
@@ -308,7 +308,7 @@ enum MCPHandlers {
             clip.clampFades()
             model.videoClips[vi] = clip
             model.bumpMCPRevision()
-            model.applyFadesPublic()
+            model.applyFadesPublic(refreshingVideo: true)
             return nil
         }
         if let ai = model.audioIndexPublic(uuid) {
@@ -317,7 +317,7 @@ enum MCPHandlers {
             clip.clampFades()
             model.audioClips[ai] = clip
             model.bumpMCPRevision()
-            model.applyFadesPublic()
+            model.applyFadesPublic(refreshingVideo: false)
             return nil
         }
         return MCPErrorResponse(error: "clip_not_found", message: "No clip with id \(clipId)", currentRevision: nil)
@@ -338,7 +338,7 @@ enum MCPHandlers {
             model.audioClips[ai].fadeIn = 0
             model.audioClips[ai].fadeOut = 0
             model.bumpMCPRevision()
-            model.applyFadesPublic()
+            model.applyFadesPublic(refreshingVideo: false)
             return nil
         }
         return MCPErrorResponse(error: "clip_not_found", message: "No clip with id \(clipId)", currentRevision: nil)

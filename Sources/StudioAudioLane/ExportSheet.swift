@@ -4,6 +4,14 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct ExportSettings: Equatable {
+    enum Mode: String, CaseIterable, Identifiable {
+        case video = "Video"
+        case animatedGIF = "Animated GIF"
+        case xLoop = "X Loop"
+
+        var id: String { rawValue }
+    }
+
     enum Container: String, CaseIterable, Identifiable {
         case mp4 = "MP4"
         case mov = "MOV"
@@ -120,6 +128,54 @@ struct ExportSettings: Equatable {
         }
     }
 
+    enum GIFSize: String, CaseIterable, Identifiable {
+        case compact = "480 px"
+        case recommended = "720 px"
+        case large = "960 px"
+
+        var id: String { rawValue }
+        var maxDimension: CGFloat {
+            switch self {
+            case .compact: 480
+            case .recommended: 720
+            case .large: 960
+            }
+        }
+    }
+
+    enum GIFFrameRate: String, CaseIterable, Identifiable {
+        case fps8 = "8 fps"
+        case fps12 = "12 fps"
+        case fps15 = "15 fps"
+        case fps20 = "20 fps"
+
+        var id: String { rawValue }
+        var value: Double {
+            switch self {
+            case .fps8: 8
+            case .fps12: 12
+            case .fps15: 15
+            case .fps20: 20
+            }
+        }
+    }
+
+    enum GIFPaletteQuality: String, CaseIterable, Identifiable {
+        case compact = "Compact"
+        case balanced = "Balanced"
+        case best = "Best"
+
+        var id: String { rawValue }
+        var compressionQuality: Double {
+            switch self {
+            case .compact: 0.45
+            case .balanced: 0.72
+            case .best: 0.95
+            }
+        }
+    }
+
+    var mode: Mode = .video
     var container: Container = .mp4
     var codec: Codec = .h264
     var quality: Quality = .high
@@ -127,13 +183,29 @@ struct ExportSettings: Equatable {
     var customWidth: Int = 1920
     var customHeight: Int = 1080
     var frameRate: FrameRate = .original
+    /// Pro override. Zero keeps the quality-derived automatic bit rate.
+    var videoBitrateMbps: Double = 0
     /// Default Match → AVAssetExportSession (reliable QuickTime output).
     /// Explicit AAC kbps opts into the writer pipeline.
     var audioBitrate: AudioBitrate = .match
+    var gifSize: GIFSize = .recommended
+    var gifFrameRate: GIFFrameRate = .fps12
+    var gifPaletteQuality: GIFPaletteQuality = .balanced
+    /// X has no persistent MP4 loop flag. Repeating media simulates looping.
+    var xLoopCount: Int = 1
     /// Base file name without extension (shown/editable in the export sheet).
     var fileBaseName: String = "StudioLane"
 
     mutating func sanitize() {
+        xLoopCount = Swift.max(1, Swift.min(10, xLoopCount))
+        if mode == .xLoop {
+            container = .mp4
+            codec = .h264
+            resolution = .p720
+            frameRate = .fps30
+            audioBitrate = .aac128
+            quality = .medium
+        }
         if codec.requiresMOV {
             container = .mov
         }
@@ -142,6 +214,9 @@ struct ExportSettings: Equatable {
         }
         customWidth = Swift.max(16, Swift.min(7680, customWidth))
         customHeight = Swift.max(16, Swift.min(4320, customHeight))
+        videoBitrateMbps = videoBitrateMbps.isFinite
+            ? Swift.max(0, Swift.min(200, videoBitrateMbps))
+            : 0
         fileBaseName = Self.sanitizedBaseName(fileBaseName)
     }
 
@@ -154,7 +229,7 @@ struct ExportSettings: Equatable {
         // Strip a trailing extension if the user typed one matching common movie types.
         let noExt: String = {
             let lower = cleaned.lowercased()
-            for ext in [".mp4", ".mov", ".m4v"] where lower.hasSuffix(ext) {
+            for ext in [".mp4", ".mov", ".m4v", ".gif"] where lower.hasSuffix(ext) {
                 return String(cleaned.dropLast(ext.count))
             }
             return cleaned
@@ -172,6 +247,15 @@ struct ExportSettings: Equatable {
 
     func targetSize(source: CGSize) -> CGSize {
         let src = CGSize(width: max(1, source.width), height: max(1, source.height))
+        if mode == .animatedGIF {
+            return Self.fit(src, into: CGSize(
+                width: gifSize.maxDimension,
+                height: gifSize.maxDimension
+            ))
+        }
+        if mode == .xLoop {
+            return Self.fit(src, into: CGSize(width: 1280, height: 1280))
+        }
         switch resolution {
         case .original:
             return CGSize(width: src.width.rounded(), height: src.height.rounded())
@@ -227,7 +311,26 @@ struct ExportSettings: Equatable {
     /// Writer is only used when the user picks an explicit AAC bitrate that
     /// ExportSession cannot set — and that path must stay MainActor-safe.
     var prefersWriterPipeline: Bool {
-        !codec.usesPCMAudio && audioBitrate.bitsPerSecond != nil
+        !codec.usesPCMAudio && (audioBitrate.bitsPerSecond != nil || videoBitrateMbps > 0)
+    }
+
+    func videoBitRate(pixelCount: CGFloat) -> Int {
+        videoBitrateMbps > 0
+            ? Int(videoBitrateMbps * 1_000_000)
+            : quality.approximateBitRate(pixelCount: pixelCount)
+    }
+
+    var pathExtension: String {
+        mode == .animatedGIF ? "gif" : container.pathExtension
+    }
+
+    var contentType: UTType {
+        mode == .animatedGIF ? .gif : container.contentType
+    }
+
+    var outputFrameRate: Double {
+        if mode == .animatedGIF { return gifFrameRate.value }
+        return frameRate.seconds.map { 1 / $0 } ?? 30
     }
 }
 
@@ -244,84 +347,22 @@ struct ExportSheet: View {
             Rectangle().fill(StudioTheme.hairline).frame(height: 1)
             VStack(alignment: .leading, spacing: 16) {
                     summary
-                    field("Container") {
-                        Picker("", selection: $settings.container) {
-                            ForEach(settings.availableContainers) { item in
-                                Text(item.rawValue).tag(item)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                        .labelsHidden()
-                        .disabled(settings.codec.requiresMOV)
-                    }
-                    field("Video codec") {
-                        Picker("", selection: $settings.codec) {
-                            ForEach(ExportSettings.Codec.allCases) { item in
-                                Text(item.rawValue).tag(item)
-                            }
-                        }
-                        .pickerStyle(.menu)
-                        .labelsHidden()
-                    }
-                    field("Quality") {
-                        Picker("", selection: $settings.quality) {
-                            ForEach(ExportSettings.Quality.allCases) { item in
-                                Text(item.rawValue).tag(item)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                        .labelsHidden()
-                        .disabled(settings.codec.usesPCMAudio)
-                    }
-                    field("Resolution") {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Picker("", selection: $settings.resolution) {
-                                ForEach(ExportSettings.Resolution.allCases) { item in
-                                    Text(item.rawValue).tag(item)
-                                }
-                            }
-                            .pickerStyle(.segmented)
-                            .labelsHidden()
-                            if settings.resolution == .custom {
-                                HStack(spacing: 8) {
-                                    steppableInt("W", value: $settings.customWidth)
-                                    Text("×").foregroundStyle(StudioTheme.muted)
-                                    steppableInt("H", value: $settings.customHeight)
-                                    Text("fit, keep aspect")
-                                        .font(.system(size: 11))
-                                        .foregroundStyle(StudioTheme.muted)
-                                }
-                            }
-                            Text(resolutionCaption)
-                                .font(.system(size: 11))
-                                .foregroundStyle(StudioTheme.muted)
-                        }
-                    }
-                    field("Frame rate") {
-                        Picker("", selection: $settings.frameRate) {
-                            ForEach(ExportSettings.FrameRate.allCases) { item in
+                    field("Export type") {
+                        Picker("", selection: $settings.mode) {
+                            ForEach(ExportSettings.Mode.allCases) { item in
                                 Text(item.rawValue).tag(item)
                             }
                         }
                         .pickerStyle(.segmented)
                         .labelsHidden()
                     }
-                    field("Audio") {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Picker("", selection: $settings.audioBitrate) {
-                                ForEach(settings.availableAudioBitrates) { item in
-                                    Text(item.rawValue).tag(item)
-                                }
-                            }
-                            .pickerStyle(.menu)
-                            .labelsHidden()
-                            .disabled(settings.codec.usesPCMAudio)
-                            Text(settings.codec.usesPCMAudio
-                                 ? "ProRes exports use linear PCM audio."
-                                 : "Match uses ExportSession (recommended). Explicit kbps uses the writer pipeline.")
-                                .font(.system(size: 11))
-                                .foregroundStyle(StudioTheme.muted)
-                        }
+                    switch settings.mode {
+                    case .video:
+                        standardVideoFields
+                    case .animatedGIF:
+                        gifFields
+                    case .xLoop:
+                        xLoopFields
                     }
                     if model.isExporting {
                         progressBlock
@@ -347,9 +388,184 @@ struct ExportSheet: View {
         .onChange(of: settings.codec) { _, _ in
             settings.sanitize()
         }
+        .onChange(of: settings.mode) { _, _ in
+            settings.sanitize()
+        }
         .onChange(of: model.isExportSheetPresented) { _, open in
             if !open { dismiss() }
         }
+    }
+
+    @ViewBuilder
+    private var standardVideoFields: some View {
+        if model.isProMode {
+            field("Container") {
+                Picker("", selection: $settings.container) {
+                    ForEach(settings.availableContainers) { item in
+                        Text(item.rawValue).tag(item)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .disabled(settings.codec.requiresMOV)
+            }
+            field("Video codec") {
+                Picker("", selection: $settings.codec) {
+                    ForEach(ExportSettings.Codec.allCases) { item in
+                        Text(item.rawValue).tag(item)
+                    }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+            }
+            field("Quality") {
+                Picker("", selection: $settings.quality) {
+                    ForEach(ExportSettings.Quality.allCases) { item in
+                        Text(item.rawValue).tag(item)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .disabled(settings.codec.usesPCMAudio)
+            }
+        }
+        field("Resolution") {
+            VStack(alignment: .leading, spacing: 8) {
+                Picker("", selection: $settings.resolution) {
+                    ForEach(
+                        model.isProMode
+                            ? ExportSettings.Resolution.allCases
+                            : [.original, .p1080, .p720]
+                    ) { item in
+                        Text(item.rawValue).tag(item)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                if settings.resolution == .custom {
+                    HStack(spacing: 8) {
+                        steppableInt("W", value: $settings.customWidth)
+                        Text("×").foregroundStyle(StudioTheme.muted)
+                        steppableInt("H", value: $settings.customHeight)
+                        Text("fit, keep aspect")
+                            .font(.system(size: 11))
+                            .foregroundStyle(StudioTheme.muted)
+                    }
+                }
+                Text(resolutionCaption)
+                    .font(.system(size: 11))
+                    .foregroundStyle(StudioTheme.muted)
+            }
+        }
+        if model.isProMode {
+            field("Frame rate") {
+                Picker("", selection: $settings.frameRate) {
+                    ForEach(ExportSettings.FrameRate.allCases) { item in
+                        Text(item.rawValue).tag(item)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+            }
+            field("Video bitrate") {
+                HStack(spacing: 8) {
+                    TextField(
+                        "Automatic",
+                        value: $settings.videoBitrateMbps,
+                        format: .number.precision(.fractionLength(0...1))
+                    )
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12, weight: .medium).monospacedDigit())
+                    .padding(.horizontal, 8)
+                    .frame(width: 100, height: 28)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(Color.white.opacity(0.06))
+                    )
+                    Text(settings.videoBitrateMbps > 0 ? "Mbps" : "0 = automatic")
+                        .font(.system(size: 11))
+                        .foregroundStyle(StudioTheme.muted)
+                }
+            }
+            field("Audio") {
+                VStack(alignment: .leading, spacing: 6) {
+                    Picker("", selection: $settings.audioBitrate) {
+                        ForEach(settings.availableAudioBitrates) { item in
+                            Text(item.rawValue).tag(item)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .disabled(settings.codec.usesPCMAudio)
+                    Text(settings.codec.usesPCMAudio
+                         ? "ProRes exports use linear PCM audio."
+                         : "Project sample rate: \(Int(model.proSettings.sampleRate)) Hz. Explicit rates use the writer.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(StudioTheme.muted)
+                }
+            }
+        } else {
+            Text("Standard export uses H.264 with automatic quality and matched audio. Enable Pro for codec, bitrate, frame-rate, and audio controls.")
+                .font(.system(size: 11))
+                .foregroundStyle(StudioTheme.muted)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    @ViewBuilder
+    private var gifFields: some View {
+        field("Size") {
+            Picker("", selection: $settings.gifSize) {
+                ForEach(ExportSettings.GIFSize.allCases) { item in
+                    Text(item.rawValue).tag(item)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+        }
+        field("Frame rate") {
+            Picker("", selection: $settings.gifFrameRate) {
+                ForEach(ExportSettings.GIFFrameRate.allCases) { item in
+                    Text(item.rawValue).tag(item)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+        }
+        field("Palette") {
+            Picker("", selection: $settings.gifPaletteQuality) {
+                ForEach(ExportSettings.GIFPaletteQuality.allCases) { item in
+                    Text(item.rawValue).tag(item)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+        }
+        Text("Loops forever. GIF has no audio. If the result exceeds X’s 15 MB limit, StudioLane retries with lower frame rate and size.")
+            .font(.system(size: 11))
+            .foregroundStyle(StudioTheme.muted)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    @ViewBuilder
+    private var xLoopFields: some View {
+        field("Repeat content") {
+            HStack(spacing: 10) {
+                Stepper(value: $settings.xLoopCount, in: 1...10) {
+                    Text("\(settings.xLoopCount)×")
+                        .font(.system(size: 12, weight: .medium).monospacedDigit())
+                }
+                Text(settings.xLoopCount == 1
+                     ? "one short H.264/AAC clip"
+                     : "content is repeated in the exported file")
+                    .font(.system(size: 11))
+                    .foregroundStyle(StudioTheme.muted)
+            }
+        }
+        Text("X-compatible MP4 · H.264 video · AAC 128 kbps audio · up to 1280 px · 30 fps. MP4 has no infinite-loop flag; repeat count simulates looping.")
+            .font(.system(size: 11))
+            .foregroundStyle(StudioTheme.muted)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     private var header: some View {
@@ -407,7 +623,7 @@ struct ExportSheet: View {
                 .disabled(model.isExporting)
             }
 
-            Text("\(settings.container.pathExtension.uppercased())  ·  double-click name or Rename")
+            Text("\(settings.pathExtension.uppercased())  ·  double-click name or Rename")
                 .font(.system(size: 11))
                 .foregroundStyle(StudioTheme.muted)
 
@@ -418,9 +634,13 @@ struct ExportSheet: View {
                 model.exportSourceFPS,
                 size.width,
                 size.height,
-                settings.frameRate == .original
-                    ? String(format: "%.2f fps", model.exportSourceFPS)
-                    : settings.frameRate.rawValue
+                settings.mode == .animatedGIF
+                    ? settings.gifFrameRate.rawValue
+                    : settings.mode == .xLoop
+                        ? "30 fps"
+                        : settings.frameRate == .original
+                            ? String(format: "%.2f fps", model.exportSourceFPS)
+                            : settings.frameRate.rawValue
             ))
             .font(.system(size: 11))
             .foregroundStyle(StudioTheme.muted)

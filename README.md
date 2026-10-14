@@ -14,7 +14,7 @@ The app is signed with Max Køngerskov’s Developer ID and notarized by Apple. 
 
 ## What you can do
 
-The editor opens empty, or restores the last session. Drop video or audio on the preview, or choose File ▸ Open Media. Video lanes show a filmstrip. Audio lanes show a waveform. Add more lanes when one picture track and one music track are not enough.
+The editor opens empty, or restores the last session. Drop video, a still image, or audio on the preview, or choose File ▸ Open Media. Still images — JPEG, PNG, HEIC, GIF, TIFF, WebP, RAW, and any other image file — land on a video lane as a picture you can trim, fade, split, and export like a clip. Video lanes show a filmstrip. Audio lanes show a waveform. Add more lanes when one picture track and one music track are not enough.
 
 Clips can be trimmed, split at the playhead, moved, and duplicated. Each clip has a fade in, a fade out, and its own gain. Each lane has a volume, and a clip can be muted on its own. Playlist layout lines music up end to end. Layer layout lets clips overlap. Ducking pulls the music down under the recording.
 

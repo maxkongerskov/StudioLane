@@ -8,7 +8,8 @@ struct TimelineView: View {
     @State private var dragKind: DragKind?
     @State private var dragOrigin: TimeInterval = 0
     @State private var dragClipID: UUID?
-    @State private var lastPlayheadFollowAt: Date = .distantPast
+    @StateObject private var timelineScroller = TimelineScrollCoordinator()
+    @State private var pinchStartZoom: CGFloat?
     @State private var isEditingPlayheadTime = false
     @State private var playheadTimeHovering = false
 
@@ -48,7 +49,7 @@ struct TimelineView: View {
 
     private enum DragKind {
         case seek, videoFadeIn, videoFadeOut
-        case audioMove, videoMove, videoTrimIn, videoTrimOut
+        case audioMove, videoMove, audioSlip, videoSlip, videoTrimIn, videoTrimOut
         case audioTrimIn, audioTrimOut, audioFadeIn, audioFadeOut
     }
 
@@ -67,46 +68,91 @@ struct TimelineView: View {
         GeometryReader { geo in
             let viewport = max(geo.size.width, 1)
             let width = viewport * max(model.timelineZoom, 1)
-            ScrollViewReader { proxy in
-                ScrollView(.horizontal, showsIndicators: model.timelineZoom > 1.01) {
-                    VStack(spacing: Self.laneSpacing) {
-                        ruler(width: width)
-                        ForEach(model.tracks) { track in
-                            laneView(for: track, width: width)
-                        }
-                    }
-                    .frame(width: width, height: playlistContentHeight, alignment: .top)
-                    .coordinateSpace(name: "playlist")
-                    .overlay(alignment: .topLeading) {
-                        playhead(width: width, height: playlistContentHeight)
-                    }
-                    .background(alignment: .leading) {
-                        ZStack(alignment: .leading) {
-                            Color.clear
-                                .frame(width: 1, height: 1)
-                                .id("timeline-start")
-                            Color.clear
-                                .frame(width: 1, height: 1)
-                                .id("playhead-anchor")
-                                .offset(x: playheadX(width: width))
-                        }
-                        .frame(width: width, height: 1, alignment: .leading)
-                        .allowsHitTesting(false)
+            ScrollView(.horizontal, showsIndicators: model.timelineZoom > 1.01) {
+                VStack(spacing: Self.laneSpacing) {
+                    ruler(width: width)
+                    ForEach(model.tracks) { track in
+                        laneView(for: track, width: width)
                     }
                 }
-                .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
-                .onChange(of: model.timelineZoom) { _, _ in
-                    Task { @MainActor in
-                        if model.timelineZoom <= 1.01 {
-                            proxy.scrollTo("timeline-start", anchor: .leading)
+                .frame(width: width, height: playlistContentHeight, alignment: .top)
+                .coordinateSpace(name: "playlist")
+                .overlay(alignment: .topLeading) {
+                    playhead(width: width, height: playlistContentHeight)
+                }
+                .background {
+                    TimelineScrollResolver { scrollView in
+                        timelineScroller.attach(to: scrollView)
+                        timelineScroller.updateZoomLayout(documentWidth: width)
+                    }
+                }
+            }
+            .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+            .simultaneousGesture(
+                MagnifyGesture(minimumScaleDelta: 0.005)
+                    .onChanged { value in
+                        let initialZoom: CGFloat
+                        if let pinchStartZoom {
+                            initialZoom = pinchStartZoom
                         } else {
-                            proxy.scrollTo("playhead-anchor", anchor: .center)
+                            initialZoom = model.timelineZoom
+                            pinchStartZoom = initialZoom
+                            timelineScroller.beginZoom(
+                                anchorFraction: value.startAnchor.x,
+                                documentWidth: width
+                            )
+                        }
+                        model.setTimelineZoom(initialZoom * value.magnification)
+                        timelineScroller.updateZoomLayout(
+                            documentWidth: viewport * model.timelineZoom
+                        )
+                    }
+                    .onEnded { value in
+                        let initialZoom = pinchStartZoom ?? model.timelineZoom
+                        model.setTimelineZoom(initialZoom * value.magnification)
+                        pinchStartZoom = nil
+                        let finalWidth = viewport * model.timelineZoom
+                        // Apply after SwiftUI lays out the newly sized playlist,
+                        // then release the anchor for button/keyboard zoom.
+                        DispatchQueue.main.async {
+                            timelineScroller.finishZoom(documentWidth: finalWidth)
                         }
                     }
+            )
+            .onChange(of: model.timelineZoom) { _, _ in
+                if pinchStartZoom != nil {
+                    timelineScroller.updateZoomLayout(
+                        documentWidth: viewport * model.timelineZoom
+                    )
+                    return
                 }
-                .onChange(of: model.currentTime) { _, _ in
-                    followPlayheadIfNeeded(proxy: proxy, viewport: viewport, width: width)
+                Task { @MainActor in
+                    if model.timelineZoom <= 1.01 {
+                        timelineScroller.scrollToStart()
+                    } else {
+                        timelineScroller.scroll(
+                            to: playheadX(width: width),
+                            anchor: 0.5,
+                            documentWidth: width
+                        )
+                    }
                 }
+            }
+            .onChange(of: model.isPlaying) { _, isPlaying in
+                timelineScroller.playbackChanged(isPlaying)
+                if isPlaying {
+                    timelineScroller.follow(
+                        playheadX: playheadX(width: width),
+                        documentWidth: width
+                    )
+                }
+            }
+            .onChange(of: model.currentTime) { _, _ in
+                guard model.isPlaying else { return }
+                timelineScroller.follow(
+                    playheadX: playheadX(width: width),
+                    documentWidth: width
+                )
             }
             .onAppear { model.timelineViewportWidth = viewport }
             .onChange(of: geo.size.width) { _, newValue in
@@ -220,7 +266,7 @@ struct TimelineView: View {
                     model.focusedTrackID = track.id
                     model.pickVideoFile(ontoTrackID: track.id)
                 } label: {
-                    Text("Add video")
+                    Text("Add video or image")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(StudioTheme.muted)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -254,7 +300,7 @@ struct TimelineView: View {
                     .disabled(clips.isEmpty)
             }
         }
-        .onDrop(of: [.fileURL, .movie, .audio, .audiovisualContent], delegate: TimelineDropDelegate(
+        .onDrop(of: EditorModel.mediaDropTypes, delegate: TimelineDropDelegate(
             model: model,
             isTargeted: .constant(false),
             laneWidth: { width },
@@ -274,7 +320,8 @@ struct TimelineView: View {
                     images: frames,
                     inPoint: clip.inPoint,
                     duration: clip.duration,
-                    sourceDuration: clip.sourceDuration
+                    sourceDuration: clip.sourceDuration,
+                    tilesSingleImage: StillImage.isStill(clip.url)
                 )
             } else {
                 StudioTheme.lane
@@ -287,6 +334,30 @@ struct TimelineView: View {
                 .padding(.vertical, 2)
                 .background(.black.opacity(0.4), in: Capsule())
                 .padding(.leading, 8)
+            if model.isProMode {
+                ForEach(clip.transformKeyframes) { keyframe in
+                    Rectangle()
+                        .fill(Color.yellow.opacity(0.95))
+                        .frame(width: 6, height: 6)
+                        .rotationEffect(.degrees(45))
+                        .offset(
+                            x: max(3, min(
+                                clipWidth - 3,
+                                CGFloat(keyframe.time / max(clip.duration, 0.000_1)) * clipWidth
+                            )),
+                            y: 18
+                        )
+                        .allowsHitTesting(false)
+                }
+                if clip.transitionIn.style != .none {
+                    Text(clip.transitionIn.style.rawValue)
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.65))
+                        .padding(.leading, 6)
+                        .offset(y: -18)
+                        .allowsHitTesting(false)
+                }
+            }
             FadeHandle(isAudio: false)
                 .offset(x: max(0, fadeInW - 4))
                 .highPriorityGesture(fadeDrag(kind: .videoFadeIn, clipID: clip.id, width: laneWidth, origin: { clip.fadeIn }) { model.setVideoFadeIn($0) })
@@ -296,15 +367,15 @@ struct TimelineView: View {
             TrimEdge()
                 .frame(width: 14)
                 .contentShape(Rectangle())
-                .highPriorityGesture(trimDrag(kind: .videoTrimIn, clipID: clip.id, laneWidth: laneWidth, origin: { clip.timelineStart }) { time in
-                    model.trimIn(clipID: clip.id, toTimelineTime: time)
+                .highPriorityGesture(trimDrag(kind: .videoTrimIn, clipID: clip.id, laneWidth: laneWidth, origin: { clip.timelineStart }) { time, snapping in
+                    model.trimIn(clipID: clip.id, toTimelineTime: time, snapping: snapping)
                 })
             TrimEdge()
                 .frame(width: 14)
                 .contentShape(Rectangle())
                 .offset(x: clipWidth - 14)
-                .highPriorityGesture(trimDrag(kind: .videoTrimOut, clipID: clip.id, laneWidth: laneWidth, origin: { clip.timelineEnd }) { time in
-                    model.trimOut(clipID: clip.id, toTimelineTime: time)
+                .highPriorityGesture(trimDrag(kind: .videoTrimOut, clipID: clip.id, laneWidth: laneWidth, origin: { clip.timelineEnd }) { time, snapping in
+                    model.trimOut(clipID: clip.id, toTimelineTime: time, snapping: snapping)
                 })
         }
         .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
@@ -313,7 +384,15 @@ struct TimelineView: View {
                 .stroke(selected ? StudioTheme.accent : Color.white.opacity(0.12), lineWidth: selected ? 1.5 : 1)
         )
         .contentShape(Rectangle())
-        .gesture(clipMoveGesture(kind: .videoMove, clipID: clip.id, laneWidth: laneWidth, origin: clip.timelineStart, isVideo: true))
+        .gesture(clipMoveGesture(
+            kind: .videoMove,
+            clipID: clip.id,
+            laneWidth: laneWidth,
+            origin: clip.timelineStart,
+            inPoint: clip.inPoint,
+            isVideo: true
+        ))
+        .help("Drag to move · ⌥ fine · ⌃ bypass snap · ⌘ drag to slip")
         .onTapGesture(count: 2) { showClipMenu(clipID: clip.id) }
         .onTapGesture {
             model.selectVideoClip(clip.id, extending: NSEvent.modifierFlags.contains(.shift))
@@ -378,7 +457,7 @@ struct TimelineView: View {
                     .disabled(clips.isEmpty)
             }
         }
-        .onDrop(of: [.fileURL, .movie, .audio, .audiovisualContent], delegate: TimelineDropDelegate(
+        .onDrop(of: EditorModel.mediaDropTypes, delegate: TimelineDropDelegate(
             model: model,
             isTargeted: $isDropTargeted,
             laneWidth: { width },
@@ -413,15 +492,15 @@ struct TimelineView: View {
             TrimEdge()
                 .frame(width: 14)
                 .contentShape(Rectangle())
-                .highPriorityGesture(trimDrag(kind: .audioTrimIn, clipID: clip.id, laneWidth: laneWidth, origin: { clip.timelineStart }) { time in
-                    model.trimIn(clipID: clip.id, toTimelineTime: time)
+                .highPriorityGesture(trimDrag(kind: .audioTrimIn, clipID: clip.id, laneWidth: laneWidth, origin: { clip.timelineStart }) { time, snapping in
+                    model.trimIn(clipID: clip.id, toTimelineTime: time, snapping: snapping)
                 })
             TrimEdge()
                 .frame(width: 14)
                 .contentShape(Rectangle())
                 .offset(x: clipWidth - 14)
-                .highPriorityGesture(trimDrag(kind: .audioTrimOut, clipID: clip.id, laneWidth: laneWidth, origin: { clip.timelineEnd }) { time in
-                    model.trimOut(clipID: clip.id, toTimelineTime: time)
+                .highPriorityGesture(trimDrag(kind: .audioTrimOut, clipID: clip.id, laneWidth: laneWidth, origin: { clip.timelineEnd }) { time, snapping in
+                    model.trimOut(clipID: clip.id, toTimelineTime: time, snapping: snapping)
                 })
             FadeHandle(isAudio: true)
                 .offset(x: max(0, fadeInW - 4))
@@ -439,32 +518,65 @@ struct TimelineView: View {
                 .stroke(selected ? wave : Color.clear, lineWidth: 1.5)
         )
         .contentShape(Rectangle())
-        .gesture(clipMoveGesture(kind: .audioMove, clipID: clip.id, laneWidth: laneWidth, origin: clip.timelineStart, isVideo: false))
+        .gesture(clipMoveGesture(
+            kind: .audioMove,
+            clipID: clip.id,
+            laneWidth: laneWidth,
+            origin: clip.timelineStart,
+            inPoint: clip.inPoint,
+            isVideo: false
+        ))
+        .help("Drag to move · ⌥ fine · ⌃ bypass snap · ⌘ drag to slip")
         .onTapGesture(count: 2) { showClipMenu(clipID: clip.id) }
         .onTapGesture {
             model.selectAudioClip(clip.id, extending: NSEvent.modifierFlags.contains(.shift))
         }
     }
 
-    private func clipMoveGesture(kind: DragKind, clipID: UUID, laneWidth: CGFloat, origin: TimeInterval, isVideo: Bool) -> some Gesture {
+    private func clipMoveGesture(
+        kind: DragKind,
+        clipID: UUID,
+        laneWidth: CGFloat,
+        origin: TimeInterval,
+        inPoint: TimeInterval,
+        isVideo: Bool
+    ) -> some Gesture {
         DragGesture(minimumDistance: 2, coordinateSpace: .named("playlist"))
             .onChanged { value in
                 if dragKind == nil {
-                    dragKind = kind
+                    let slipping = NSEvent.modifierFlags.contains(.command)
+                    dragKind = slipping ? (isVideo ? .videoSlip : .audioSlip) : kind
                     dragClipID = clipID
-                    dragOrigin = origin
+                    dragOrigin = slipping ? inPoint : origin
                     if isVideo {
                         model.selectVideoClip(clipID)
                     } else {
                         model.selectAudioClip(clipID)
                     }
                 }
-                guard dragKind == kind, dragClipID == clipID, laneWidth > 0 else { return }
-                let dt = Double(value.translation.width / laneWidth) * model.layoutDuration
-                model.moveClip(clipID: clipID, toStart: dragOrigin + dt)
+                guard dragClipID == clipID, laneWidth > 0 else { return }
+                let dt = TimelinePrecisionMath.dragDelta(
+                    translation: value.translation.width,
+                    laneWidth: laneWidth,
+                    timelineDuration: model.layoutDuration,
+                    fine: NSEvent.modifierFlags.contains(.option)
+                )
+                switch dragKind {
+                case .videoSlip, .audioSlip:
+                    model.slipClip(clipID: clipID, toInPoint: dragOrigin - dt)
+                case .videoMove, .audioMove:
+                    let snapping = !NSEvent.modifierFlags.contains(.control)
+                    model.moveClip(clipID: clipID, toStart: dragOrigin + dt, snapping: snapping)
+                default:
+                    break
+                }
             }
             .onEnded { _ in
-                if dragKind == kind { model.commitEdit() }
+                if dragKind == .videoSlip || dragKind == .audioSlip {
+                    model.commitPrecisionEdit()
+                } else if dragKind == kind {
+                    model.commitEdit()
+                }
                 dragKind = nil
                 dragClipID = nil
             }
@@ -477,14 +589,23 @@ struct TimelineView: View {
                     dragKind = kind
                     dragClipID = clipID
                     dragOrigin = origin()
-                    if kind == .videoFadeIn || kind == .videoFadeOut {
-                        model.selectVideoClip(clipID)
-                    } else {
-                        model.selectAudioClip(clipID)
+                    // Keep an existing multi-selection intact so dragging one
+                    // selected fade handle applies the fade to every highlighted clip.
+                    if !model.isClipSelected(clipID) {
+                        if kind == .videoFadeIn || kind == .videoFadeOut {
+                            model.selectVideoClip(clipID)
+                        } else {
+                            model.selectAudioClip(clipID)
+                        }
                     }
                 }
                 guard dragKind == kind, dragClipID == clipID, width > 0 else { return }
-                let dt = Double(value.translation.width / width) * model.layoutDuration
+                let dt = TimelinePrecisionMath.dragDelta(
+                    translation: value.translation.width,
+                    laneWidth: width,
+                    timelineDuration: model.layoutDuration,
+                    fine: NSEvent.modifierFlags.contains(.option)
+                )
                 switch kind {
                 case .videoFadeIn, .audioFadeIn:
                     apply(dragOrigin + dt)
@@ -503,22 +624,38 @@ struct TimelineView: View {
             }
     }
 
-    private func trimDrag(kind: DragKind, clipID: UUID, laneWidth: CGFloat, origin: @escaping () -> TimeInterval, apply: @escaping (TimeInterval) -> Void) -> some Gesture {
+    private func trimDrag(
+        kind: DragKind,
+        clipID: UUID,
+        laneWidth: CGFloat,
+        origin: @escaping () -> TimeInterval,
+        apply: @escaping (TimeInterval, Bool) -> Void
+    ) -> some Gesture {
         DragGesture(minimumDistance: 1, coordinateSpace: .named("playlist"))
             .onChanged { value in
                 if dragKind == nil {
                     dragKind = kind
                     dragClipID = clipID
                     dragOrigin = origin()
-                    if model.videoClips.contains(where: { $0.id == clipID }) {
-                        model.selectVideoClip(clipID)
-                    } else {
-                        model.selectAudioClip(clipID)
+                    // Trimming a highlighted clip is a group edit. Only replace
+                    // the selection when the grabbed clip was not selected.
+                    if !model.isClipSelected(clipID) {
+                        if model.videoClips.contains(where: { $0.id == clipID }) {
+                            model.selectVideoClip(clipID)
+                        } else {
+                            model.selectAudioClip(clipID)
+                        }
                     }
                 }
                 guard dragKind == kind, dragClipID == clipID, laneWidth > 0 else { return }
-                let time = Double(value.location.x / laneWidth) * model.layoutDuration
-                apply(time)
+                let dt = TimelinePrecisionMath.dragDelta(
+                    translation: value.translation.width,
+                    laneWidth: laneWidth,
+                    timelineDuration: model.layoutDuration,
+                    fine: NSEvent.modifierFlags.contains(.option)
+                )
+                let snapping = !NSEvent.modifierFlags.contains(.control)
+                apply(dragOrigin + dt, snapping)
             }
             .onEnded { _ in
                 if dragKind == kind { model.commitEdit() }
@@ -649,15 +786,6 @@ struct TimelineView: View {
         menu.popUp(positioning: nil, at: window.convertPoint(fromScreen: NSEvent.mouseLocation), in: content)
     }
 
-    private func followPlayheadIfNeeded(proxy: ScrollViewProxy, viewport: CGFloat, width: CGFloat) {
-        guard model.isPlaying, model.timelineZoom > 1.01, viewport > 0, width > viewport else { return }
-        let now = Date()
-        guard now.timeIntervalSince(lastPlayheadFollowAt) > 0.12 else { return }
-        lastPlayheadFollowAt = now
-        // Throttled follow while playing zoomed — keeps playhead in the viewport.
-        proxy.scrollTo("playhead-anchor", anchor: UnitPoint(x: 0.35, y: 0.5))
-    }
-
     private struct JunctionMark: Identifiable {
         let id: String
         let x: CGFloat
@@ -675,6 +803,185 @@ struct TimelineView: View {
             }
         }
         return marks
+    }
+}
+
+enum TimelineZoomMath {
+    /// Keeps the same timeline point under a viewport-relative pinch anchor.
+    nonisolated static func anchoredOffset(
+        oldOffset: CGFloat,
+        viewportWidth: CGFloat,
+        anchorFraction: CGFloat,
+        oldDocumentWidth: CGFloat,
+        newDocumentWidth: CGFloat
+    ) -> CGFloat {
+        guard viewportWidth > 0, oldDocumentWidth > 0 else { return 0 }
+        let anchor = min(max(anchorFraction, 0), 1)
+        let viewportX = viewportWidth * anchor
+        let timelineFraction = min(
+            max((max(0, oldOffset) + viewportX) / oldDocumentWidth, 0),
+            1
+        )
+        let maximum = max(0, newDocumentWidth - viewportWidth)
+        return min(max(0, timelineFraction * newDocumentWidth - viewportX), maximum)
+    }
+}
+
+enum TimelinePrecisionMath {
+    nonisolated static func dragDelta(
+        translation: CGFloat,
+        laneWidth: CGFloat,
+        timelineDuration: TimeInterval,
+        fine: Bool
+    ) -> TimeInterval {
+        guard laneWidth > 0, timelineDuration.isFinite else { return 0 }
+        let scale = fine ? 0.1 : 1.0
+        return Double(translation / laneWidth) * timelineDuration * scale
+    }
+}
+
+/// Resolves SwiftUI's horizontal `ScrollView` to its AppKit scroll view. A moving
+/// SwiftUI `scrollTo` target does not reliably update its layout position, whereas
+/// the clip view's bounds are the actual playlist scroll position.
+private struct TimelineScrollResolver: NSViewRepresentable {
+    let resolve: (NSScrollView) -> Void
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        resolveWhenAttached(view)
+        return view
+    }
+
+    func updateNSView(_ view: NSView, context: Context) {
+        resolveWhenAttached(view)
+    }
+
+    private func resolveWhenAttached(_ view: NSView) {
+        DispatchQueue.main.async {
+            if let scrollView = view.enclosingScrollView {
+                resolve(scrollView)
+            }
+        }
+    }
+}
+
+/// Keeps the playhead in view during playback without taking scrolling away from
+/// the user. A manual trackpad/mouse scroll suspends follow for that playback run;
+/// pressing play again starts a fresh follow run.
+@MainActor
+private final class TimelineScrollCoordinator: ObservableObject {
+    private struct ZoomAnchor {
+        var oldOffset: CGFloat
+        var viewportWidth: CGFloat
+        var anchorFraction: CGFloat
+        var oldDocumentWidth: CGFloat
+    }
+
+    private weak var scrollView: NSScrollView?
+    private var observers: [NSObjectProtocol] = []
+    private var playbackIsRunning = false
+    private var userInterruptedFollow = false
+    private var zoomAnchor: ZoomAnchor?
+
+    isolated deinit {
+        for observer in observers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
+
+    func attach(to scrollView: NSScrollView) {
+        guard self.scrollView !== scrollView else { return }
+        for observer in observers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        observers.removeAll()
+        self.scrollView = scrollView
+
+        let center = NotificationCenter.default
+        for name in [
+            NSScrollView.willStartLiveScrollNotification,
+            NSScrollView.didLiveScrollNotification
+        ] {
+            observers.append(center.addObserver(
+                forName: name,
+                object: scrollView,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, self.playbackIsRunning else { return }
+                    self.userInterruptedFollow = true
+                }
+            })
+        }
+    }
+
+    func playbackChanged(_ isPlaying: Bool) {
+        if isPlaying && !playbackIsRunning {
+            userInterruptedFollow = false
+        }
+        playbackIsRunning = isPlaying
+    }
+
+    func follow(playheadX: CGFloat, documentWidth: CGFloat) {
+        guard playbackIsRunning, !userInterruptedFollow else { return }
+        scroll(to: playheadX, anchor: 0.35, documentWidth: documentWidth)
+    }
+
+    func beginZoom(anchorFraction: CGFloat, documentWidth: CGFloat) {
+        guard let scrollView else { return }
+        let viewportWidth = scrollView.documentVisibleRect.width
+        guard viewportWidth > 0, documentWidth > 0 else { return }
+        if playbackIsRunning {
+            userInterruptedFollow = true
+        }
+        zoomAnchor = ZoomAnchor(
+            oldOffset: scrollView.documentVisibleRect.minX,
+            viewportWidth: viewportWidth,
+            anchorFraction: anchorFraction,
+            oldDocumentWidth: documentWidth
+        )
+    }
+
+    func updateZoomLayout(documentWidth: CGFloat) {
+        guard let scrollView, let zoomAnchor else { return }
+        let target = TimelineZoomMath.anchoredOffset(
+            oldOffset: zoomAnchor.oldOffset,
+            viewportWidth: zoomAnchor.viewportWidth,
+            anchorFraction: zoomAnchor.anchorFraction,
+            oldDocumentWidth: zoomAnchor.oldDocumentWidth,
+            newDocumentWidth: documentWidth
+        )
+        setHorizontalOffset(target, in: scrollView)
+    }
+
+    func finishZoom(documentWidth: CGFloat) {
+        updateZoomLayout(documentWidth: documentWidth)
+        zoomAnchor = nil
+    }
+
+    func scrollToStart() {
+        guard let scrollView else { return }
+        setHorizontalOffset(0, in: scrollView)
+    }
+
+    func scroll(to x: CGFloat, anchor: CGFloat, documentWidth: CGFloat) {
+        guard let scrollView else { return }
+        let viewportWidth = scrollView.documentVisibleRect.width
+        guard viewportWidth > 0, documentWidth > viewportWidth else {
+            setHorizontalOffset(0, in: scrollView)
+            return
+        }
+        let maximum = max(0, documentWidth - viewportWidth)
+        let target = min(max(0, x - viewportWidth * anchor), maximum)
+        setHorizontalOffset(target, in: scrollView)
+    }
+
+    private func setHorizontalOffset(_ x: CGFloat, in scrollView: NSScrollView) {
+        var origin = scrollView.contentView.bounds.origin
+        guard abs(origin.x - x) > 0.25 else { return }
+        origin.x = x
+        scrollView.contentView.setBoundsOrigin(origin)
+        scrollView.reflectScrolledClipView(scrollView.contentView)
     }
 }
 
@@ -701,7 +1008,7 @@ struct TimelineDropDelegate: DropDelegate {
     func dropExited(info: DropInfo) { isTargeted = false }
 
     func validateDrop(info: DropInfo) -> Bool {
-        info.hasItemsConforming(to: [.fileURL, .audio, .movie, .audiovisualContent])
+        info.hasItemsConforming(to: EditorModel.mediaDropTypes)
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
@@ -716,7 +1023,7 @@ struct TimelineDropDelegate: DropDelegate {
         // Prefer fileURL providers; fall back to any conforming provider.
         var providers = info.itemProviders(for: [.fileURL])
         if providers.isEmpty {
-            providers = info.itemProviders(for: [.movie, .audio, .audiovisualContent])
+            providers = info.itemProviders(for: [.movie, .audio, .audiovisualContent, .image])
         }
         guard !providers.isEmpty else { return false }
 
@@ -817,8 +1124,8 @@ struct AddLaneMenuButton: View {
 
     var body: some View {
         Menu {
-            Button("Add Audio Lane") { model.addLane(kind: .audio) }
-            Button("Add Video Lane") { model.addLane(kind: .video) }
+            Button("Audio") { model.addLane(kind: .audio) }
+            Button("Video") { model.addLane(kind: .video) }
         } label: {
             Image(systemName: "plus")
                 .font(.system(size: 10, weight: .semibold))
@@ -1049,10 +1356,17 @@ struct FilmstripLane: View {
     var duration: TimeInterval = 0
     /// Full source length that `images` covers (0...sourceDuration).
     var sourceDuration: TimeInterval = 0
+    /// Still images have one visual frame regardless of clip duration. Keep that
+    /// frame at a lane-height-derived size and repeat it instead of stretching it.
+    var tilesSingleImage = false
 
     var body: some View {
         Canvas { context, size in
             guard !images.isEmpty, size.width > 0, size.height > 0 else { return }
+            if tilesSingleImage {
+                drawRepeatedStill(images[0], in: &context, size: size)
+                return
+            }
             let source = max(sourceDuration, 0.0001)
             let startFrac = min(max(inPoint / source, 0), 1)
             let endFrac = min(max((inPoint + max(duration, 0.0001)) / source, startFrac), 1)
@@ -1078,6 +1392,36 @@ struct FilmstripLane: View {
             }
         }
         .allowsHitTesting(false)
+    }
+
+    nonisolated static func stillTileWidth(imageSize: CGSize, laneHeight: CGFloat) -> CGFloat {
+        guard imageSize.width > 0, imageSize.height > 0, laneHeight > 0 else {
+            return max(1, laneHeight)
+        }
+        return max(1, laneHeight * imageSize.width / imageSize.height)
+    }
+
+    private func drawRepeatedStill(_ image: CGImage, in context: inout GraphicsContext, size: CGSize) {
+        let imageSize = CGSize(width: image.width, height: image.height)
+        let tileWidth = Self.stillTileWidth(imageSize: imageSize, laneHeight: size.height)
+        let tileCount = max(1, Int(ceil(size.width / tileWidth)))
+        let nsImage = NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
+        let resolved = context.resolve(Image(nsImage: nsImage))
+        for index in 0..<tileCount {
+            let cell = CGRect(
+                x: CGFloat(index) * tileWidth,
+                y: 0,
+                width: min(tileWidth, max(0, size.width - CGFloat(index) * tileWidth)),
+                height: size.height
+            )
+            guard cell.width > 0 else { continue }
+            var layer = context
+            layer.clip(to: Path(cell))
+            // Draw a full-size tile even when the final cell is clipped at the
+            // clip edge; otherwise the last thumbnail would be squeezed.
+            let fullTile = CGRect(x: cell.minX, y: 0, width: tileWidth, height: size.height)
+            layer.draw(resolved, in: fullTile)
+        }
     }
 
     private func fillRect(for imageSize: CGSize, in cell: CGRect) -> CGRect {

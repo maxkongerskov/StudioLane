@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import ImageIO
 import Observation
 import UniformTypeIdentifiers
 
@@ -40,6 +41,15 @@ struct MediaClip: Identifiable, Codable {
     var trackID: UUID
     /// Full-source peak map covering `0...sourceDuration`. Drawing windows by inPoint/duration (Logic-style mask).
     var waveform: [Float] = []
+    /// Pro video controls. Kept on every clip so projects remain round-trippable
+    /// when Pro mode is switched off.
+    var transform: ClipTransform = .identity
+    var transformKeyframes: [ClipTransformKeyframe] = []
+    var transitionIn: ClipTransition = ClipTransition()
+    var transitionOut: ClipTransition = ClipTransition()
+    /// Pro audio controls.
+    var pan: Float = 0
+    var isNormalized = false
 
     var timelineEnd: TimeInterval { timelineStart + duration }
 
@@ -63,6 +73,7 @@ struct MediaClip: Identifiable, Codable {
     enum CodingKeys: String, CodingKey {
         case id, url, name, sourceDuration, inPoint, timelineStart, duration
         case fadeIn, fadeOut, muted, gain, trackID, waveform
+        case transform, transformKeyframes, transitionIn, transitionOut, pan, isNormalized
     }
 
     init(
@@ -78,7 +89,13 @@ struct MediaClip: Identifiable, Codable {
         muted: Bool = false,
         gain: Float = 1,
         trackID: UUID = UUID(),
-        waveform: [Float] = []
+        waveform: [Float] = [],
+        transform: ClipTransform = .identity,
+        transformKeyframes: [ClipTransformKeyframe] = [],
+        transitionIn: ClipTransition = ClipTransition(),
+        transitionOut: ClipTransition = ClipTransition(),
+        pan: Float = 0,
+        isNormalized: Bool = false
     ) {
         self.id = id
         self.url = url
@@ -93,6 +110,12 @@ struct MediaClip: Identifiable, Codable {
         self.gain = gain
         self.trackID = trackID
         self.waveform = waveform
+        self.transform = transform
+        self.transformKeyframes = transformKeyframes
+        self.transitionIn = transitionIn
+        self.transitionOut = transitionOut
+        self.pan = pan
+        self.isNormalized = isNormalized
     }
 
     init(from decoder: Decoder) throws {
@@ -110,6 +133,12 @@ struct MediaClip: Identifiable, Codable {
         gain = try c.decodeIfPresent(Float.self, forKey: .gain) ?? 1
         trackID = try c.decodeIfPresent(UUID.self, forKey: .trackID) ?? UUID()
         waveform = try c.decodeIfPresent([Float].self, forKey: .waveform) ?? []
+        transform = try c.decodeIfPresent(ClipTransform.self, forKey: .transform) ?? .identity
+        transformKeyframes = try c.decodeIfPresent([ClipTransformKeyframe].self, forKey: .transformKeyframes) ?? []
+        transitionIn = try c.decodeIfPresent(ClipTransition.self, forKey: .transitionIn) ?? ClipTransition()
+        transitionOut = try c.decodeIfPresent(ClipTransition.self, forKey: .transitionOut) ?? ClipTransition()
+        pan = try c.decodeIfPresent(Float.self, forKey: .pan) ?? 0
+        isNormalized = try c.decodeIfPresent(Bool.self, forKey: .isNormalized) ?? false
     }
 
     func encode(to encoder: Encoder) throws {
@@ -127,6 +156,12 @@ struct MediaClip: Identifiable, Codable {
         try c.encode(gain, forKey: .gain)
         try c.encode(trackID, forKey: .trackID)
         try c.encode(waveform, forKey: .waveform)
+        try c.encode(transform, forKey: .transform)
+        try c.encode(transformKeyframes, forKey: .transformKeyframes)
+        try c.encode(transitionIn, forKey: .transitionIn)
+        try c.encode(transitionOut, forKey: .transitionOut)
+        try c.encode(pan, forKey: .pan)
+        try c.encode(isNormalized, forKey: .isNormalized)
     }
 
     func sanitized() -> MediaClip? {
@@ -150,7 +185,13 @@ struct MediaClip: Identifiable, Codable {
             trackID: trackID,
             waveform: waveform.count <= Self.maximumPersistedWaveformPoints
                 ? waveform.map { $0.isFinite ? min(max($0, 0), 1) : 0 }
-                : []
+                : [],
+            transform: transform,
+            transformKeyframes: transformKeyframes,
+            transitionIn: transitionIn,
+            transitionOut: transitionOut,
+            pan: pan.isFinite ? min(max(pan, -1), 1) : 0,
+            isNormalized: isNormalized
         )
         var sanitized = clip
         // Floors/ceilings go through the shared EditorModel constants (see
@@ -165,6 +206,14 @@ struct MediaClip: Identifiable, Codable {
             inPoint: sanitized.inPoint
         )
         sanitized.timelineStart = max(0, timelineStart)
+        sanitized.transform.sanitize()
+        sanitized.transformKeyframes = transformKeyframes.map {
+            var keyframe = $0
+            keyframe.sanitize(clipDuration: sanitized.duration)
+            return keyframe
+        }.sorted { $0.time < $1.time }
+        sanitized.transitionIn.sanitize(clipDuration: sanitized.duration)
+        sanitized.transitionOut.sanitize(clipDuration: sanitized.duration)
         sanitized.clampFades()
         return sanitized
     }
@@ -182,6 +231,8 @@ struct EditorSnapshot: Codable {
     var musicVolume: Float
     var isDuckingMusic: Bool
     var audioLayoutMode: Int
+    var isProMode: Bool
+    var proSettings: ProProjectSettings
 }
 
 struct ProjectClips: Codable {
@@ -203,10 +254,13 @@ struct ProjectDocument: Codable {
     var timelineSpan: TimeInterval?
     /// Playhead in seconds. Absent in older files, which open at the start.
     var playhead: TimeInterval?
+    var isProMode: Bool?
+    var proSettings: ProProjectSettings?
 
     enum CodingKeys: String, CodingKey {
         case clips, tracks, focusedLane, focusedTrackID, selectedClipID, selectedClipIDs
         case videoVolume, musicVolume, isDuckingMusic, audioLayoutMode, timelineSpan, playhead
+        case isProMode, proSettings
     }
 
     init(
@@ -221,7 +275,9 @@ struct ProjectDocument: Codable {
         isDuckingMusic: Bool,
         audioLayoutMode: Int? = 0,
         timelineSpan: TimeInterval? = nil,
-        playhead: TimeInterval? = nil
+        playhead: TimeInterval? = nil,
+        isProMode: Bool? = nil,
+        proSettings: ProProjectSettings? = nil
     ) {
         self.clips = clips
         self.tracks = tracks
@@ -235,6 +291,8 @@ struct ProjectDocument: Codable {
         self.audioLayoutMode = audioLayoutMode
         self.timelineSpan = timelineSpan
         self.playhead = playhead
+        self.isProMode = isProMode
+        self.proSettings = proSettings
     }
 
     init(from decoder: Decoder) throws {
@@ -251,6 +309,8 @@ struct ProjectDocument: Codable {
         audioLayoutMode = try c.decodeIfPresent(Int.self, forKey: .audioLayoutMode)
         timelineSpan = try c.decodeIfPresent(TimeInterval.self, forKey: .timelineSpan)
         playhead = try c.decodeIfPresent(TimeInterval.self, forKey: .playhead)
+        isProMode = try c.decodeIfPresent(Bool.self, forKey: .isProMode)
+        proSettings = try c.decodeIfPresent(ProProjectSettings.self, forKey: .proSettings)
     }
 }
 
@@ -297,6 +357,8 @@ final class EditorModel {
     var timelineZoom: CGFloat = 1
     var timelineViewportWidth: CGFloat = 1100
     var isSnapEnabled = true
+    var isProMode = false
+    var proSettings = ProProjectSettings()
     /// Playlist = abut/ripple music; Layer = free overlaps.
     var audioLayoutMode: AudioLayoutMode = .playlist
     var loopEnabled = false
@@ -310,6 +372,7 @@ final class EditorModel {
 
     static let defaultVideoTrackID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
     static let defaultAudioTrackID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
+    private static let proModeDefaultsKey = "StudioAudioLane.ProMode"
 
     enum Lane: Int, Hashable, CaseIterable {
         case video = 0
@@ -325,6 +388,24 @@ final class EditorModel {
 
     func trackIndex(_ id: UUID) -> Int? {
         tracks.firstIndex { $0.id == id }
+    }
+
+    func setProMode(_ enabled: Bool) {
+        isProMode = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.proModeDefaultsKey)
+        scheduleAutosave()
+        scheduleRebuild()
+    }
+
+    func updateProSettings(_ update: (inout ProProjectSettings) -> Void) {
+        pushHistory()
+        update(&proSettings)
+        proSettings.sanitize()
+        frameDuration = CMTime(
+            seconds: 1 / max(1, proSettings.frameRate),
+            preferredTimescale: 60_000
+        )
+        rebuild()
     }
 
     func clips(on trackID: UUID) -> [MediaClip] {
@@ -492,7 +573,9 @@ final class EditorModel {
         if tracks[i].kind == .audio, tracks.filter({ $0.kind == .audio }).first?.id == trackID {
             musicVolume = v
         }
-        applyFades()
+        // Lane volume is an audio-mix change. Replacing the video composition here
+        // tears down the preview while playback is running.
+        applyFades(refreshingVideo: false)
         scheduleAutosave()
     }
 
@@ -607,6 +690,7 @@ final class EditorModel {
     }
 
     var exportSourceFPS: Double {
+        if isProMode { return proSettings.frameRate }
         let seconds = frameDuration.seconds
         guard seconds > 0 else { return 30 }
         return 1.0 / seconds
@@ -671,6 +755,7 @@ final class EditorModel {
     private var exportCancelFlag: ExportCancelFlag?
     private var exportProgressTimer: Timer?
     private var exportWriterTask: Task<Void, Never>?
+    private var exportTemporaryURLs: Set<URL> = []
     /// Destination of the in-flight export; used to delete incomplete files on cancel/failure.
     var exportDestinationURL: URL?
 
@@ -701,8 +786,8 @@ final class EditorModel {
     func rebuildCompositionPublic() async {
         await rebuildAndWait()
     }
-    func applyFadesPublic() {
-        applyFades()
+    func applyFadesPublic(refreshingVideo: Bool = true) {
+        applyFades(refreshingVideo: refreshingVideo)
     }
 
     /// MCP export entry point — bypasses the save panel.
@@ -738,13 +823,31 @@ final class EditorModel {
         }
         try? FileManager.default.removeItem(at: destination)
         exportDestinationURL = destination
-        let pipeline = settings.prefersWriterPipeline ? "writer" : "session"
-        status = "Exporting… (\(pipeline), \(settings.codec.rawValue)/\(settings.container.rawValue))"
 
         let videoComposition = makeExportVideoComposition(settings: settings)
         let audioMix = item.audioMix ?? makeAudioMix()
 
-        if settings.prefersWriterPipeline {
+        switch settings.mode {
+        case .animatedGIF:
+            status = "Exporting… (animated GIF)"
+            startGIFExport(
+                asset: item.asset,
+                settings: settings,
+                destination: destination,
+                videoComposition: videoComposition
+            )
+        case .xLoop:
+            status = "Exporting… (X loop H.264/AAC)"
+            startXLoopExport(
+                asset: item.asset,
+                settings: settings,
+                destination: destination,
+                videoComposition: videoComposition,
+                audioMix: audioMix
+            )
+        case .video where settings.prefersWriterPipeline
+            || (isProMode && abs(proSettings.sampleRate - 48_000) > 1):
+            status = "Exporting… (writer, \(settings.codec.rawValue)/\(settings.container.rawValue))"
             startWriterExport(
                 asset: item.asset,
                 settings: settings,
@@ -752,7 +855,8 @@ final class EditorModel {
                 videoComposition: videoComposition,
                 audioMix: audioMix
             )
-        } else {
+        case .video:
+            status = "Exporting… (session, \(settings.codec.rawValue)/\(settings.container.rawValue))"
             startSessionExport(
                 asset: item.asset,
                 settings: settings,
@@ -832,7 +936,9 @@ final class EditorModel {
         let id = clip.id
         let url = clip.url
         let sourceDuration = max(clip.sourceDuration, 0.05)
-        let count = Self.filmstripFrameCount(for: sourceDuration)
+        // Stills repeat one picture. A short strip is enough; the lane masks it
+        // by in-point the same way a filmstrip is masked.
+        let count = StillImage.isStill(url) ? 12 : Self.filmstripFrameCount(for: sourceDuration)
         Task {
             // Full-source frames so trim only remasks the window — no live regenerate.
             let frames = await Filmstrip.generate(url: url, count: count, inPoint: 0, duration: sourceDuration)
@@ -897,7 +1003,9 @@ final class EditorModel {
             isDuckingMusic: isDuckingMusic,
             audioLayoutMode: audioLayoutMode.rawValue,
             timelineSpan: timelineSpan,
-            playhead: currentTime
+            playhead: currentTime,
+            isProMode: isProMode,
+            proSettings: proSettings
         )
     }
 
@@ -1072,6 +1180,12 @@ final class EditorModel {
         if let mode = project.audioLayoutMode {
             audioLayoutMode = AudioLayoutMode(rawValue: mode) ?? .playlist
         }
+        isProMode = project.isProMode
+            ?? UserDefaults.standard.bool(forKey: Self.proModeDefaultsKey)
+        if var savedSettings = project.proSettings {
+            savedSettings.sanitize()
+            proSettings = savedSettings
+        }
         ensureDefaultTracks()
         // Prefer saved primary volumes when tracks were synthesized.
         if let i = tracks.firstIndex(where: { $0.kind == .video }) { tracks[i].volume = videoVolume }
@@ -1168,7 +1282,9 @@ final class EditorModel {
             videoVolume: videoVolume,
             musicVolume: musicVolume,
             isDuckingMusic: isDuckingMusic,
-            audioLayoutMode: audioLayoutMode.rawValue
+            audioLayoutMode: audioLayoutMode.rawValue,
+            isProMode: isProMode,
+            proSettings: proSettings
         )
     }
 
@@ -1186,6 +1302,9 @@ final class EditorModel {
         musicVolume = snapshot.musicVolume
         isDuckingMusic = snapshot.isDuckingMusic
         audioLayoutMode = AudioLayoutMode(rawValue: snapshot.audioLayoutMode) ?? .playlist
+        isProMode = snapshot.isProMode
+        proSettings = snapshot.proSettings
+        proSettings.sanitize()
         ensureDefaultTracks()
         isEditingClip = false
         timelineSpan = max(timelineSpan, duration)
@@ -1213,19 +1332,16 @@ final class EditorModel {
     /// Media-agnostic open: accepts video + audio and routes by type.
     func pickMediaFile(preferredKind: TimelineTrack.Kind? = nil, ontoTrackID: UUID? = nil) {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [
-            .movie, .mpeg4Movie, .quickTimeMovie, .avi,
-            .audio, .mp3, .wav, .aiff, .mpeg4Audio
-        ]
+        panel.allowedContentTypes = Self.openMediaTypes
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = true
         switch preferredKind {
         case .video:
-            panel.message = videoClips.isEmpty ? "Open media" : "Add video to the track"
+            panel.message = videoClips.isEmpty ? "Open video or image" : "Add a video or image to the track"
         case .audio:
             panel.message = "Add audio to the track"
         case nil:
-            panel.message = "Open media"
+            panel.message = "Open video, image, or audio"
         }
         guard panel.runModal() == .OK else { return }
         acceptDroppedFiles(panel.urls, at: nil, ontoTrackID: ontoTrackID, preferKind: preferredKind)
@@ -1264,20 +1380,33 @@ final class EditorModel {
         return audioTracks.first?.id ?? Self.defaultAudioTrackID
     }
 
-    static let audioExtensions: Set<String> = [
+    nonisolated static let audioExtensions: Set<String> = [
         "wav", "mp3", "m4a", "aac", "aiff", "aif", "caf", "flac", "ogg", "wma"
     ]
-    static let videoExtensions: Set<String> = [
+    nonisolated static let videoExtensions: Set<String> = [
         "mov", "mp4", "m4v", "avi", "mkv", "mpg", "mpeg", "mts", "m2ts", "webm"
     ]
 
-    static func mediaKind(for url: URL) -> TimelineTrack.Kind {
+    /// Movies, still images, and audio. Images land on a video lane.
+    static let openMediaTypes: [UTType] = [
+        .movie, .mpeg4Movie, .quickTimeMovie, .avi,
+        .image, .jpeg, .png, .gif, .tiff, .bmp, .heic, .heif, .webP,
+        .audio, .mp3, .wav, .aiff, .mpeg4Audio
+    ]
+
+    static let mediaDropTypes: [UTType] = [
+        .fileURL, .movie, .audio, .audiovisualContent, .image
+    ]
+
+    nonisolated static func mediaKind(for url: URL) -> TimelineTrack.Kind {
         let ext = url.pathExtension.lowercased()
         if audioExtensions.contains(ext) { return .audio }
         if videoExtensions.contains(ext) { return .video }
-        // UTI fallback
+        // Photos, screenshots, RAW, and anything else UniformTypeIdentifiers calls an image.
+        if StillImage.isStill(url) { return .video }
         if let values = try? url.resourceValues(forKeys: [.contentTypeKey]),
            let type = values.contentType {
+            if type.conforms(to: .image) { return .video }
             if type.conforms(to: .audiovisualContent) && !type.conforms(to: .audio) {
                 return .video
             }
@@ -1620,28 +1749,106 @@ final class EditorModel {
         }
     }
 
-    func trimIn(clipID: UUID, toTimelineTime time: TimeInterval) {
+    func trimIn(clipID: UUID, toTimelineTime time: TimeInterval, snapping: Bool = true) {
         beginEdit()
         if let i = audioIndex(clipID) {
-            let end = audioClips[i].timelineEnd
-            trimInOn(&audioClips[i], time: snapTime(time, excluding: [end]))
+            let original = audioClips[i]
+            var anchor = original
+            trimInOn(
+                &anchor,
+                time: snapping ? snapTime(time, excluding: [original.timelineEnd]) : time
+            )
+            let delta = anchor.timelineStart - original.timelineStart
+            for id in directEditClipIDs(anchor: clipID) {
+                if id == clipID {
+                    audioClips[i] = anchor
+                } else if let selectedAudioIndex = audioIndex(id) {
+                    trimInOn(
+                        &audioClips[selectedAudioIndex],
+                        time: audioClips[selectedAudioIndex].timelineStart + delta
+                    )
+                } else if let selectedVideoIndex = videoIndex(id) {
+                    trimInOn(
+                        &videoClips[selectedVideoIndex],
+                        time: videoClips[selectedVideoIndex].timelineStart + delta
+                    )
+                }
+            }
         } else if let i = videoIndex(clipID) {
-            let end = videoClips[i].timelineEnd
-            trimInOn(&videoClips[i], time: snapTime(time, excluding: [end]))
+            let original = videoClips[i]
+            var anchor = original
+            trimInOn(
+                &anchor,
+                time: snapping ? snapTime(time, excluding: [original.timelineEnd]) : time
+            )
+            let delta = anchor.timelineStart - original.timelineStart
+            for id in directEditClipIDs(anchor: clipID) {
+                if id == clipID {
+                    videoClips[i] = anchor
+                } else if let selectedVideoIndex = videoIndex(id) {
+                    trimInOn(
+                        &videoClips[selectedVideoIndex],
+                        time: videoClips[selectedVideoIndex].timelineStart + delta
+                    )
+                } else if let selectedAudioIndex = audioIndex(id) {
+                    trimInOn(
+                        &audioClips[selectedAudioIndex],
+                        time: audioClips[selectedAudioIndex].timelineStart + delta
+                    )
+                }
+            }
         }
         isEditingClip = true
     }
 
-    func trimOut(clipID: UUID, toTimelineTime time: TimeInterval) {
+    func trimOut(clipID: UUID, toTimelineTime time: TimeInterval, snapping: Bool = true) {
         beginEdit()
         if let i = audioIndex(clipID) {
-            let start = audioClips[i].timelineStart
-            trimOutOn(&audioClips[i], time: snapTime(time, excluding: [start]))
+            let original = audioClips[i]
+            var anchor = original
+            trimOutOn(
+                &anchor,
+                time: snapping ? snapTime(time, excluding: [original.timelineStart]) : time
+            )
+            let delta = anchor.timelineEnd - original.timelineEnd
+            for id in directEditClipIDs(anchor: clipID) {
+                if id == clipID {
+                    audioClips[i] = anchor
+                } else if let selectedAudioIndex = audioIndex(id) {
+                    trimOutOn(
+                        &audioClips[selectedAudioIndex],
+                        time: audioClips[selectedAudioIndex].timelineEnd + delta
+                    )
+                } else if let selectedVideoIndex = videoIndex(id) {
+                    trimOutOn(
+                        &videoClips[selectedVideoIndex],
+                        time: videoClips[selectedVideoIndex].timelineEnd + delta
+                    )
+                }
+            }
         } else if let i = videoIndex(clipID) {
-            let start = videoClips[i].timelineStart
-            var clip = videoClips[i]
-            trimOutOn(&clip, time: snapTime(time, excluding: [start]))
-            videoClips[i] = clip
+            let original = videoClips[i]
+            var anchor = original
+            trimOutOn(
+                &anchor,
+                time: snapping ? snapTime(time, excluding: [original.timelineStart]) : time
+            )
+            let delta = anchor.timelineEnd - original.timelineEnd
+            for id in directEditClipIDs(anchor: clipID) {
+                if id == clipID {
+                    videoClips[i] = anchor
+                } else if let selectedVideoIndex = videoIndex(id) {
+                    trimOutOn(
+                        &videoClips[selectedVideoIndex],
+                        time: videoClips[selectedVideoIndex].timelineEnd + delta
+                    )
+                } else if let selectedAudioIndex = audioIndex(id) {
+                    trimOutOn(
+                        &audioClips[selectedAudioIndex],
+                        time: audioClips[selectedAudioIndex].timelineEnd + delta
+                    )
+                }
+            }
         }
         isEditingClip = true
     }
@@ -1650,15 +1857,132 @@ final class EditorModel {
         moveClip(clipID: clipID, toStart: time)
     }
 
-    func moveClip(clipID: UUID, toStart time: TimeInterval) {
+    func moveClip(clipID: UUID, toStart time: TimeInterval, snapping: Bool = true) {
         beginEdit()
-        let start = snapTime(max(0, time))
+        let proposed = max(0, time)
+        let start = snapping ? snapTime(proposed) : proposed
         if let i = audioIndex(clipID) {
             audioClips[i].timelineStart = start
         } else if let i = videoIndex(clipID) {
             videoClips[i].timelineStart = start
         }
         isEditingClip = true
+    }
+
+    /// Slip changes which source media is visible without moving or resizing the clip.
+    func slipClip(clipID: UUID, toInPoint time: TimeInterval) {
+        beginEdit()
+        if let i = audioIndex(clipID) {
+            audioClips[i].inPoint = min(
+                max(0, time),
+                max(0, audioClips[i].sourceDuration - audioClips[i].duration)
+            )
+        } else if let i = videoIndex(clipID) {
+            videoClips[i].inPoint = min(
+                max(0, time),
+                max(0, videoClips[i].sourceDuration - videoClips[i].duration)
+            )
+        }
+        isEditingClip = true
+    }
+
+    var inspectorTimelineStart: TimeInterval { primarySelectedClip?.timelineStart ?? 0 }
+    var inspectorInPoint: TimeInterval { primarySelectedClip?.inPoint ?? 0 }
+
+    /// Numeric start entry shifts all selected clips by the same delta so a
+    /// multi-selection keeps its internal spacing.
+    func setSelectedTimelineStart(_ start: TimeInterval) {
+        guard let primary = primarySelectedClip else { return }
+        beginEdit()
+        let ids = selectedClipIDs.isEmpty ? Set([primary.id]) : selectedClipIDs
+        let requestedDelta = max(0, start) - primary.timelineStart
+        let selected = (videoClips + audioClips).filter { ids.contains($0.id) }
+        let minimumStart = selected.map(\.timelineStart).min() ?? 0
+        let delta = max(requestedDelta, -minimumStart)
+        for id in ids {
+            if let i = videoIndex(id) {
+                videoClips[i].timelineStart += delta
+            } else if let i = audioIndex(id) {
+                audioClips[i].timelineStart += delta
+            }
+        }
+        isEditingClip = true
+    }
+
+    /// Numeric in-point entry is a slip edit: timeline position and duration stay fixed.
+    func setSelectedInPoint(_ inPoint: TimeInterval) {
+        guard let primary = primarySelectedClip else { return }
+        beginEdit()
+        let ids = selectedClipIDs.isEmpty ? Set([primary.id]) : selectedClipIDs
+        let delta = max(0, inPoint) - primary.inPoint
+        for id in ids {
+            if let i = videoIndex(id) {
+                let maximum = max(0, videoClips[i].sourceDuration - videoClips[i].duration)
+                videoClips[i].inPoint = min(max(0, videoClips[i].inPoint + delta), maximum)
+            } else if let i = audioIndex(id) {
+                let maximum = max(0, audioClips[i].sourceDuration - audioClips[i].duration)
+                audioClips[i].inPoint = min(max(0, audioClips[i].inPoint + delta), maximum)
+            }
+        }
+        isEditingClip = true
+    }
+
+    /// Commits a precision edit without playlist normalization. Fine nudges and
+    /// numeric offsets are intentional gaps/overlaps and must not be rippled away.
+    func commitPrecisionEdit() {
+        isEditingClip = false
+        growTimelineSpan()
+        rebuild()
+    }
+
+    @discardableResult
+    func nudgeSelectedClips(by delta: TimeInterval, audioOnly: Bool = false) -> Bool {
+        var ids = selectedClipIDs
+        if ids.isEmpty, let selectedClipID { ids = [selectedClipID] }
+        if audioOnly {
+            ids = ids.filter { audioIndex($0) != nil }
+        }
+        let clips = (videoClips + audioClips).filter { ids.contains($0.id) }
+        guard !clips.isEmpty, delta.isFinite, delta != 0 else { return false }
+        isEditingClip = false
+        pushHistory()
+        let minimumStart = clips.map(\.timelineStart).min() ?? 0
+        let applied = max(delta, -minimumStart)
+        for id in ids {
+            if let i = videoIndex(id) {
+                videoClips[i].timelineStart += applied
+            } else if let i = audioIndex(id) {
+                audioClips[i].timelineStart += applied
+            }
+        }
+        growTimelineSpan()
+        scheduleAutosave()
+        scheduleRebuild()
+        return true
+    }
+
+    func nudgeSelectedByFrames(_ frames: Int) -> Bool {
+        let seconds = isProMode
+            ? 1 / max(1, proSettings.frameRate)
+            : frameDuration.seconds.isFinite && frameDuration.seconds > 0
+                ? frameDuration.seconds
+                : 1.0 / 30.0
+        return nudgeSelectedClips(by: Double(frames) * seconds)
+    }
+
+    func nudgeSelectedAudio(milliseconds: Double) -> Bool {
+        nudgeSelectedClips(by: milliseconds / 1_000, audioOnly: true)
+    }
+
+    func nudgeSelectedAudio(samples: Int) -> Bool {
+        let sampleRate: Double = {
+            if isProMode { return max(1, proSettings.sampleRate) }
+            guard let clip = primarySelectedClip,
+                  audioIndex(clip.id) != nil,
+                  let file = try? AVAudioFile(forReading: clip.url) else { return 48_000 }
+            return max(1, file.processingFormat.sampleRate)
+        }()
+        return nudgeSelectedClips(by: Double(samples) / sampleRate, audioOnly: true)
     }
 
     func setClipLength(_ length: TimeInterval) {
@@ -1681,9 +2005,18 @@ final class EditorModel {
     func snapTime(_ time: TimeInterval, excluding: [TimeInterval] = []) -> TimeInterval {
         guard isSnapEnabled else { return time }
         let threshold = max(0.02, 7 * layoutDuration / max(timelineWidthPoints, 1))
-        var candidates: [TimeInterval] = [0, currentTime, layoutDuration]
-        candidates += videoClips.flatMap { [$0.timelineStart, $0.timelineEnd] }
-        candidates += audioClips.flatMap { [$0.timelineStart, $0.timelineEnd] }
+        var candidates: [TimeInterval] = [0, layoutDuration]
+        if !isProMode || proSettings.snapToPlayhead {
+            candidates.append(currentTime)
+        }
+        if !isProMode || proSettings.snapToClipEdges {
+            candidates += videoClips.flatMap { [$0.timelineStart, $0.timelineEnd] }
+            candidates += audioClips.flatMap { [$0.timelineStart, $0.timelineEnd] }
+        }
+        if isProMode, proSettings.snapToFrameGrid {
+            let frame = 1 / max(1, proSettings.frameRate)
+            candidates.append((time / frame).rounded() * frame)
+        }
         let filtered = candidates.filter { candidate in
             excluding.allSatisfy { abs($0 - candidate) > 0.0005 }
         }
@@ -1698,12 +2031,16 @@ final class EditorModel {
         max(timelineViewportWidth, 1) * max(timelineZoom, 1)
     }
 
+    func setTimelineZoom(_ zoom: CGFloat) {
+        timelineZoom = min(max(zoom, Self.minTimelineZoom), Self.maxTimelineZoom)
+    }
+
     func zoomIn() {
-        timelineZoom = min(Self.maxTimelineZoom, timelineZoom * 1.35)
+        setTimelineZoom(timelineZoom * 1.35)
     }
 
     func zoomOut() {
-        timelineZoom = max(Self.minTimelineZoom, timelineZoom / 1.35)
+        setTimelineZoom(timelineZoom / 1.35)
     }
 
     func zoomToFit(viewportWidth: CGFloat) {
@@ -1993,7 +2330,7 @@ final class EditorModel {
                 audioClips[i].clampFades()
             }
         }
-        applyFades()
+        applyFades(refreshingVideo: ids.contains { videoIndex($0) != nil })
         isEditingClip = true
     }
 
@@ -2010,7 +2347,7 @@ final class EditorModel {
                 audioClips[i].clampFades()
             }
         }
-        applyFades()
+        applyFades(refreshingVideo: ids.contains { videoIndex($0) != nil })
         isEditingClip = true
     }
 
@@ -2023,7 +2360,7 @@ final class EditorModel {
         if let i = tracks.firstIndex(where: { $0.kind == .audio }) {
             tracks[i].volume = musicVolume
         }
-        applyFades()
+        applyFades(refreshingVideo: false)
         scheduleAutosave()
     }
 
@@ -2032,7 +2369,7 @@ final class EditorModel {
         if let i = tracks.firstIndex(where: { $0.kind == .video }) {
             tracks[i].volume = videoVolume
         }
-        applyFades()
+        applyFades(refreshingVideo: false)
         scheduleAutosave()
     }
 
@@ -2047,12 +2384,190 @@ final class EditorModel {
                 audioClips[i].gain = g
             }
         }
-        applyFades()
+        applyFades(refreshingVideo: false)
         isEditingClip = true
     }
 
     var selectedClipGain: Float {
         primarySelectedClip?.gain ?? 1
+    }
+
+    var selectedClipTransform: ClipTransform {
+        selectedVideo?.transform ?? .identity
+    }
+
+    var selectedClipPan: Float {
+        selectedAudio?.pan ?? 0
+    }
+
+    var selectedTransitionIn: ClipTransition {
+        selectedVideo?.transitionIn ?? ClipTransition()
+    }
+
+    var selectedTransitionOut: ClipTransition {
+        selectedVideo?.transitionOut ?? ClipTransition()
+    }
+
+    var selectedKeyframeCount: Int {
+        selectedVideo?.transformKeyframes.count ?? 0
+    }
+
+    func setSelectedTransform(_ update: (inout ClipTransform) -> Void) {
+        guard isProMode else { return }
+        beginEdit()
+        let ids = selectedClipIDs.isEmpty ? Set([selectedClipID].compactMap { $0 }) : selectedClipIDs
+        for id in ids {
+            guard let i = videoIndex(id) else { continue }
+            update(&videoClips[i].transform)
+            videoClips[i].transform.sanitize()
+        }
+        applyFades()
+        scheduleAutosave()
+        isEditingClip = true
+    }
+
+    func setSelectedTransition(_ transition: ClipTransition, incoming: Bool) {
+        guard isProMode else { return }
+        beginEdit()
+        let ids = selectedClipIDs.isEmpty ? Set([selectedClipID].compactMap { $0 }) : selectedClipIDs
+        for id in ids {
+            guard let i = videoIndex(id) else { continue }
+            var value = transition
+            value.sanitize(clipDuration: videoClips[i].duration)
+            if incoming {
+                videoClips[i].transitionIn = value
+            } else {
+                videoClips[i].transitionOut = value
+            }
+        }
+        applyFades()
+        scheduleAutosave()
+        isEditingClip = true
+    }
+
+    func addTransformKeyframeAtPlayhead() {
+        guard isProMode else { return }
+        pushHistory()
+        let ids = selectedClipIDs.isEmpty ? Set([selectedClipID].compactMap { $0 }) : selectedClipIDs
+        for id in ids {
+            guard let i = videoIndex(id) else { continue }
+            let localTime = min(max(0, currentTime - videoClips[i].timelineStart), videoClips[i].duration)
+            let keyframe = ClipTransformKeyframe(time: localTime, transform: videoClips[i].transform)
+            if let existing = videoClips[i].transformKeyframes.firstIndex(where: { abs($0.time - localTime) < 0.5 / max(proSettings.frameRate, 1) }) {
+                videoClips[i].transformKeyframes[existing] = keyframe
+            } else {
+                videoClips[i].transformKeyframes.append(keyframe)
+                videoClips[i].transformKeyframes.sort { $0.time < $1.time }
+            }
+        }
+        rebuild()
+    }
+
+    func clearSelectedTransformKeyframes() {
+        guard isProMode else { return }
+        pushHistory()
+        let ids = selectedClipIDs.isEmpty ? Set([selectedClipID].compactMap { $0 }) : selectedClipIDs
+        for id in ids {
+            guard let i = videoIndex(id) else { continue }
+            videoClips[i].transformKeyframes = []
+        }
+        rebuild()
+    }
+
+    func setSelectedPan(_ pan: Float) {
+        guard isProMode else { return }
+        beginEdit()
+        let value = min(max(pan, -1), 1)
+        let ids = selectedClipIDs.isEmpty ? Set([selectedClipID].compactMap { $0 }) : selectedClipIDs
+        for id in ids {
+            guard let i = audioIndex(id) else { continue }
+            audioClips[i].pan = value
+        }
+        applyFades(refreshingVideo: false)
+        scheduleAutosave()
+        isEditingClip = true
+    }
+
+    func normalizeSelectedAudio(targetPeak: Float = 0.89) {
+        guard isProMode else { return }
+        pushHistory()
+        let ids = selectedClipIDs.isEmpty ? Set([selectedClipID].compactMap { $0 }) : selectedClipIDs
+        var normalizedAny = false
+        for id in ids {
+            guard let i = audioIndex(id), let peak = audioClips[i].waveform.max(), peak > 0.000_1 else { continue }
+            audioClips[i].gain = ProFeatureMath.normalizedGain(
+                current: audioClips[i].gain,
+                peak: peak,
+                targetPeak: targetPeak
+            )
+            audioClips[i].isNormalized = true
+            normalizedAny = true
+        }
+        status = normalizedAny ? "Normalized selected audio" : "Waveform analysis is still loading"
+        applyFades(refreshingVideo: false)
+        rebuild()
+    }
+
+    var selectedAudioMeter: (left: Float, right: Float) {
+        guard isProMode, let clip = selectedAudio, !clip.waveform.isEmpty else { return (0, 0) }
+        let local = min(max(0, currentTime - clip.timelineStart), max(clip.duration, 0.000_1))
+        let sourceTime = clip.inPoint + local
+        let ratio = min(max(sourceTime / max(clip.sourceDuration, 0.000_1), 0), 0.999_999)
+        let index = min(clip.waveform.count - 1, max(0, Int(ratio * Double(clip.waveform.count))))
+        let level = min(max(clip.waveform[index] * clip.gain, 0), 1)
+        let pan = ProFeatureMath.equalPowerPan(clip.pan)
+        return (level * pan.left, level * pan.right)
+    }
+
+    func alignSelectedClips(_ alignment: ClipAlignment) {
+        guard isProMode else { return }
+        let ids = selectedClipIDs
+        let selected = (videoClips + audioClips).filter { ids.contains($0.id) }
+        guard selected.count > 1 else { return }
+        pushHistory()
+        switch alignment {
+        case .starts:
+            let target = selected.map(\.timelineStart).min() ?? 0
+            setSelectedStarts(ids, target: target)
+        case .ends:
+            let target = selected.map(\.timelineEnd).max() ?? 0
+            for id in ids {
+                if let i = videoIndex(id) {
+                    videoClips[i].timelineStart = max(0, target - videoClips[i].duration)
+                } else if let i = audioIndex(id) {
+                    audioClips[i].timelineStart = max(0, target - audioClips[i].duration)
+                }
+            }
+        case .playhead:
+            setSelectedStarts(ids, target: currentTime)
+        case .distribute:
+            let ordered = selected.sorted { $0.timelineStart < $1.timelineStart }
+            guard let first = ordered.first, let last = ordered.last else { break }
+            let totalDuration = ordered.reduce(0) { $0 + $1.duration }
+            let available = max(0, last.timelineEnd - first.timelineStart - totalDuration)
+            let gap = available / Double(max(1, ordered.count - 1))
+            var cursor = first.timelineStart
+            for clip in ordered {
+                if let i = videoIndex(clip.id) {
+                    videoClips[i].timelineStart = cursor
+                } else if let i = audioIndex(clip.id) {
+                    audioClips[i].timelineStart = cursor
+                }
+                cursor += clip.duration + gap
+            }
+        }
+        growTimelineSpan()
+        rebuild()
+    }
+
+    private func setSelectedStarts(_ ids: Set<UUID>, target: TimeInterval) {
+        for id in ids {
+            if let i = videoIndex(id) {
+                videoClips[i].timelineStart = max(0, target)
+            } else if let i = audioIndex(id) {
+                audioClips[i].timelineStart = max(0, target)
+            }
+        }
     }
 
     /// Inspector display values — primary clip; writes go to all selected.
@@ -2071,7 +2586,12 @@ final class EditorModel {
     }
     var inspectorMaxLength: TimeInterval {
         guard let clip = primarySelectedClip else { return 0.2 }
-        return max(0.2, clip.sourceDuration - clip.inPoint)
+        let mediaMax = max(0.2, clip.sourceDuration - clip.inPoint)
+        guard StillImage.isStill(clip.url) else { return mediaMax }
+        // A still's source is a long hold, not a file length. Keep the slider
+        // near the current hold; it grows as the picture is extended. Trim
+        // handles still reach `StillImage.maximumDuration`.
+        return min(mediaMax, max(60, clip.duration * 1.5))
     }
     var inspectorValuesAreMixed: Bool {
         let clips = allSelectedClips
@@ -2085,7 +2605,7 @@ final class EditorModel {
 
     func setDuckingMusic(_ enabled: Bool) {
         isDuckingMusic = enabled
-        applyFades()
+        applyFades(refreshingVideo: false)
         scheduleAutosave()
     }
 
@@ -2093,10 +2613,16 @@ final class EditorModel {
     var videoFadeOut: TimeInterval { selectedVideo?.fadeOut ?? 0 }
     var audioFadeIn: TimeInterval { selectedAudio?.fadeIn ?? 0 }
     var audioFadeOut: TimeInterval { selectedAudio?.fadeOut ?? 0 }
-    func applyFades() {
+    /// `refreshingVideo` is false for mix-only edits (gain, lane volume, pan, ducking,
+    /// audio fades). Those must not replace `videoComposition` while playback is running:
+    /// swapping the composition object drops the preview. Video fades and transforms
+    /// still rebuild it, and the replacement covers the whole item so the picture stays.
+    func applyFades(refreshingVideo: Bool = true) {
         guard let item = player.currentItem else { return }
         item.audioMix = makeAudioMix()
-        item.videoComposition = makeVideoComposition()
+        if refreshingVideo {
+            item.videoComposition = makeVideoComposition()
+        }
     }
 
     func presentExportSheet() {
@@ -2112,14 +2638,14 @@ final class EditorModel {
         let panel = NSSavePanel()
         panel.canCreateDirectories = true
         panel.isExtensionHidden = false
-        panel.title = "Export Video"
-        panel.nameFieldStringValue = "\(settings.fileBaseName).\(settings.container.pathExtension)"
-        panel.allowedContentTypes = [settings.container.contentType]
+        panel.title = settings.mode == .animatedGIF ? "Export Animated GIF" : "Export Video"
+        panel.nameFieldStringValue = "\(settings.fileBaseName).\(settings.pathExtension)"
+        panel.allowedContentTypes = [settings.contentType]
         panel.allowsOtherFileTypes = false
         guard panel.runModal() == .OK, let dest = panel.url else { return }
 
         let finalURL: URL = {
-            let ext = settings.container.pathExtension
+            let ext = settings.pathExtension
             if dest.pathExtension.lowercased() == ext { return dest }
             return dest.deletingPathExtension().appendingPathExtension(ext)
         }()
@@ -2151,6 +2677,7 @@ final class EditorModel {
         if let dest = exportDestinationURL {
             try? FileManager.default.removeItem(at: dest)
         }
+        removeExportTemporaryFiles()
         exportDestinationURL = nil
         if isExporting {
             isExporting = false
@@ -2165,6 +2692,327 @@ final class EditorModel {
             .replacingOccurrences(of: "/", with: "-")
             .replacingOccurrences(of: ":", with: "-")
         return cleaned.isEmpty ? "StudioLane" : cleaned
+    }
+
+    private func startGIFExport(
+        asset: AVAsset,
+        settings: ExportSettings,
+        destination: URL,
+        videoComposition: AVVideoComposition?
+    ) {
+        nonisolated(unsafe) let unsafeAsset = asset
+        let unsafeVideoComposition = videoComposition
+        let cancelFlag = ExportCancelFlag()
+        exportCancelFlag = cancelFlag
+        let intent = exportIntent
+        exportWriterTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await EditorModel.performGIFExport(
+                    asset: unsafeAsset,
+                    destination: destination,
+                    targetSize: settings.targetSize(source: self.exportSourceSize),
+                    fps: settings.gifFrameRate.value,
+                    compressionQuality: settings.gifPaletteQuality.compressionQuality,
+                    videoComposition: unsafeVideoComposition,
+                    byteLimit: 15_000_000,
+                    isCancelled: { cancelFlag.value },
+                    onProgress: { [weak self] value in
+                        Task { @MainActor in self?.exportProgress = value }
+                    }
+                )
+                guard self.exportIntent == intent else { return }
+                self.finishExport(success: true, destination: destination, message: nil)
+            } catch is CancellationError {
+                guard self.exportIntent == intent else { return }
+                self.finishExport(success: false, destination: destination, message: "Export cancelled", reveal: false)
+            } catch {
+                guard self.exportIntent == intent else { return }
+                self.finishExport(
+                    success: false,
+                    destination: destination,
+                    message: "GIF export failed: \(error.localizedDescription)"
+                )
+            }
+        }
+    }
+
+    /// Encodes an infinitely looping GIF and retries progressively smaller/fewer
+    /// frames when necessary to stay under X's 15 MB upload limit.
+    nonisolated static func performGIFExport(
+        asset: AVAsset,
+        destination: URL,
+        targetSize: CGSize,
+        fps: Double,
+        compressionQuality: Double,
+        videoComposition: AVVideoComposition?,
+        byteLimit: Int,
+        isCancelled: @escaping @Sendable () -> Bool,
+        onProgress: @escaping @Sendable (Double) -> Void
+    ) async throws {
+        let duration = max(0.05, try await asset.load(.duration).seconds)
+        let requestedFPS = min(max(fps, 1), 30)
+        let attempts: [(scale: CGFloat, fps: Double)] = [
+            (1, requestedFPS),
+            (0.84, min(requestedFPS, 12)),
+            (0.68, min(requestedFPS, 10)),
+            (0.52, min(requestedFPS, 8))
+        ]
+
+        for (attemptIndex, attempt) in attempts.enumerated() {
+            if isCancelled() { throw CancellationError() }
+            try? FileManager.default.removeItem(at: destination)
+
+            let generator = AVAssetImageGenerator(asset: asset)
+            generator.appliesPreferredTrackTransform = true
+            generator.videoComposition = videoComposition
+            generator.maximumSize = CGSize(
+                width: max(2, targetSize.width * attempt.scale),
+                height: max(2, targetSize.height * attempt.scale)
+            )
+            generator.requestedTimeToleranceBefore = CMTime(
+                seconds: 0.5 / attempt.fps,
+                preferredTimescale: 600
+            )
+            generator.requestedTimeToleranceAfter = generator.requestedTimeToleranceBefore
+
+            let frameCount = max(1, Int(ceil(duration * attempt.fps)))
+            guard let gif = CGImageDestinationCreateWithURL(
+                destination as CFURL,
+                UTType.gif.identifier as CFString,
+                frameCount,
+                nil
+            ) else {
+                throw NSError(
+                    domain: "StudioAudioLane.GIF",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Could not create the GIF destination."]
+                )
+            }
+            CGImageDestinationSetProperties(gif, [
+                kCGImagePropertyGIFDictionary: [
+                    kCGImagePropertyGIFLoopCount: 0
+                ]
+            ] as CFDictionary)
+
+            let delay = 1 / attempt.fps
+            let frameProperties: [CFString: Any] = [
+                kCGImagePropertyGIFDictionary: [
+                    kCGImagePropertyGIFUnclampedDelayTime: delay,
+                    kCGImagePropertyGIFDelayTime: delay
+                ],
+                kCGImageDestinationLossyCompressionQuality: min(max(compressionQuality, 0), 1)
+            ]
+            for frame in 0..<frameCount {
+                if isCancelled() { throw CancellationError() }
+                let seconds = min(
+                    max(0, duration - 1.0 / 600.0),
+                    (Double(frame) + 0.5) / attempt.fps
+                )
+                let (image, _) = try await generator.image(at: CMTime(
+                    seconds: seconds,
+                    preferredTimescale: 600
+                ))
+                CGImageDestinationAddImage(gif, image, frameProperties as CFDictionary)
+                let attemptBase = Double(attemptIndex) / Double(attempts.count)
+                let attemptSpan = 1 / Double(attempts.count)
+                onProgress(min(0.99, attemptBase + attemptSpan * Double(frame + 1) / Double(frameCount)))
+            }
+            guard CGImageDestinationFinalize(gif) else {
+                throw NSError(
+                    domain: "StudioAudioLane.GIF",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "ImageIO could not finalize the GIF."]
+                )
+            }
+
+            let bytes = (try? destination.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? Int.max
+            if bytes <= byteLimit {
+                onProgress(1)
+                return
+            }
+        }
+
+        let bytes = (try? destination.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        try? FileManager.default.removeItem(at: destination)
+        throw NSError(
+            domain: "StudioAudioLane.GIF",
+            code: 3,
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    String(format: "The smallest retry was %.1f MB. Shorten the timeline or choose 480 px / 8 fps.", Double(bytes) / 1_000_000)
+            ]
+        )
+    }
+
+    private func startXLoopExport(
+        asset: AVAsset,
+        settings: ExportSettings,
+        destination: URL,
+        videoComposition: AVVideoComposition?,
+        audioMix: AVAudioMix?
+    ) {
+        let temporary = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StudioLane-XLoop-\(UUID().uuidString)")
+            .appendingPathExtension("mp4")
+        try? FileManager.default.removeItem(at: temporary)
+        exportTemporaryURLs.insert(temporary)
+
+        let targetSize = settings.targetSize(source: exportSourceSize)
+        let videoBitRate = settings.quality.approximateBitRate(
+            pixelCount: targetSize.width * targetSize.height
+        )
+        nonisolated(unsafe) let unsafeAsset = asset
+        let unsafeVideoComposition = videoComposition
+        nonisolated(unsafe) let unsafeAudioMix = audioMix
+        let cancelFlag = ExportCancelFlag()
+        exportCancelFlag = cancelFlag
+        let intent = exportIntent
+        exportWriterTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await EditorModel.performWriterExport(
+                    asset: unsafeAsset,
+                    destination: temporary,
+                    fileType: .mp4,
+                    codec: .h264,
+                    targetSize: targetSize,
+                    fps: 30,
+                    videoBitRate: videoBitRate,
+                    audioBitRate: 128_000,
+                    sampleRate: 48_000,
+                    videoComposition: unsafeVideoComposition,
+                    audioMix: unsafeAudioMix,
+                    isCancelled: { cancelFlag.value },
+                    onProgress: { [weak self] value in
+                        Task { @MainActor in self?.exportProgress = value * 0.8 }
+                    }
+                )
+                guard self.exportIntent == intent else { return }
+                if settings.xLoopCount == 1 {
+                    try? FileManager.default.removeItem(at: destination)
+                    try FileManager.default.moveItem(at: temporary, to: destination)
+                    self.exportTemporaryURLs.remove(temporary)
+                    self.finishExport(success: true, destination: destination, message: nil)
+                } else {
+                    await self.finishRepeatedXLoop(
+                        flattenedURL: temporary,
+                        count: settings.xLoopCount,
+                        destination: destination,
+                        intent: intent
+                    )
+                }
+            } catch is CancellationError {
+                guard self.exportIntent == intent else { return }
+                self.finishExport(
+                    success: false,
+                    destination: destination,
+                    message: "Export cancelled",
+                    reveal: false
+                )
+            } catch {
+                guard self.exportIntent == intent else { return }
+                self.finishExport(
+                    success: false,
+                    destination: destination,
+                    message: "X loop encoding failed: \(error.localizedDescription)"
+                )
+            }
+        }
+    }
+
+    private func finishRepeatedXLoop(
+        flattenedURL: URL,
+        count: Int,
+        destination: URL,
+        intent: Int
+    ) async {
+        do {
+            let flattened = AVURLAsset(url: flattenedURL)
+            let repeated = try await Self.makeRepeatedComposition(from: flattened, count: count)
+
+            guard exportIntent == intent, isExporting else { return }
+            try? FileManager.default.removeItem(at: destination)
+            guard let exporter = AVAssetExportSession(
+                asset: repeated,
+                presetName: AVAssetExportPresetPassthrough
+            ) else {
+                throw NSError(
+                    domain: "StudioAudioLane.XLoop",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Could not create the repeated MP4 export."]
+                )
+            }
+            exporter.outputURL = destination
+            exporter.outputFileType = .mp4
+            exporter.shouldOptimizeForNetworkUse = true
+            activeExportSession = exporter
+            startExportProgressTimer(base: 0.8, span: 0.2)
+            let exporterID = ObjectIdentifier(exporter)
+            exporter.exportAsynchronously { [weak self] in
+                let result = exporter.status
+                let message = exporter.error?.localizedDescription
+                Task { @MainActor in
+                    guard let self,
+                          self.exportIntent == intent,
+                          self.activeExportSession.map(ObjectIdentifier.init) == exporterID else { return }
+                    self.activeExportSession = nil
+                    if result == .completed {
+                        self.finishExport(success: true, destination: destination, message: nil)
+                    } else {
+                        self.finishExport(
+                            success: false,
+                            destination: destination,
+                            message: result == .cancelled ? "Export cancelled" : (message ?? "Could not repeat the X loop"),
+                            reveal: result != .cancelled
+                        )
+                    }
+                }
+            }
+        } catch {
+            guard exportIntent == intent else { return }
+            finishExport(
+                success: false,
+                destination: destination,
+                message: "Could not repeat X loop: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    static func makeRepeatedComposition(from asset: AVAsset, count: Int) async throws -> AVMutableComposition {
+        let repetitions = max(1, min(10, count))
+        let sourceDuration = try await asset.load(.duration)
+        let sourceRange = CMTimeRange(start: .zero, duration: sourceDuration)
+        let repeated = AVMutableComposition()
+
+        for source in try await asset.loadTracks(withMediaType: .video) {
+            guard let track = repeated.addMutableTrack(
+                withMediaType: .video,
+                preferredTrackID: source.trackID
+            ) else { continue }
+            track.preferredTransform = try await source.load(.preferredTransform)
+            for repetition in 0..<repetitions {
+                try track.insertTimeRange(
+                    sourceRange,
+                    of: source,
+                    at: CMTimeMultiply(sourceDuration, multiplier: Int32(repetition))
+                )
+            }
+        }
+        for source in try await asset.loadTracks(withMediaType: .audio) {
+            guard let track = repeated.addMutableTrack(
+                withMediaType: .audio,
+                preferredTrackID: source.trackID
+            ) else { continue }
+            for repetition in 0..<repetitions {
+                try track.insertTimeRange(
+                    sourceRange,
+                    of: source,
+                    at: CMTimeMultiply(sourceDuration, multiplier: Int32(repetition))
+                )
+            }
+        }
+        return repeated
     }
 
     private func startSessionExport(
@@ -2242,8 +3090,9 @@ final class EditorModel {
         let sourceSize = exportSourceSize
         let targetSize = settings.targetSize(source: sourceSize)
         let fps = settings.frameRate.seconds.map { 1.0 / $0 } ?? exportSourceFPS
-        let videoBitRate = settings.quality.approximateBitRate(pixelCount: targetSize.width * targetSize.height)
+        let videoBitRate = settings.videoBitRate(pixelCount: targetSize.width * targetSize.height)
         let audioBitRate = settings.audioBitrate.bitsPerSecond ?? 192_000
+        let sampleRate = isProMode ? proSettings.sampleRate : 48_000
         let codec = settings.codec
         let fileType = settings.container.fileType
 
@@ -2275,6 +3124,7 @@ final class EditorModel {
                     fps: fps,
                     videoBitRate: videoBitRate,
                     audioBitRate: audioBitRate,
+                    sampleRate: sampleRate,
                     videoComposition: unsafeVideoComposition,
                     audioMix: unsafeAudioMix,
                     isCancelled: { cancelFlag.value },
@@ -2308,6 +3158,7 @@ final class EditorModel {
         fps: Double,
         videoBitRate: Int,
         audioBitRate: Int,
+        sampleRate: Double,
         videoComposition: AVVideoComposition?,
         audioMix: AVAudioMix?,
         isCancelled: @escaping @Sendable () -> Bool,
@@ -2384,7 +3235,7 @@ final class EditorModel {
             AVLinearPCMIsFloatKey: false,
             AVLinearPCMIsNonInterleaved: false,
             AVNumberOfChannelsKey: 2,
-            AVSampleRateKey: 48_000
+            AVSampleRateKey: sampleRate
         ]
 
         var writerAudio: AVAssetWriterInput?
@@ -2393,7 +3244,7 @@ final class EditorModel {
             let audioSettings: [String: Any] = [
                 AVFormatIDKey: kAudioFormatMPEG4AAC,
                 AVNumberOfChannelsKey: 2,
-                AVSampleRateKey: 48_000,
+                AVSampleRateKey: sampleRate,
                 AVEncoderBitRateKey: audioBitRate
             ]
             let input = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
@@ -2603,12 +3454,13 @@ final class EditorModel {
         }
     }
 
-    private func startExportProgressTimer() {
+    private func startExportProgressTimer(base: Double = 0, span: Double = 1) {
         stopExportProgressTimer()
         exportProgressTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
-                self.exportProgress = min(0.99, max(0, Double(self.activeExportSession?.progress ?? 0)))
+                let progress = Double(self.activeExportSession?.progress ?? 0)
+                self.exportProgress = min(0.99, max(0, base + progress * span))
             }
         }
     }
@@ -2623,6 +3475,7 @@ final class EditorModel {
         activeExportSession = nil
         exportWriterTask = nil
         exportCancelFlag = nil
+        removeExportTemporaryFiles()
         isExporting = false
         exportDestinationURL = nil
 
@@ -2631,7 +3484,10 @@ final class EditorModel {
 
         if ok {
             let bytes = (try? FileManager.default.attributesOfItem(atPath: destination.path)[.size] as? NSNumber)?.intValue ?? 0
-            if bytes < 1024 {
+            // A small, flat-color GIF can legitimately be only a few hundred
+            // bytes; movie containers need a larger floor to catch truncation.
+            let minimumBytes = destination.pathExtension.lowercased() == "gif" ? 32 : 1024
+            if bytes < minimumBytes {
                 ok = false
                 failMessage = "Export produced an empty or truncated file (\(bytes) bytes)"
                 try? FileManager.default.removeItem(at: destination)
@@ -2662,11 +3518,21 @@ final class EditorModel {
         }
     }
 
+    private func removeExportTemporaryFiles() {
+        for url in exportTemporaryURLs {
+            try? FileManager.default.removeItem(at: url)
+        }
+        exportTemporaryURLs.removeAll()
+    }
+
     private func makeExportVideoComposition(settings: ExportSettings) -> AVVideoComposition? {
         guard let track = mix.track(withTrackID: 1), !videoClips.isEmpty else { return nil }
         let sourceSize = exportSourceSize
         let targetSize = settings.targetSize(source: sourceSize)
         let outFrameDuration: CMTime = {
+            if settings.mode == .animatedGIF {
+                return CMTime(seconds: 1 / settings.gifFrameRate.value, preferredTimescale: 600)
+            }
             if let seconds = settings.frameRate.seconds {
                 return CMTime(seconds: seconds, preferredTimescale: 600)
             }
@@ -2674,10 +3540,11 @@ final class EditorModel {
         }()
 
         let hasFades = videoClips.contains { $0.fadeIn > 0.01 || $0.fadeOut > 0.01 }
+        let hasEffects = hasFades || hasProVideoEffects
         let sizeChanged = abs(targetSize.width - sourceSize.width) > 0.5
             || abs(targetSize.height - sourceSize.height) > 0.5
-        let fpsChanged = settings.frameRate != .original
-        guard hasFades || sizeChanged || fpsChanged else {
+        let fpsChanged = settings.frameRate != .original || settings.mode == .animatedGIF
+        guard hasEffects || sizeChanged || fpsChanged else {
             // Keep any existing preview composition (fade ramps).
             return player.currentItem?.videoComposition
         }
@@ -2692,12 +3559,11 @@ final class EditorModel {
         let ty = (targetSize.height - scaled.height) * 0.5
         let transform = CGAffineTransform(a: scale, b: 0, c: 0, d: scale, tx: tx, ty: ty)
 
-        var instructions: [AVVideoCompositionInstructionProtocol] = []
+        var instructions: [AVMutableVideoCompositionInstruction] = []
         let timelineEnd = max(videoClips.map(\.timelineEnd).max() ?? 0.05, 0.05)
 
-        if hasFades {
+        if hasEffects {
             for segment in renderSegments() {
-                let clip = segment.clip
                 // Instruction ranges come from the *actual* on-track segment (same rule as
                 // preview), so export can't diverge from the preview or hand AVFoundation
                 // overlapping instructions when clips overlap on the single composition track.
@@ -2707,31 +3573,12 @@ final class EditorModel {
                     duration: CMTime(seconds: segment.duration, preferredTimescale: 600)
                 )
                 let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
-                if sizeChanged {
-                    layer.setTransform(transform, at: .zero)
-                }
-                let fadeIn = min(max(0, clip.fadeIn), segment.duration / 2)
-                let fadeOut = min(max(0, clip.fadeOut), segment.duration - fadeIn)
-                if fadeIn > 0.01 {
-                    layer.setOpacityRamp(
-                        fromStartOpacity: 0,
-                        toEndOpacity: 1,
-                        timeRange: CMTimeRange(
-                            start: CMTime(seconds: segment.at, preferredTimescale: 600),
-                            duration: CMTime(seconds: fadeIn, preferredTimescale: 600)
-                        )
-                    )
-                }
-                if fadeOut > 0.01 {
-                    layer.setOpacityRamp(
-                        fromStartOpacity: 1,
-                        toEndOpacity: 0,
-                        timeRange: CMTimeRange(
-                            start: CMTime(seconds: segment.at + segment.duration - fadeOut, preferredTimescale: 600),
-                            duration: CMTime(seconds: fadeOut, preferredTimescale: 600)
-                        )
-                    )
-                }
+                configureVideoLayer(
+                    layer,
+                    segment: segment,
+                    canvasSize: targetSize,
+                    baseTransform: sizeChanged ? transform : .identity
+                )
                 instruction.layerInstructions = [layer]
                 instructions.append(instruction)
             }
@@ -2749,13 +3596,14 @@ final class EditorModel {
             instructions.append(instruction)
         }
 
-        composition.instructions = instructions
+        composition.instructions = instructionsCoveringPlayback(instructions)
         return composition
     }
 
     private func loadDefaults() async {
         isLoading = true
         status = "Opening…"
+        isProMode = UserDefaults.standard.bool(forKey: Self.proModeDefaultsKey)
         ensureDefaultTracks()
         if !restoreAutosave() {
             status = "Drop media to begin"
@@ -2923,6 +3771,33 @@ final class EditorModel {
         trackID: UUID,
         requiresMediaType: AVMediaType? = nil
     ) async -> MediaClip? {
+        if StillImage.isStill(url) {
+            if requiresMediaType == .audio {
+                errorMessage = "“\(url.lastPathComponent)” is an image — place it on a video lane."
+                return nil
+            }
+            // Pictures have no duration of their own. Prepare the cached movie now
+            // so a file ImageIO cannot read never becomes an empty clip.
+            do {
+                _ = try await StillImage.movieURL(for: url)
+            } catch {
+                errorMessage = error.localizedDescription
+                return nil
+            }
+            let dur = StillImage.defaultDuration
+            return MediaClip(
+                id: UUID(),
+                url: url,
+                name: url.deletingPathExtension().lastPathComponent,
+                sourceDuration: StillImage.maximumDuration,
+                inPoint: 0,
+                timelineStart: start,
+                duration: dur,
+                fadeIn: min(fade, dur / 2),
+                fadeOut: min(fade, dur / 2),
+                trackID: trackID
+            )
+        }
         let asset = AVURLAsset(url: url)
         let source = (try? await asset.load(.duration).seconds) ?? 0
         guard source.isFinite, source > 0 else {
@@ -3090,6 +3965,12 @@ final class EditorModel {
     private func audioIndex(_ id: UUID) -> Int? { audioClips.firstIndex(where: { $0.id == id }) }
     private func videoIndex(_ id: UUID) -> Int? { videoClips.firstIndex(where: { $0.id == id }) }
 
+    /// Direct manipulation preserves a multi-selection when its anchor is already
+    /// selected. Clicking a handle on an unselected clip edits only that clip.
+    private func directEditClipIDs(anchor id: UUID) -> Set<UUID> {
+        selectedClipIDs.contains(id) ? selectedClipIDs : [id]
+    }
+
     private func mutateSelectedVideo(_ body: (inout MediaClip) -> Void) {
         let ids = selectedClipIDs.isEmpty ? Set([selectedVideo?.id].compactMap { $0 }) : selectedClipIDs
         var any = false
@@ -3111,11 +3992,17 @@ final class EditorModel {
             audioClips[i].clampFades()
             any = true
         }
-        if any { applyFades() }
+        if any { applyFades(refreshingVideo: false) }
     }
 
     private func rebuildComposition() async {
         growTimelineSpan()
+        if isProMode {
+            frameDuration = CMTime(
+                seconds: 1 / max(1, proSettings.frameRate),
+                preferredTimescale: 60_000
+            )
+        }
         if Task.isCancelled { return }
         do {
             let rebuiltMix = AVMutableComposition()
@@ -3137,8 +4024,31 @@ final class EditorModel {
             // its instructions from the same segments so they can't disagree.
             for segment in renderSegments() {
                 if Task.isCancelled { return }
+                guard let videoTrack else { continue }
+                if StillImage.isStill(segment.clip.url) {
+                    do {
+                        let movie = try await StillImage.movieURL(for: segment.clip.url)
+                        // The picture has no time axis. `segment.sourceStart` only records
+                        // a trim; reading it as a movie offset would run past the one-second cache.
+                        let placed = try await StillImage.place(
+                            movieURL: movie,
+                            on: videoTrack,
+                            at: segment.at,
+                            duration: segment.duration
+                        )
+                        if placed.renderSize.width > 1, placed.renderSize.height > 1 {
+                            renderSize = placed.renderSize
+                        }
+                        if !isProMode, placed.frameRate > 1 {
+                            frameDuration = CMTime(value: 1, timescale: CMTimeScale(max(1, Int(placed.frameRate.rounded()))))
+                        }
+                    } catch {
+                        errorMessage = error.localizedDescription
+                    }
+                    continue
+                }
                 let asset = AVURLAsset(url: segment.clip.url)
-                guard let src = try await asset.loadTracks(withMediaType: .video).first, let videoTrack else { continue }
+                guard let src = try await asset.loadTracks(withMediaType: .video).first else { continue }
                 try videoTrack.insertTimeRange(
                     CMTimeRange(start: CMTime(seconds: segment.sourceStart, preferredTimescale: 600), duration: CMTime(seconds: segment.duration, preferredTimescale: 600)),
                     of: src,
@@ -3150,7 +4060,7 @@ final class EditorModel {
                 let rendered = CGRect(origin: .zero, size: natural).applying(transform)
                 renderSize = CGSize(width: abs(rendered.width), height: abs(rendered.height))
                 let fps = try await src.load(.nominalFrameRate)
-                if fps > 1 {
+                if !isProMode, fps > 1 {
                     frameDuration = CMTime(value: 1, timescale: CMTimeScale(max(1, Int(fps.rounded()))))
                 }
             }
@@ -3159,6 +4069,9 @@ final class EditorModel {
             // `AVAudioMixInputParameters` per clip (a shared track drops earlier clips' fades).
             for clip in videoClips.sorted(by: { $0.timelineStart < $1.timelineStart }) {
                 if Task.isCancelled { return }
+                // A still has no soundtrack. Probing the image file for audio throws
+                // and would discard the whole preview composition.
+                if StillImage.isStill(clip.url) { continue }
                 let asset = AVURLAsset(url: clip.url)
                 guard let src = try await asset.loadTracks(withMediaType: .audio).first else { continue }
                 guard let track = rebuiltMix.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) else { continue }
@@ -3252,6 +4165,13 @@ final class EditorModel {
             } else {
                 p.setVolume(vol, at: CMTime(seconds: start, preferredTimescale: 600))
             }
+            if isProMode,
+               let tap = ProAudioProcessor.makeTap(
+                   pan: clip.pan,
+                   limiterEnabled: proSettings.limiterEnabled
+               ) {
+                p.audioTapProcessor = tap
+            }
             if fadeOut > 0.01 && vol > 0 {
                 p.setVolumeRamp(
                     fromStartVolume: vol,
@@ -3316,15 +4236,197 @@ final class EditorModel {
         return segments
     }
 
+    private var hasProVideoEffects: Bool {
+        guard isProMode else { return false }
+        return videoClips.contains {
+            $0.transform != .identity
+                || !$0.transformKeyframes.isEmpty
+                || $0.transitionIn.style != .none
+                || $0.transitionOut.style != .none
+        }
+    }
+
+    private func transformValue(for clip: MediaClip, at localTime: TimeInterval) -> ClipTransform {
+        let keyframes = clip.transformKeyframes.sorted { $0.time < $1.time }
+        guard !keyframes.isEmpty else { return clip.transform }
+        if localTime <= keyframes[0].time {
+            guard keyframes[0].time > 0 else { return keyframes[0].transform }
+            return .interpolated(
+                from: clip.transform,
+                to: keyframes[0].transform,
+                progress: localTime / keyframes[0].time
+            )
+        }
+        for pair in zip(keyframes, keyframes.dropFirst()) where localTime <= pair.1.time {
+            let span = max(0.000_1, pair.1.time - pair.0.time)
+            return .interpolated(
+                from: pair.0.transform,
+                to: pair.1.transform,
+                progress: (localTime - pair.0.time) / span
+            )
+        }
+        return keyframes.last?.transform ?? clip.transform
+    }
+
+    private func configureVideoLayer(
+        _ layer: AVMutableVideoCompositionLayerInstruction,
+        segment: VideoRenderSegment,
+        canvasSize: CGSize,
+        baseTransform: CGAffineTransform = .identity
+    ) {
+        let clip = segment.clip
+        let localStart = max(0, segment.at - clip.timelineStart)
+        let localEnd = localStart + segment.duration
+        let segmentStart = CMTime(seconds: segment.at, preferredTimescale: 600)
+        let baseAtStart = transformValue(for: clip, at: localStart)
+
+        if isProMode, !clip.transformKeyframes.isEmpty {
+            var points: [(TimeInterval, ClipTransform)] = [(localStart, baseAtStart)]
+            points += clip.transformKeyframes
+                .filter { $0.time > localStart + 0.000_1 && $0.time < localEnd - 0.000_1 }
+                .map { ($0.time, $0.transform) }
+            points.append((localEnd, transformValue(for: clip, at: localEnd)))
+            for pair in zip(points, points.dropFirst()) {
+                let start = segment.at + pair.0.0 - localStart
+                let span = max(0.000_1, pair.1.0 - pair.0.0)
+                let range = CMTimeRange(
+                    start: CMTime(seconds: start, preferredTimescale: 600),
+                    duration: CMTime(seconds: span, preferredTimescale: 600)
+                )
+                layer.setTransformRamp(
+                    fromStart: pair.0.1.affineTransform(canvasSize: canvasSize, base: baseTransform),
+                    toEnd: pair.1.1.affineTransform(canvasSize: canvasSize, base: baseTransform),
+                    timeRange: range
+                )
+                layer.setOpacityRamp(
+                    fromStartOpacity: Float(pair.0.1.opacity),
+                    toEndOpacity: Float(pair.1.1.opacity),
+                    timeRange: range
+                )
+            }
+        } else {
+            layer.setTransform(
+                baseAtStart.affineTransform(canvasSize: canvasSize, base: baseTransform),
+                at: segmentStart
+            )
+            layer.setOpacity(Float(baseAtStart.opacity), at: segmentStart)
+        }
+
+        let fadeIn = min(max(0, clip.fadeIn), segment.duration / 2)
+        let fadeOut = min(max(0, clip.fadeOut), segment.duration - fadeIn)
+        if fadeIn > 0.01 {
+            layer.setOpacityRamp(
+                fromStartOpacity: 0,
+                toEndOpacity: Float(baseAtStart.opacity),
+                timeRange: CMTimeRange(
+                    start: segmentStart,
+                    duration: CMTime(seconds: fadeIn, preferredTimescale: 600)
+                )
+            )
+        }
+        if fadeOut > 0.01 {
+            let endOpacity = transformValue(for: clip, at: localEnd).opacity
+            layer.setOpacityRamp(
+                fromStartOpacity: Float(endOpacity),
+                toEndOpacity: 0,
+                timeRange: CMTimeRange(
+                    start: CMTime(seconds: segment.at + segment.duration - fadeOut, preferredTimescale: 600),
+                    duration: CMTime(seconds: fadeOut, preferredTimescale: 600)
+                )
+            )
+        }
+
+        guard isProMode else { return }
+        if localStart < 0.000_1 {
+            applyTransition(
+                clip.transitionIn,
+                incoming: true,
+                layer: layer,
+                clip: clip,
+                canvasSize: canvasSize,
+                baseTransform: baseTransform,
+                timelineStart: segment.at,
+                localTime: 0,
+                maximumDuration: segment.duration
+            )
+        }
+        if abs(localEnd - clip.duration) < 0.001 {
+            applyTransition(
+                clip.transitionOut,
+                incoming: false,
+                layer: layer,
+                clip: clip,
+                canvasSize: canvasSize,
+                baseTransform: baseTransform,
+                timelineStart: segment.at + segment.duration,
+                localTime: clip.duration,
+                maximumDuration: segment.duration
+            )
+        }
+    }
+
+    private func applyTransition(
+        _ transition: ClipTransition,
+        incoming: Bool,
+        layer: AVMutableVideoCompositionLayerInstruction,
+        clip: MediaClip,
+        canvasSize: CGSize,
+        baseTransform: CGAffineTransform,
+        timelineStart: TimeInterval,
+        localTime: TimeInterval,
+        maximumDuration: TimeInterval
+    ) {
+        guard transition.style != .none else { return }
+        let duration = min(max(0, transition.duration), maximumDuration / 2)
+        guard duration > 0.001 else { return }
+        let rangeStart = incoming ? timelineStart : timelineStart - duration
+        let range = CMTimeRange(
+            start: CMTime(seconds: rangeStart, preferredTimescale: 600),
+            duration: CMTime(seconds: duration, preferredTimescale: 600)
+        )
+        let settled = transformValue(for: clip, at: localTime)
+        let settledTransform = settled.affineTransform(canvasSize: canvasSize, base: baseTransform)
+        switch transition.style {
+        case .none:
+            break
+        case .dissolve:
+            layer.setOpacityRamp(
+                fromStartOpacity: incoming ? 0 : Float(settled.opacity),
+                toEndOpacity: incoming ? Float(settled.opacity) : 0,
+                timeRange: range
+            )
+        case .slide:
+            let displaced = settledTransform.translatedBy(
+                x: incoming ? -canvasSize.width * 0.18 : canvasSize.width * 0.18,
+                y: 0
+            )
+            layer.setTransformRamp(
+                fromStart: incoming ? displaced : settledTransform,
+                toEnd: incoming ? settledTransform : displaced,
+                timeRange: range
+            )
+        case .zoom:
+            let zoomed = settledTransform
+                .translatedBy(x: canvasSize.width / 2, y: canvasSize.height / 2)
+                .scaledBy(x: incoming ? 0.82 : 1.18, y: incoming ? 0.82 : 1.18)
+                .translatedBy(x: -canvasSize.width / 2, y: -canvasSize.height / 2)
+            layer.setTransformRamp(
+                fromStart: incoming ? zoomed : settledTransform,
+                toEnd: incoming ? settledTransform : zoomed,
+                timeRange: range
+            )
+        }
+    }
+
     private func makeVideoComposition() -> AVVideoComposition? {
         guard let track = mix.track(withTrackID: 1), !videoClips.isEmpty else { return nil }
-        guard videoClips.contains(where: { $0.fadeIn > 0.01 || $0.fadeOut > 0.01 }) else { return nil }
+        guard videoClips.contains(where: { $0.fadeIn > 0.01 || $0.fadeOut > 0.01 })
+                || hasProVideoEffects else { return nil }
         let composition = AVMutableVideoComposition()
         composition.renderSize = renderSize.width > 1 ? renderSize : CGSize(width: 1080, height: 1920)
         composition.frameDuration = frameDuration
-        var instructions: [AVVideoCompositionInstructionProtocol] = []
+        var instructions: [AVMutableVideoCompositionInstruction] = []
         for segment in renderSegments() {
-            let clip = segment.clip
             // Instruction ranges come from the *actual* on-track segment, not the model's
             // timeline range — a partially-overlapped clip only owns its rendered tail, and a
             // fully-overlapped clip isn't in `segments` at all, so no two instructions overlap.
@@ -3334,33 +4436,44 @@ final class EditorModel {
                 duration: CMTime(seconds: segment.duration, preferredTimescale: 600)
             )
             let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
-            let fadeIn = min(max(0, clip.fadeIn), segment.duration / 2)
-            let fadeOut = min(max(0, clip.fadeOut), segment.duration - fadeIn)
-            if fadeIn > 0.01 {
-                layer.setOpacityRamp(
-                    fromStartOpacity: 0,
-                    toEndOpacity: 1,
-                    timeRange: CMTimeRange(
-                        start: CMTime(seconds: segment.at, preferredTimescale: 600),
-                        duration: CMTime(seconds: fadeIn, preferredTimescale: 600)
-                    )
-                )
-            }
-            if fadeOut > 0.01 {
-                layer.setOpacityRamp(
-                    fromStartOpacity: 1,
-                    toEndOpacity: 0,
-                    timeRange: CMTimeRange(
-                        start: CMTime(seconds: segment.at + segment.duration - fadeOut, preferredTimescale: 600),
-                        duration: CMTime(seconds: fadeOut, preferredTimescale: 600)
-                    )
-                )
-            }
+            configureVideoLayer(layer, segment: segment, canvasSize: composition.renderSize)
             instruction.layerInstructions = [layer]
             instructions.append(instruction)
         }
-        composition.instructions = instructions
+        guard !instructions.isEmpty else { return nil }
+        composition.instructions = instructionsCoveringPlayback(instructions)
         return composition
+    }
+
+    /// AVPlayer drops the entire preview when a video composition leaves any hole in
+    /// the player item, even a single tick past the video track where an audio edit
+    /// rounded longer. Fill those holes with empty instructions so the picture stays
+    /// up for the whole item. The empty spans are the regions with no video.
+    private func instructionsCoveringPlayback(
+        _ segmentInstructions: [AVMutableVideoCompositionInstruction]
+    ) -> [AVVideoCompositionInstructionProtocol] {
+        var covered: [AVMutableVideoCompositionInstruction] = []
+        var cursor = CMTime.zero
+        for instruction in segmentInstructions {
+            let start = instruction.timeRange.start
+            let end = instruction.timeRange.end
+            if CMTimeCompare(start, cursor) > 0 {
+                let gap = AVMutableVideoCompositionInstruction()
+                gap.timeRange = CMTimeRange(start: cursor, end: start)
+                gap.layerInstructions = []
+                covered.append(gap)
+            }
+            covered.append(instruction)
+            cursor = end
+        }
+        let itemEnd = mix.duration
+        if itemEnd.isNumeric, CMTimeCompare(itemEnd, cursor) > 0 {
+            let gap = AVMutableVideoCompositionInstruction()
+            gap.timeRange = CMTimeRange(start: cursor, end: itemEnd)
+            gap.layerInstructions = []
+            covered.append(gap)
+        }
+        return covered
     }
 
     private func installTimeObserver() {
@@ -3409,18 +4522,37 @@ final class EditorModel {
             }
             let command = event.modifierFlags.contains(.command)
             let option = event.modifierFlags.contains(.option)
+            let control = event.modifierFlags.contains(.control)
             let shift = event.modifierFlags.contains(.shift)
             // Undo = ⌘Z (keyCode 6); redo = ⇧⌘Z (keyCode 6 + shift) or ⌘Y (keyCode 16).
             // keyCode 7 is ⌘X (Cut) — never map it to redo, so Cut stays free.
             if command && !shift && event.keyCode == 6 { self.undo(); return nil }
             if (command && shift && event.keyCode == 6) || (command && event.keyCode == 16) { self.redo(); return nil }
             if command && event.keyCode == 2 { self.duplicateSelectedClip(); return nil }
+            // Standard Mac +/= and - keys. Accept either shifted + or unshifted =
+            // so keyboard layout details do not make zoom-in unreachable.
+            if command && event.keyCode == 24 { self.zoomIn(); return nil }
+            if command && event.keyCode == 27 { self.zoomOut(); return nil }
             if event.keyCode == 1 && !command { self.splitSelectedAtPlayhead(); return nil } // S (not ⌘S)
-            // Option+← / Option+→ — previous / next music clip
-            if option && event.keyCode == 124 { self.seekToNextMusicClip(); return nil }
-            if option && event.keyCode == 123 { self.seekToPreviousMusicClip(); return nil }
-            if event.keyCode == 124 { self.selectNextClip(); return nil }
-            if event.keyCode == 123 { self.selectPreviousClip(); return nil }
+            if event.keyCode == 123 || event.keyCode == 124 {
+                let direction = event.keyCode == 124 ? 1 : -1
+                if command {
+                    direction > 0 ? self.selectNextClip() : self.selectPreviousClip()
+                    return nil
+                }
+                if option && control {
+                    if self.nudgeSelectedAudio(samples: direction * (shift ? 10 : 1)) { return nil }
+                } else if option {
+                    if self.nudgeSelectedAudio(milliseconds: Double(direction * (shift ? 10 : 1))) { return nil }
+                    direction > 0 ? self.seekToNextMusicClip() : self.seekToPreviousMusicClip()
+                    return nil
+                } else if self.nudgeSelectedByFrames(direction * (shift ? 10 : 1)) {
+                    return nil
+                } else {
+                    direction > 0 ? self.selectNextClip() : self.selectPreviousClip()
+                    return nil
+                }
+            }
             // I / O — mark loop in/out; L — toggle loop
             if event.keyCode == 34 && !command { self.markLoopIn(); return nil }
             if event.keyCode == 31 && !command { self.markLoopOut(); return nil }
@@ -3429,7 +4561,6 @@ final class EditorModel {
                 self.deleteSelectedClips(preferringLane: self.focusedLane)
                 return nil
             }
-            _ = shift // reserved; Shift+click handled in views
             return event
         }
     }
@@ -3567,7 +4698,14 @@ enum Waveform {
 
 enum Filmstrip {
     nonisolated static func generate(url: URL, count: Int, inPoint: TimeInterval = 0, duration: TimeInterval? = nil) async -> [CGImage] {
-        await Task.detached(priority: .userInitiated) {
+        if StillImage.isStill(url) {
+            let frames = max(1, count)
+            return await Task.detached(priority: .userInitiated) {
+                guard let image = StillImage.thumbnail(at: url) else { return [] }
+                return Array(repeating: image, count: frames)
+            }.value
+        }
+        return await Task.detached(priority: .userInitiated) {
             let asset = AVURLAsset(url: url)
             let generator = AVAssetImageGenerator(asset: asset)
             generator.appliesPreferredTrackTransform = true

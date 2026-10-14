@@ -13,6 +13,11 @@ let package = Package(
         .executableTarget(
             name: "StudioAudioLane",
             path: "Sources/StudioAudioLane"
+        ),
+        .testTarget(
+            name: "StudioAudioLaneTests",
+            dependencies: ["StudioAudioLane"],
+            path: "Tests/StudioAudioLaneTests"
         )
     ]
 )
