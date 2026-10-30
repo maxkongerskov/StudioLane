@@ -143,7 +143,7 @@ struct TitleBar: View {
     }
 
     private var exportEnabled: Bool {
-        !model.isExporting && model.hasVideo
+        !model.isExporting && (model.hasVideo || model.hasMusic)
     }
 
     private var titleText: String {

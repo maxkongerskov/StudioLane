@@ -828,6 +828,14 @@ final class EditorModel {
         let audioMix = item.audioMix ?? makeAudioMix()
 
         switch settings.mode {
+        case .audio:
+            status = "Exporting… (audio \(settings.audioFormat.rawValue))"
+            startAudioExport(
+                asset: item.asset,
+                settings: settings,
+                destination: destination,
+                audioMix: audioMix
+            )
         case .animatedGIF:
             status = "Exporting… (animated GIF)"
             startGIFExport(
@@ -2626,7 +2634,7 @@ final class EditorModel {
     }
 
     func presentExportSheet() {
-        guard hasVideo, !isExporting else { return }
+        guard hasVideo || hasMusic, !isExporting else { return }
         isExportSheetPresented = true
     }
 
@@ -2638,7 +2646,11 @@ final class EditorModel {
         let panel = NSSavePanel()
         panel.canCreateDirectories = true
         panel.isExtensionHidden = false
-        panel.title = settings.mode == .animatedGIF ? "Export Animated GIF" : "Export Video"
+        panel.title = switch settings.mode {
+        case .animatedGIF: "Export Animated GIF"
+        case .audio: "Export Audio"
+        default: "Export Video"
+        }
         panel.nameFieldStringValue = "\(settings.fileBaseName).\(settings.pathExtension)"
         panel.allowedContentTypes = [settings.contentType]
         panel.allowsOtherFileTypes = false
@@ -3451,6 +3463,288 @@ final class EditorModel {
         }
         if reader.status == .failed {
             throw reader.error ?? NSError(domain: "StudioAudioLane", code: 7, userInfo: [NSLocalizedDescriptionKey: "Export reading failed"])
+        }
+    }
+
+    /// Kick off an audio-only mixdown of the full timeline through `audioMix`.
+    private func startAudioExport(
+        asset: AVAsset,
+        settings: ExportSettings,
+        destination: URL,
+        audioMix: AVAudioMix?
+    ) {
+        let format = settings.audioFormat
+        let sampleRate = Double(settings.audioSampleRateHertz)
+        let bitDepth = settings.pcmBitDepth
+        let aacBitRate = settings.audioBitrate.bitsPerSecond ?? 192_000
+        let contentDuration = Swift.max(duration, 0.001)
+
+        // AVFoundation objects are not Sendable; pin them for off-main render work.
+        nonisolated(unsafe) let unsafeAsset = asset
+        nonisolated(unsafe) let unsafeAudioMix = audioMix
+
+        let cancelFlag = ExportCancelFlag()
+        exportCancelFlag = cancelFlag
+        let intent = exportIntent
+        exportWriterTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                // nonisolated static: the pump callbacks must NOT inherit @MainActor.
+                try await EditorModel.performAudioExport(
+                    asset: unsafeAsset,
+                    destination: destination,
+                    format: format,
+                    sampleRate: sampleRate,
+                    bitDepth: bitDepth,
+                    aacBitRate: aacBitRate,
+                    duration: contentDuration,
+                    audioMix: unsafeAudioMix,
+                    isCancelled: { cancelFlag.value },
+                    onProgress: { value in
+                        Task { @MainActor in
+                            self.exportProgress = value
+                        }
+                    }
+                )
+                guard self.exportIntent == intent else { return }
+                self.finishExport(success: true, destination: destination, message: nil)
+            } catch is CancellationError {
+                guard self.exportIntent == intent else { return }
+                self.finishExport(success: false, destination: destination, message: "Export cancelled", reveal: false)
+            } catch {
+                guard self.exportIntent == intent else { return }
+                self.finishExport(
+                    success: false,
+                    destination: destination,
+                    message: "Audio export failed: \(error.localizedDescription)"
+                )
+            }
+        }
+    }
+
+    /// Offline mixdown: reads every timeline audio track through `audioMix`
+    /// (track volumes, clip gain, mute, ducking, fade ramps and the Pro pan/
+    /// limiter tap) as one interleaved stream and encodes it to `destination`.
+    /// Internal for tests; never touch MainActor state from here.
+    nonisolated static func performAudioExport(
+        asset: AVAsset,
+        destination: URL,
+        format: ExportSettings.AudioFormat,
+        sampleRate: Double,
+        bitDepth: Int,
+        aacBitRate: Int,
+        duration: TimeInterval,
+        audioMix: AVAudioMix?,
+        isCancelled: @escaping @Sendable () -> Bool,
+        onProgress: @escaping @Sendable (Double) -> Void
+    ) async throws {
+        let audioTracks = try await asset.loadTracks(withMediaType: .audio)
+        guard !audioTracks.isEmpty else {
+            throw NSError(domain: "StudioAudioLane", code: 1, userInfo: [NSLocalizedDescriptionKey: "No audio to export"])
+        }
+        nonisolated(unsafe) let reader = try AVAssetReader(asset: asset)
+        nonisolated(unsafe) let writer = try AVAssetWriter(outputURL: destination, fileType: format.fileType)
+
+        // Float PCM input keeps the mix lossless until the encoder's own
+        // requantization; the writer converts from float to the file's format.
+        let pcmSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVLinearPCMBitDepthKey: 32,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsFloatKey: true,
+            AVLinearPCMIsNonInterleaved: false,
+            AVNumberOfChannelsKey: 2,
+            AVSampleRateKey: sampleRate
+        ]
+
+        let outputSettings: [String: Any]
+        switch format {
+        case .wav, .aiff:
+            outputSettings = [
+                AVFormatIDKey: kAudioFormatLinearPCM,
+                AVLinearPCMBitDepthKey: bitDepth,
+                AVLinearPCMIsBigEndianKey: false,
+                AVLinearPCMIsFloatKey: false,
+                AVLinearPCMIsNonInterleaved: false,
+                AVNumberOfChannelsKey: 2,
+                AVSampleRateKey: sampleRate
+            ]
+        case .flac:
+            // Encoder derives bit depth from the input; hint keys are rejected.
+            outputSettings = [
+                AVFormatIDKey: kAudioFormatFLAC,
+                AVNumberOfChannelsKey: 2,
+                AVSampleRateKey: sampleRate
+            ]
+        case .alac:
+            outputSettings = [
+                AVFormatIDKey: kAudioFormatAppleLossless,
+                AVNumberOfChannelsKey: 2,
+                AVSampleRateKey: sampleRate,
+                AVEncoderBitDepthHintKey: bitDepth
+            ]
+        case .aac:
+            outputSettings = [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVNumberOfChannelsKey: 2,
+                AVSampleRateKey: sampleRate,
+                AVEncoderBitRateKey: aacBitRate
+            ]
+        }
+
+        nonisolated(unsafe) let writerInput = AVAssetWriterInput(mediaType: .audio, outputSettings: outputSettings)
+        writerInput.expectsMediaDataInRealTime = false
+        guard writer.canAdd(writerInput) else {
+            throw NSError(domain: "StudioAudioLane", code: 2, userInfo: [NSLocalizedDescriptionKey: "Cannot add audio writer input"])
+        }
+        writer.add(writerInput)
+
+        nonisolated(unsafe) let mixed = AVAssetReaderAudioMixOutput(audioTracks: audioTracks, audioSettings: pcmSettings)
+        mixed.alwaysCopiesSampleData = false
+        mixed.audioMix = audioMix
+        guard reader.canAdd(mixed) else {
+            throw NSError(domain: "StudioAudioLane", code: 3, userInfo: [NSLocalizedDescriptionKey: "Cannot add audio reader output"])
+        }
+        reader.add(mixed)
+
+        // Bound the bounce to the end of content; timelineSpan deliberately
+        // never shrinks, so it must not stretch the exported file with silence.
+        reader.timeRange = CMTimeRange(
+            start: .zero,
+            duration: CMTime(seconds: Swift.max(0.001, duration), preferredTimescale: 600)
+        )
+
+        guard writer.startWriting() else {
+            throw writer.error ?? NSError(domain: "StudioAudioLane", code: 4, userInfo: [NSLocalizedDescriptionKey: "Failed to start writing"])
+        }
+        guard reader.startReading() else {
+            writer.cancelWriting()
+            throw reader.error ?? NSError(domain: "StudioAudioLane", code: 5, userInfo: [NSLocalizedDescriptionKey: "Failed to start reading"])
+        }
+        writer.startSession(atSourceTime: .zero)
+
+        let durationSeconds = Swift.max(0.001, duration)
+
+        final class FlagBox: @unchecked Sendable {
+            private let lock = NSLock()
+            private var resumed = false
+            private var message: String?
+            func setFailure(_ value: String) {
+                lock.lock()
+                if message == nil { message = value }
+                lock.unlock()
+            }
+            func failure() -> String? {
+                lock.lock()
+                defer { lock.unlock() }
+                return message
+            }
+            func claimResume() -> Bool {
+                lock.lock()
+                defer { lock.unlock() }
+                if resumed { return false }
+                resumed = true
+                return true
+            }
+        }
+
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let box = FlagBox()
+                let watchdog = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
+
+                @Sendable func abort(_ error: Error) {
+                    reader.cancelReading()
+                    writer.cancelWriting()
+                    watchdog.cancel()
+                    if box.claimResume() { continuation.resume(throwing: error) }
+                }
+                @Sendable func complete() {
+                    watchdog.cancel()
+                    guard box.claimResume() else { return }
+                    if let message = box.failure() {
+                        continuation.resume(
+                            throwing: NSError(
+                                domain: "StudioAudioLane",
+                                code: 8,
+                                userInfo: [NSLocalizedDescriptionKey: message]
+                            )
+                        )
+                    } else {
+                        continuation.resume()
+                    }
+                }
+
+                writerInput.requestMediaDataWhenReady(on: DispatchQueue(label: "studio.export.audio-mix")) {
+                    while writerInput.isReadyForMoreMediaData {
+                        if isCancelled() {
+                            abort(CancellationError())
+                            return
+                        }
+                        if let sample = mixed.copyNextSampleBuffer() {
+                            let pts = CMSampleBufferGetPresentationTimeStamp(sample).seconds
+                            onProgress(Swift.min(0.99, Swift.max(0, pts / durationSeconds)))
+                            if !writerInput.append(sample) {
+                                box.setFailure(writer.error?.localizedDescription ?? "Audio append failed")
+                                abort(NSError(
+                                    domain: "StudioAudioLane",
+                                    code: 8,
+                                    userInfo: [NSLocalizedDescriptionKey: box.failure() ?? "Audio append failed"]
+                                ))
+                                return
+                            }
+                        } else {
+                            if reader.status == .failed {
+                                box.setFailure(reader.error?.localizedDescription ?? "Audio read failed")
+                            }
+                            writerInput.markAsFinished()
+                            complete()
+                            return
+                        }
+                    }
+                }
+
+                // If the pump never re-fires (terminal reader/writer state),
+                // drain so the continuation can't hang forever (HIGH-2 shape).
+                watchdog.schedule(deadline: .now() + 0.05, repeating: 0.05)
+                watchdog.setEventHandler {
+                    if isCancelled() {
+                        abort(CancellationError())
+                        return
+                    }
+                    guard writer.status == .cancelled || writer.status == .failed || reader.status == .failed else { return }
+                    if writer.status == .failed {
+                        box.setFailure(writer.error?.localizedDescription ?? "Audio export failed")
+                    } else if reader.status == .failed {
+                        box.setFailure(reader.error?.localizedDescription ?? "Audio read failed")
+                    }
+                    abort(NSError(
+                        domain: "StudioAudioLane",
+                        code: 9,
+                        userInfo: [NSLocalizedDescriptionKey: box.failure() ?? "Audio export failed"]
+                    ))
+                }
+                watchdog.resume()
+            }
+        } onCancel: {
+            reader.cancelReading()
+            writer.cancelWriting()
+        }
+
+        if isCancelled() {
+            writer.cancelWriting()
+            throw CancellationError()
+        }
+        if writer.status == .cancelled || writer.status == .failed {
+            throw writer.error ?? NSError(domain: "StudioAudioLane", code: 6, userInfo: [NSLocalizedDescriptionKey: "Audio export writing failed"])
+        }
+
+        await writer.finishWriting()
+        if writer.status != .completed {
+            throw writer.error ?? NSError(domain: "StudioAudioLane", code: 6, userInfo: [NSLocalizedDescriptionKey: "Audio export writing failed"])
+        }
+        if reader.status == .failed {
+            throw reader.error ?? NSError(domain: "StudioAudioLane", code: 7, userInfo: [NSLocalizedDescriptionKey: "Audio export reading failed"])
         }
     }
 

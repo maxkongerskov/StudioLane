@@ -40,7 +40,7 @@ struct StudioAudioLaneApp: App {
                     model.presentExportSheet()
                 }
                 .keyboardShortcut("e", modifiers: [.command])
-                .disabled(!model.hasVideo || model.isExporting)
+                .disabled((!model.hasVideo && !model.hasMusic) || model.isExporting)
             }
             CommandMenu("Timeline") {
                 Button("Zoom In") { model.zoomIn() }

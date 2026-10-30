@@ -6,11 +6,55 @@ import UniformTypeIdentifiers
 struct ExportSettings: Equatable {
     enum Mode: String, CaseIterable, Identifiable {
         case video = "Video"
+        case audio = "Audio"
         case animatedGIF = "Animated GIF"
         case xLoop = "X Loop"
 
         var id: String { rawValue }
     }
+
+    /// Standalone-audio export formats. macOS ships no MP3/OGG encoder, so
+    /// lossy options are the ISO-media-family codecs (AAC) next to ALAC/FLAC.
+    enum AudioFormat: String, CaseIterable, Identifiable {
+        case wav = "WAV"
+        case aiff = "AIFF"
+        case flac = "FLAC"
+        case alac = "ALAC"
+        case aac = "AAC"
+
+        var id: String { rawValue }
+
+        var isLossless: Bool { self != .aac }
+
+        var usesPCMBitDepth: Bool { self == .wav || self == .aiff }
+
+        var pathExtension: String {
+            switch self {
+            case .wav: "wav"
+            case .aiff: "aiff"
+            // CoreAudio writes FLAC/ALAC/AAC into ISO-media containers.
+            case .flac, .alac, .aac: "m4a"
+            }
+        }
+
+        var fileType: AVFileType {
+            switch self {
+            case .wav: .wav
+            case .aiff: .aiff
+            case .flac, .alac, .aac: .m4a
+            }
+        }
+
+        var contentType: UTType {
+            switch self {
+            case .wav: .wav
+            case .aiff: .aiff
+            case .flac, .alac, .aac: .mpeg4Audio
+            }
+        }
+    }
+
+    static let allowedAudioSampleRates: [Int] = [44_100, 48_000, 96_000]
 
     enum Container: String, CaseIterable, Identifiable {
         case mp4 = "MP4"
@@ -193,6 +237,11 @@ struct ExportSettings: Equatable {
     var gifPaletteQuality: GIFPaletteQuality = .balanced
     /// X has no persistent MP4 loop flag. Repeating media simulates looping.
     var xLoopCount: Int = 1
+    var audioFormat: AudioFormat = .wav
+    /// Sample rate for standalone audio export, in hertz.
+    var audioSampleRateHertz: Int = 48_000
+    /// Bit depth for PCM (WAV/AIFF) standalone audio export.
+    var pcmBitDepth: Int = 24
     /// Base file name without extension (shown/editable in the export sheet).
     var fileBaseName: String = "StudioLane"
 
@@ -212,6 +261,12 @@ struct ExportSettings: Equatable {
         if codec.usesPCMAudio {
             audioBitrate = .match
         }
+        if !Self.allowedAudioSampleRates.contains(audioSampleRateHertz) {
+            audioSampleRateHertz = 48_000
+        }
+        if pcmBitDepth != 16 && pcmBitDepth != 24 {
+            pcmBitDepth = 24
+        }
         customWidth = Swift.max(16, Swift.min(7680, customWidth))
         customHeight = Swift.max(16, Swift.min(4320, customHeight))
         videoBitrateMbps = videoBitrateMbps.isFinite
@@ -229,7 +284,7 @@ struct ExportSettings: Equatable {
         // Strip a trailing extension if the user typed one matching common movie types.
         let noExt: String = {
             let lower = cleaned.lowercased()
-            for ext in [".mp4", ".mov", ".m4v", ".gif"] where lower.hasSuffix(ext) {
+            for ext in [".mp4", ".mov", ".m4v", ".gif", ".wav", ".aiff", ".m4a"] where lower.hasSuffix(ext) {
                 return String(cleaned.dropLast(ext.count))
             }
             return cleaned
@@ -321,11 +376,15 @@ struct ExportSettings: Equatable {
     }
 
     var pathExtension: String {
-        mode == .animatedGIF ? "gif" : container.pathExtension
+        if mode == .animatedGIF { return "gif" }
+        if mode == .audio { return audioFormat.pathExtension }
+        return container.pathExtension
     }
 
     var contentType: UTType {
-        mode == .animatedGIF ? .gif : container.contentType
+        if mode == .animatedGIF { return .gif }
+        if mode == .audio { return audioFormat.contentType }
+        return container.contentType
     }
 
     var outputFrameRate: Double {
@@ -349,7 +408,7 @@ struct ExportSheet: View {
                     summary
                     field("Export type") {
                         Picker("", selection: $settings.mode) {
-                            ForEach(ExportSettings.Mode.allCases) { item in
+                            ForEach(availableModes) { item in
                                 Text(item.rawValue).tag(item)
                             }
                         }
@@ -359,6 +418,8 @@ struct ExportSheet: View {
                     switch settings.mode {
                     case .video:
                         standardVideoFields
+                    case .audio:
+                        audioFields
                     case .animatedGIF:
                         gifFields
                     case .xLoop:
@@ -383,6 +444,8 @@ struct ExportSheet: View {
             settings.customWidth = max(16, Int(model.exportSourceSize.width.rounded()))
             settings.customHeight = max(16, Int(model.exportSourceSize.height.rounded()))
             settings.fileBaseName = ExportSettings.sanitizedBaseName(model.clipName)
+            if !model.hasVideo { settings.mode = .audio }
+            if model.isProMode { settings.audioSampleRateHertz = Int(model.proSettings.sampleRate) }
             settings.sanitize()
         }
         .onChange(of: settings.codec) { _, _ in
@@ -393,6 +456,68 @@ struct ExportSheet: View {
         }
         .onChange(of: model.isExportSheetPresented) { _, open in
             if !open { dismiss() }
+        }
+    }
+
+    /// Video, GIF and X-Loop all need a video track; audio-only timelines
+    /// can only bounce the mix.
+    private var availableModes: [ExportSettings.Mode] {
+        model.hasVideo ? ExportSettings.Mode.allCases : [.audio]
+    }
+
+    @ViewBuilder
+    private var audioFields: some View {
+        field("Format") {
+            VStack(alignment: .leading, spacing: 6) {
+                Picker("", selection: $settings.audioFormat) {
+                    ForEach(ExportSettings.AudioFormat.allCases) { item in
+                        Text(item.rawValue).tag(item)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                Text(settings.audioFormat.isLossless
+                     ? "Lossless bounce of the full timeline. FLAC, ALAC and AAC files use the M4A container."
+                     : "Lossy AAC for sharing. FLAC, ALAC and AAC files use the M4A container.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(StudioTheme.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        field("Sample rate") {
+            Picker("", selection: $settings.audioSampleRateHertz) {
+                Text("44.1 kHz").tag(44_100)
+                Text("48 kHz").tag(48_000)
+                Text("96 kHz").tag(96_000)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+        }
+        if settings.audioFormat.usesPCMBitDepth {
+            field("Bit depth") {
+                Picker("", selection: $settings.pcmBitDepth) {
+                    Text("16-bit").tag(16)
+                    Text("24-bit").tag(24)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+            }
+        }
+        if settings.audioFormat == .aac {
+            field("Bitrate") {
+                VStack(alignment: .leading, spacing: 6) {
+                    Picker("", selection: $settings.audioBitrate) {
+                        ForEach(ExportSettings.AudioBitrate.allCases) { item in
+                            Text(item.rawValue).tag(item)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    Text("Match / default exports AAC at 192 kbps.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(StudioTheme.muted)
+                }
+            }
         }
     }
 
@@ -627,23 +752,36 @@ struct ExportSheet: View {
                 .font(.system(size: 11))
                 .foregroundStyle(StudioTheme.muted)
 
-            Text(String(
-                format: "Source %.0f×%.0f · %.2f fps  →  %.0f×%.0f · %@",
-                model.exportSourceSize.width,
-                model.exportSourceSize.height,
-                model.exportSourceFPS,
-                size.width,
-                size.height,
-                settings.mode == .animatedGIF
-                    ? settings.gifFrameRate.rawValue
-                    : settings.mode == .xLoop
-                        ? "30 fps"
-                        : settings.frameRate == .original
-                            ? String(format: "%.2f fps", model.exportSourceFPS)
-                            : settings.frameRate.rawValue
-            ))
-            .font(.system(size: 11))
-            .foregroundStyle(StudioTheme.muted)
+            if settings.mode == .audio {
+                Text(String(
+                    format: "Full timeline · %@ · %.1f kHz · %@",
+                    settings.audioFormat.rawValue,
+                    Double(settings.audioSampleRateHertz) / 1_000,
+                    settings.audioFormat == .aac
+                        ? (settings.audioBitrate.bitsPerSecond.map { "\($0 / 1_000) kbps" } ?? "192 kbps")
+                        : settings.audioFormat.usesPCMBitDepth ? "\(settings.pcmBitDepth)-bit" : "lossless"
+                ))
+                .font(.system(size: 11))
+                .foregroundStyle(StudioTheme.muted)
+            } else {
+                Text(String(
+                    format: "Source %.0f×%.0f · %.2f fps  →  %.0f×%.0f · %@",
+                    model.exportSourceSize.width,
+                    model.exportSourceSize.height,
+                    model.exportSourceFPS,
+                    size.width,
+                    size.height,
+                    settings.mode == .animatedGIF
+                        ? settings.gifFrameRate.rawValue
+                        : settings.mode == .xLoop
+                            ? "30 fps"
+                            : settings.frameRate == .original
+                                ? String(format: "%.2f fps", model.exportSourceFPS)
+                                : settings.frameRate.rawValue
+                ))
+                .font(.system(size: 11))
+                .foregroundStyle(StudioTheme.muted)
+            }
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -714,7 +852,7 @@ struct ExportSheet: View {
                 model.beginExport(with: settings)
             }
             .buttonStyle(ExportPrimaryButtonStyle())
-            .disabled(model.isExporting || !model.hasVideo)
+            .disabled(model.isExporting || (!model.hasVideo && !model.hasMusic))
             .keyboardShortcut(.defaultAction)
         }
         .padding(.horizontal, 20)
