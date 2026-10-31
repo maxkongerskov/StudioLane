@@ -83,7 +83,7 @@ enum ProAudioProcessor {
         guard format.mFormatID == kAudioFormatLinearPCM,
               format.mFormatFlags & kAudioFormatFlagIsFloat != 0,
               format.mBitsPerChannel == 32 else { return }
-        let gains = ProFeatureMath.equalPowerPan(pan)
+        let gains = ProFeatureMath.unityCenterPan(pan)
         let buffers = UnsafeMutableAudioBufferListPointer(bufferList)
         let nonInterleaved = format.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0
 
@@ -102,9 +102,10 @@ enum ProAudioProcessor {
                     channel = sampleIndex % max(1, Int(buffer.mNumberChannels))
                 }
                 let channelGain: Float = channel == 0 ? gains.left : gains.right
-                samples[sampleIndex] = ProFeatureMath.limitedSample(
-                    samples[sampleIndex] * channelGain,
-                    enabled: limiterEnabled
+                samples[sampleIndex] = ProFeatureMath.processedSample(
+                    samples[sampleIndex],
+                    channelGain: channelGain,
+                    limiterEnabled: limiterEnabled
                 )
             }
         }
