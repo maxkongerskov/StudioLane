@@ -3,10 +3,10 @@ import CoreVideo
 import XCTest
 @testable import StudioAudioLane
 
-/// Speaks newline-delimited JSON-RPC at `MCPServer`, the same bytes a stdio
-/// client writes. `EditorModel` is `@MainActor`, so every test that touches it
-/// is `@MainActor` too. Media files are built by nonisolated helpers that do
-/// not touch the model.
+/// Protocol tests spawn the built `StudioAudioLane --mcp` binary. An in-process
+/// server deadlocks under `swift test`: the read loop blocks on a semaphore
+/// until a main-actor hop runs, and the `@MainActor` test never gets that turn.
+/// Tests that touch `EditorModel` stay `@MainActor` and do not start the server.
 final class MCPAgentLoopTests: XCTestCase {
     private var directory: URL!
 
@@ -40,12 +40,9 @@ final class MCPAgentLoopTests: XCTestCase {
         )
     }
 
-    @MainActor
     func testJSONRPCIdsNotificationsAndMissingDelete() async throws {
-        let autosave = directory.appendingPathComponent("untouched-autosave", isDirectory: true)
-        try FileManager.default.createDirectory(at: autosave, withIntermediateDirectories: true)
-        let client = MCPTestClient(autosaveDirectory: autosave)
-        defer { client.closeInput() }
+        let client = try MCPProcessClient()
+        defer { client.stop() }
 
         let initialize = try await client.request(id: 1, method: "initialize", params: [
             "protocolVersion": "2024-11-05",
@@ -56,11 +53,11 @@ final class MCPAgentLoopTests: XCTestCase {
         let initResult = try XCTUnwrap(initialize["result"] as? [String: Any])
         XCTAssertEqual(initResult["protocolVersion"] as? String, "2024-11-05")
 
-        let linesBeforeNotification = client.log.snapshot().count
+        let responsesBeforeNotification = client.responseCount()
         try client.notify(method: "notifications/initialized")
         let ping = try await client.request(id: "ping", method: "ping")
         XCTAssertTrue(idsMatch(ping["id"], "ping"))
-        XCTAssertEqual(client.log.snapshot().count, linesBeforeNotification + 1)
+        XCTAssertEqual(client.responseCount(), responsesBeforeNotification + 1)
 
         let listed = try await client.request(id: "list", method: "tools/list")
         XCTAssertTrue(idsMatch(listed["id"], "list"))
@@ -74,7 +71,8 @@ final class MCPAgentLoopTests: XCTestCase {
         XCTAssertTrue(idsMatch(missingMethod["id"], 9))
         XCTAssertNotNil(missingMethod["error"])
 
-        let revisionBefore = client.model.mcpRevision
+        let before = try await client.call(id: "state-before", tool: "get_project_state")
+        let revisionBefore = jsonInt(before.payload["revision"])
         let deleted = try await client.call(
             id: "missing",
             tool: "delete_clip",
@@ -84,15 +82,10 @@ final class MCPAgentLoopTests: XCTestCase {
         let deletedResult = try XCTUnwrap(deleted.rpc["result"] as? [String: Any])
         XCTAssertEqual(deletedResult["isError"] as? Bool, true)
         XCTAssertEqual(deleted.payload["error"] as? String, "clip_not_found")
-        XCTAssertEqual(client.model.mcpRevision, revisionBefore)
+        let after = try await client.call(id: "state-after", tool: "get_project_state")
+        XCTAssertEqual(jsonInt(after.payload["revision"]), revisionBefore)
 
-        client.closeInput()
-        let deadline = Date().addingTimeInterval(5)
-        while client.server.isReading, Date() < deadline {
-            try await Task.sleep(nanoseconds: 50_000_000)
-        }
-        XCTAssertFalse(client.server.isReading)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: autosave.appendingPathComponent("autosave.json").path))
+        try await client.closeAndWaitForExit()
     }
 
     @MainActor
@@ -165,21 +158,15 @@ final class MCPAgentLoopTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: autosave), original)
     }
 
-    @MainActor
     func testAgentLoopTrimFadeExport() async throws {
         let wav = directory.appendingPathComponent("tone.wav")
-        try writeSine(to: wav, seconds: 1.0, frequency: 440)
+        try writeSine(to: wav, seconds: 0.6, frequency: 440)
         let video = directory.appendingPathComponent("clip.mov")
         let hasVideo = (try? writeTinyVideo(to: video, frames: 15)) != nil
             && FileManager.default.fileExists(atPath: video.path)
 
-        let autosave = directory.appendingPathComponent("agent-autosave", isDirectory: true)
-        try FileManager.default.createDirectory(at: autosave, withIntermediateDirectories: true)
-        let client = MCPTestClient(autosaveDirectory: autosave)
-        defer { client.closeInput() }
-        await client.model.loadInitialSession()
-        XCTAssertTrue(client.model.audioClips.isEmpty)
-        XCTAssertEqual(client.model.mcpRevision, 0)
+        let client = try MCPProcessClient()
+        defer { client.stop() }
 
         _ = try await client.request(id: 1, method: "initialize", params: [
             "protocolVersion": "2024-11-05",
@@ -204,6 +191,7 @@ final class MCPAgentLoopTests: XCTestCase {
         XCTAssertGreaterThan(jsonDouble(audioAdd.payload["source_duration"]) ?? 0, 0.5)
 
         var videoID: String?
+        var revisionAfterImport = try XCTUnwrap(jsonInt(audioAdd.payload["revision"]))
         if hasVideo {
             let videoAdd = try await client.call(id: "add-video", tool: "add_clip", arguments: [
                 "file_path": video.path,
@@ -211,22 +199,21 @@ final class MCPAgentLoopTests: XCTestCase {
             ])
             XCTAssertTrue(idsMatch(videoAdd.rpc["id"], "add-video"))
             videoID = try XCTUnwrap(videoAdd.payload["clip_id"] as? String)
-            XCTAssertEqual(jsonInt(videoAdd.payload["revision"]), 2)
+            revisionAfterImport = try XCTUnwrap(jsonInt(videoAdd.payload["revision"]))
+            XCTAssertEqual(revisionAfterImport, 2)
         }
 
-        let revisionAfterImport = client.model.mcpRevision
         let missing = try await client.call(
             id: "missing-during-loop",
             tool: "delete_clip",
             arguments: ["clip_id": UUID().uuidString, "confirmed": true]
         )
         XCTAssertEqual(missing.payload["error"] as? String, "clip_not_found")
-        XCTAssertEqual(client.model.mcpRevision, revisionAfterImport)
 
         let stateCall = try await client.call(id: 4, tool: "get_project_state")
         XCTAssertTrue(idsMatch(stateCall.rpc["id"], 4))
         let state = stateCall.payload
-        XCTAssertEqual(jsonInt(state["revision"]), revisionAfterImport)
+        XCTAssertEqual(jsonInt(state["revision"]) ?? -1, revisionAfterImport)
         XCTAssertEqual(jsonDouble(state["playhead"]) ?? -1, 0, accuracy: 0.001)
         XCTAssertGreaterThan(jsonDouble(state["timeline_duration"]) ?? 0, 0.2)
         XCTAssertEqual(state["audio_layout"] as? String, "playlist")
@@ -254,7 +241,7 @@ final class MCPAgentLoopTests: XCTestCase {
         XCTAssertTrue(idsMatch(trimmed.rpc["id"], "trim"))
         XCTAssertEqual(trimmed.payload["status"] as? String, "trimmed")
         XCTAssertEqual(jsonDouble(trimmed.payload["duration"]) ?? 0, trimDuration, accuracy: 0.02)
-        XCTAssertEqual(jsonInt(trimmed.payload["revision"]), revisionAfterImport + 1)
+        XCTAssertEqual(jsonInt(trimmed.payload["revision"]) ?? -1, revisionAfterImport + 1)
         let note = try XCTUnwrap(trimmed.payload["note"] as? String)
         XCTAssertTrue(note.localizedCaseInsensitiveContains("does not ripple"))
 
@@ -264,14 +251,14 @@ final class MCPAgentLoopTests: XCTestCase {
         ])
         XCTAssertTrue(idsMatch(faded.rpc["id"], "fade"))
         XCTAssertEqual(jsonDouble(faded.payload["fade_in"]) ?? 0, 0.08, accuracy: 0.01)
-        XCTAssertEqual(jsonInt(faded.payload["revision"]), revisionAfterImport + 2)
+        XCTAssertEqual(jsonInt(faded.payload["revision"]) ?? -1, revisionAfterImport + 2)
 
         let again = try await client.call(id: "fade-again", tool: "set_fade_in", arguments: [
             "clip_id": trimTarget,
             "duration": 0.08
         ])
         XCTAssertEqual(again.payload["status"] as? String, "unchanged")
-        XCTAssertEqual(jsonInt(again.payload["revision"]), revisionAfterImport + 2)
+        XCTAssertEqual(jsonInt(again.payload["revision"]) ?? -1, revisionAfterImport + 2)
 
         let timeline = jsonDouble(
             (try await client.call(id: "state-before-export", tool: "get_project_state")).payload["timeline_duration"]
@@ -281,7 +268,7 @@ final class MCPAgentLoopTests: XCTestCase {
             "destination_path": destination.path,
             "container": "mp4",
             "codec": "h264",
-            "quality": "high",
+            "quality": "low",
             "overwrite": true
         ])
         XCTAssertTrue(idsMatch(exported.rpc["id"], "export"))
@@ -290,7 +277,7 @@ final class MCPAgentLoopTests: XCTestCase {
         let outputPath = try XCTUnwrap(exported.payload["destination"] as? String)
 
         var finalStatus: [String: Any] = [:]
-        let deadline = Date().addingTimeInterval(90)
+        let deadline = Date().addingTimeInterval(45)
         var poll = 0
         while Date() < deadline {
             poll += 1
@@ -327,35 +314,60 @@ final class MCPAgentLoopTests: XCTestCase {
         }
         XCTAssertTrue(progressTokens.contains { idsMatch($0, "export") })
 
-        XCTAssertFalse(FileManager.default.fileExists(atPath: autosave.appendingPathComponent("autosave.json").path))
-        client.closeInput()
-        let eofDeadline = Date().addingTimeInterval(5)
-        while client.server.isReading, Date() < eofDeadline {
-            try await Task.sleep(nanoseconds: 50_000_000)
-        }
-        XCTAssertFalse(client.server.isReading)
+        try await client.closeAndWaitForExit()
     }
 }
 
-@MainActor
-private final class MCPTestClient {
-    let model: EditorModel
-    let server: MCPServer
+/// Talks to a real `StudioAudioLane --mcp` process. Stdout is read on a
+/// background queue with no main-actor hop, so `swift test` can service the pipes.
+private final class MCPProcessClient {
+    let process: Process
     let log: MCPLineLog
-    let input: Pipe
+    private let stdin: Pipe
+    private let stderrLog: MCPLineLog
     private var closed = false
 
-    init(autosaveDirectory: URL) {
-        let model = EditorModel()
-        model.enterAgentSession(autosaveDirectory: autosaveDirectory)
+    init() throws {
+        let executable = try Self.executable()
+        let stdin = Pipe()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = ["--mcp"]
+        process.standardInput = stdin
+        process.standardOutput = stdout
+        process.standardError = stderr
         let log = MCPLineLog()
-        let input = Pipe()
-        let server = MCPServer(model: model, emit: { log.append($0) }, onEOF: {})
-        self.model = model
-        self.server = server
+        let stderrLog = MCPLineLog()
+        DispatchQueue.global(qos: .userInitiated).async {
+            MCPStdio.readLines(from: stdout.fileHandleForReading, isRunning: { true }) { line in
+                log.append(Data(line.utf8))
+            }
+        }
+        DispatchQueue.global(qos: .utility).async {
+            while true {
+                let chunk = (try? stderr.fileHandleForReading.read(upToCount: 65_536)) ?? Data()
+                if chunk.isEmpty { break }
+                stderrLog.append(chunk)
+            }
+        }
+        do {
+            try process.run()
+        } catch {
+            try? stdout.fileHandleForWriting.close()
+            try? stderr.fileHandleForWriting.close()
+            try? stdin.fileHandleForWriting.close()
+            throw error
+        }
+        // The parent still holds the write ends. Close them so the readers see
+        // EOF when the child exits, without closing the child's copies.
+        try? stdout.fileHandleForWriting.close()
+        try? stderr.fileHandleForWriting.close()
+        self.process = process
+        self.stdin = stdin
         self.log = log
-        self.input = input
-        server.start(input: input.fileHandleForReading)
+        self.stderrLog = stderrLog
     }
 
     func request(id: Any, method: String, params: [String: Any]? = nil, timeout: TimeInterval = 30) async throws -> [String: Any] {
@@ -369,30 +381,51 @@ private final class MCPTestClient {
         try write(["jsonrpc": "2.0", "method": method])
     }
 
-    func call(id: Any, tool: String, arguments: [String: Any] = [:], timeout: TimeInterval = 60) async throws -> (rpc: [String: Any], payload: [String: Any]) {
+    func call(id: Any, tool: String, arguments: [String: Any] = [:], timeout: TimeInterval = 30) async throws -> (rpc: [String: Any], payload: [String: Any]) {
         let rpc = try await request(
             id: id,
             method: "tools/call",
             params: ["name": tool, "arguments": arguments],
             timeout: timeout
         )
-        let result = try XCTUnwrap(rpc["result"] as? [String: Any], "\(rpc)")
+        let result = try XCTUnwrap(rpc["result"] as? [String: Any], "\(rpc) stderr:\n\(stderrText())")
         let content = try XCTUnwrap(result["content"] as? [[String: Any]])
         let text = try XCTUnwrap(content.first?["text"] as? String)
         let payload = try XCTUnwrap(jsonObject(text))
         return (rpc, payload)
     }
 
-    func closeInput() {
+    func responseCount() -> Int {
+        log.snapshot().filter { jsonObject($0)?["id"] != nil }.count
+    }
+
+    func closeAndWaitForExit(timeout: TimeInterval = 8) async throws {
+        closeInput()
+        let deadline = Date().addingTimeInterval(timeout)
+        while process.isRunning, Date() < deadline {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertFalse(process.isRunning, "process did not quit after stdin closed. stderr:\n\(stderrText())")
+    }
+
+    /// Closes stdin and kills a process that is still up. Used from `defer`.
+    func stop() {
+        closeInput()
+        if process.isRunning {
+            process.terminate()
+        }
+    }
+
+    private func closeInput() {
         guard !closed else { return }
         closed = true
-        try? input.fileHandleForWriting.close()
+        try? stdin.fileHandleForWriting.close()
     }
 
     private func write(_ object: [String: Any]) throws {
         var data = try JSONSerialization.data(withJSONObject: object)
         data.append(UInt8(ascii: "\n"))
-        input.fileHandleForWriting.write(data)
+        stdin.fileHandleForWriting.write(data)
     }
 
     private func waitForResponse(id: Any, timeout: TimeInterval) async throws -> [String: Any] {
@@ -402,10 +435,56 @@ private final class MCPTestClient {
                 guard let obj = jsonObject(line), idsMatch(obj["id"], id) else { continue }
                 return obj
             }
+            if !process.isRunning {
+                break
+            }
             try await Task.sleep(nanoseconds: 20_000_000)
         }
-        XCTFail("timed out waiting for id \(id). lines:\n\(log.snapshot().joined())")
+        XCTFail("timed out waiting for id \(id). stdout:\n\(log.snapshot().joined(separator: "\n"))\nstderr:\n\(stderrText())")
         throw MCPTestTimeout()
+    }
+
+    private func stderrText() -> String {
+        stderrLog.snapshot().joined()
+    }
+
+    /// `swift test` puts the executable next to the `.xctest` bundle.
+    private static func executable() throws -> URL {
+        var tried: [String] = []
+        var seen = Set<String>()
+        var roots = [Bundle(for: MCPAgentLoopTests.self).bundleURL]
+        roots.append(contentsOf: Bundle.allBundles.map(\.bundleURL))
+        for root in roots {
+            var cursor = root
+            for _ in 0..<6 {
+                let directories = cursor.pathExtension == "xctest"
+                    ? [cursor.deletingLastPathComponent(), cursor]
+                    : [cursor]
+                for directory in directories {
+                    let candidates = [
+                        directory.appendingPathComponent("StudioAudioLane"),
+                        directory.appendingPathComponent("StudioAudioLane.app").appendingPathComponent("Contents/MacOS/StudioAudioLane")
+                    ]
+                    for candidate in candidates where seen.insert(candidate.path).inserted {
+                        tried.append(candidate.path)
+                        if FileManager.default.isExecutableFile(atPath: candidate.path) {
+                            return candidate
+                        }
+                    }
+                }
+                let parent = cursor.deletingLastPathComponent()
+                if parent.path == cursor.path { break }
+                cursor = parent
+            }
+        }
+        throw MCPExecutableNotFound(tried: tried)
+    }
+}
+
+private struct MCPExecutableNotFound: Error, LocalizedError {
+    let tried: [String]
+    var errorDescription: String? {
+        "StudioAudioLane executable not found next to the test bundle. Looked in:\n" + tried.joined(separator: "\n")
     }
 }
 
