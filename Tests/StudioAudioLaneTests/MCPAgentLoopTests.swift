@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreFoundation
 import CoreVideo
 import Darwin
 import XCTest
@@ -46,8 +47,8 @@ final class MCPAgentLoopTests: XCTestCase {
     func testResponseLinesMatchJSONRPCIds() throws {
         let log = MCPByteLog()
         log.append(Data("{\"id\":1,\"jsonrpc\":\"2.0\",\"result\":{\"protocolVersion\":\"2024-11-05\"}}\n".utf8))
-        log.append(Data("{\"id\":"))
-        log.append(Data("\"ping\"}\r\n{\"id\":true}\n"))
+        log.append(Data("{\"id\":".utf8))
+        log.append(Data("\"ping\"}\r\n{\"id\":true}\n".utf8))
         let lines = log.lines()
         XCTAssertEqual(lines.count, 3)
 
@@ -64,9 +65,14 @@ final class MCPAgentLoopTests: XCTestCase {
         XCTAssertTrue(idsMatch(boolID["id"], true))
 
         let partial = MCPByteLog()
-        partial.append(Data("{\"id\":1,\"ok\":true}"))
-        XCTAssertEqual(partial.lines(), ["{\"id\":1,\"ok\":true}"])
-        XCTAssertTrue(idsMatch(jsonObject(partial.lines()[0])?["id"], 1))
+        partial.append(Data("{\"id\":1,\"ok\":true,\"revision\":1,\"duration\":0.45}".utf8))
+        XCTAssertEqual(partial.lines(), ["{\"id\":1,\"ok\":true,\"revision\":1,\"duration\":0.45}"])
+        let partialObject = try XCTUnwrap(jsonObject(partial.lines()[0]))
+        XCTAssertTrue(idsMatch(partialObject["id"], 1))
+        XCTAssertEqual(jsonInt(partialObject["revision"]), 1)
+        XCTAssertEqual(jsonInt(partialObject["ok"]), nil)
+        XCTAssertEqual(jsonDouble(partialObject["duration"]) ?? 0, 0.45, accuracy: 0.001)
+        XCTAssertEqual(jsonDouble(partialObject["ok"]), nil)
     }
 
     func testJSONRPCIdsNotificationsAndMissingDelete() async throws {
@@ -751,17 +757,28 @@ private func normalizeID(_ value: Any?) -> String? {
     return "n:\(asDouble)"
 }
 
+/// JSON numbers 0 and 1 are `NSNumber`, and `value is Bool` is true for both.
+/// Only a real `CFBoolean` is rejected.
+private func jsonNumber(_ value: Any?) -> NSNumber? {
+    guard let value else { return nil }
+    if type(of: value) == Bool.self { return nil }
+    guard let number = value as? NSNumber else { return nil }
+    if CFGetTypeID(number) == CFBooleanGetTypeID() { return nil }
+    return number
+}
+
 private func jsonInt(_ value: Any?) -> Int? {
-    guard let value, !(value is Bool) else { return nil }
-    if let int = value as? Int { return int }
-    if let number = value as? NSNumber { return number.intValue }
-    return nil
+    if type(of: value as Any) == Int.self, let int = value as? Int { return int }
+    guard let number = jsonNumber(value) else { return nil }
+    let asDouble = number.doubleValue
+    guard asDouble.isFinite, asDouble.rounded() == asDouble, abs(asDouble) <= Double(Int.max) else { return nil }
+    return Int(asDouble)
 }
 
 private func jsonDouble(_ value: Any?) -> Double? {
-    guard let value, !(value is Bool) else { return nil }
-    if let number = value as? NSNumber { return number.doubleValue }
-    return nil
+    guard let number = jsonNumber(value) else { return nil }
+    let asDouble = number.doubleValue
+    return asDouble.isFinite ? asDouble : nil
 }
 
 private func writeSine(to url: URL, seconds: Double, frequency: Double) throws {
