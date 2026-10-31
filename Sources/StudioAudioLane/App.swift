@@ -113,19 +113,10 @@ struct StudioAudioLaneApp: App {
         }
     }
 
-    init() {
-        if CommandLine.arguments.contains("--mcp") {
-        }
-
-    }
-
     private func startMCPIfNeeded() {
         guard CommandLine.arguments.contains("--mcp"), mcpServer == nil else { return }
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 200_000_000)
-            let server = MCPServer(model: model)
-            mcpServer = server
-            server.start()
-        }
+        let server = MCPServer(model: model)
+        mcpServer = server
+        server.start()
     }
 }

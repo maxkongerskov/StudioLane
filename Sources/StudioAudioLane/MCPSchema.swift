@@ -12,9 +12,12 @@ struct MCPTrack: Codable {
 struct MCPClip: Codable {
     let id: String
     let trackId: String
+    let kind: String
     let name: String
+    let filePath: String
     let timelineStart: Double
     let duration: Double
+    let sourceDuration: Double
     let sourceIn: Double
     let fadeIn: Double
     let fadeOut: Double
@@ -25,8 +28,13 @@ struct MCPClip: Codable {
 struct MCPProjectState: Codable {
     let revision: Int
     let timelineDuration: Double
+    let playhead: Double
     let isPlaying: Bool
     let isExporting: Bool
+    let audioLayout: String
+    let ducking: Bool
+    let fps: Double
+    let projectPath: String?
     let tracks: [MCPTrack]
     let clips: [MCPClip]
 }
