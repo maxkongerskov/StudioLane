@@ -266,15 +266,15 @@ enum MCPHandlers {
         guard let uuid = UUID(uuidString: clipId) else {
             return .failure(MCPErrorResponse(error: "invalid_clip_id", message: "Not a UUID: \(clipId)", currentRevision: nil))
         }
+        guard model.videoIndexPublic(uuid) != nil || model.audioIndexPublic(uuid) != nil else {
+            return .failure(MCPErrorResponse(error: "clip_not_found", message: "No clip with id \(clipId)", currentRevision: nil))
+        }
         guard confirmed else {
             return .failure(MCPErrorResponse(
                 error: "confirmation_required",
                 message: "Set confirmed=true to delete this clip. In playlist mode, deleting an audio clip also ripples the lane and reapplies the automatic crossfade.",
                 currentRevision: nil
             ))
-        }
-        guard model.videoIndexPublic(uuid) != nil || model.audioIndexPublic(uuid) != nil else {
-            return .failure(MCPErrorResponse(error: "clip_not_found", message: "No clip with id \(clipId)", currentRevision: nil))
         }
         let before = placementSnapshot(model)
         let revisionBefore = model.mcpRevision

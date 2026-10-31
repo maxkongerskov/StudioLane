@@ -646,10 +646,11 @@ final class MCPServer {
         return value
     }
 
-    /// Real JSON booleans only. `NSNumber` 0 and 1 are not booleans.
+    /// Swift `Bool` or a real `CFBoolean`. `NSNumber` 0 and 1 also satisfy `is Bool`
+    /// and `is Int`, so those checks cannot run first — they would turn `true`
+    /// into the number 1 and drop `dry_run` / `include_image` / `confirmed`.
     private func jsonBool(_ value: Any?) -> Bool? {
         guard let value, !(value is NSNull) else { return nil }
-        if value is Double || value is Int || value is Float { return nil }
         if type(of: value) == Bool.self {
             return value as? Bool
         }
