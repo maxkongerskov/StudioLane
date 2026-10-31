@@ -638,18 +638,18 @@ final class MCPServer {
         settings.quality = qualityEnum
         settings.fileBaseName = URL(fileURLWithPath: destPath).deletingPathExtension().lastPathComponent
 
-        let destURL = URL(fileURLWithPath: destPath)
-        let ext = containerEnum.pathExtension
-        let finalURL = destURL.pathExtension.lowercased() == ext
-            ? destURL
-            : destURL.deletingPathExtension().appendingPathExtension(ext)
+        // Audio-only timelines cannot fill a video container. preparedExport
+        // switches those to a mixdown and rewrites the extension (mp4 → wav)
+        // so the path we report is the file that will actually be written.
+        let prepared = model.preparedExport(settings: settings, destination: URL(fileURLWithPath: destPath))
+        let finalURL = prepared.destination
 
         if FileManager.default.fileExists(atPath: finalURL.path), !overwrite {
             return .failure(MCPDictError(dict: ["error": "file_exists", "message": "Destination already exists. Pass overwrite=true to replace it."] as [String: Any]))
         }
 
         // Bypass the save panel and start the export directly.
-        guard model.beginExportDirect(settings: settings, destination: finalURL) else {
+        guard model.beginExportDirect(settings: prepared.settings, destination: finalURL) else {
             return .failure(MCPDictError(dict: [
                 "error": "export_not_started",
                 "message": "Another export is already running, or nothing is loaded to export."
@@ -659,7 +659,7 @@ final class MCPServer {
         return .success([
             "status": "started",
             "destination": finalURL.path,
-            "container": container,
+            "container": prepared.settings.mode == .audio ? prepared.settings.pathExtension : container,
             "codec": codecRaw,
             "quality": qualityRaw,
             "revision": model.mcpRevision

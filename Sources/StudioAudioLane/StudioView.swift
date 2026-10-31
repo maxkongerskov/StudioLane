@@ -53,7 +53,7 @@ struct StudioView: View {
                     .controlSize(.small)
                     .tint(.white)
                     .allowsHitTesting(false)
-            } else if !model.hasVideo {
+            } else if !model.hasVideo && !model.hasMusic {
                 VStack(spacing: 10) {
                     Image(systemName: "film")
                         .font(.system(size: 28, weight: .light))
@@ -61,6 +61,17 @@ struct StudioView: View {
                     Text("Drop video, image, or audio")
                         .font(.system(size: 13))
                         .foregroundStyle(StudioTheme.muted)
+                }
+                .allowsHitTesting(false)
+            } else if !model.hasVideo {
+                VStack(spacing: 10) {
+                    Image(systemName: "waveform")
+                        .font(.system(size: 28, weight: .light))
+                        .foregroundStyle(StudioTheme.muted)
+                    Text(model.clipName)
+                        .font(.system(size: 13))
+                        .foregroundStyle(StudioTheme.muted)
+                        .lineLimit(1)
                 }
                 .allowsHitTesting(false)
             }

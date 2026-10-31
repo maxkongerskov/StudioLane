@@ -958,7 +958,7 @@ struct ExportSheet: View {
                 model.beginExport(with: settings)
             }
             .buttonStyle(ExportPrimaryButtonStyle())
-            .disabled(model.isExporting || (!model.hasVideo && !model.hasMusic))
+            .disabled(!model.canExport)
             .keyboardShortcut(.defaultAction)
         }
         .padding(.horizontal, 20)
