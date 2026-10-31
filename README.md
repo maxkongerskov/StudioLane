@@ -31,6 +31,21 @@ cd ~/Projects/StudioAudioLane
 
 That writes `.build/StudioAudioLane.app` and launches it. The window opens at 1568×780, and can shrink to 1100×620.
 
+## MCP
+
+Claude Desktop, Cursor, or another stdio MCP client can run the editor unattended. The app starts empty, does not touch your autosave, and speaks JSON-RPC on stdout. See [docs/MCP.md](docs/MCP.md).
+
+```json
+{
+  "mcpServers": {
+    "studiolane": {
+      "command": "/Applications/StudioLane.app/Contents/MacOS/StudioAudioLane",
+      "args": ["--mcp"]
+    }
+  }
+}
+```
+
 To put a copy in `/Applications`:
 
 ```bash

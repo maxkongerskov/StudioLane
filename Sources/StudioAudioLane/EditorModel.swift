@@ -771,11 +771,51 @@ final class EditorModel {
     /// Destination of the in-flight export; used to delete incomplete files on cancel/failure.
     var exportDestinationURL: URL?
 
-    /// Monotonic revision counter — bumped on every MCP-initiated mutation.
+    /// Monotonic revision counter. One step per completed mutation: a UI gesture
+    /// through `pushHistory`, or an MCP edit that actually changed the timeline.
+    /// A no-op (deleting a clip that is not there, setting a value that is
+    /// already set) does not move it.
     private(set) var mcpRevision: Int = 0
+
+    /// `--mcp` sessions start empty. They must not read or write the user's autosave.
+    private(set) var isAgentSession = false
+    /// UI exports select the file in Finder. Agent sessions leave Finder alone.
+    var revealExportsInFinder = true
+    /// Tests point this at a temporary folder so the real autosave is never touched.
+    var autosaveDirectoryOverride: URL?
+    /// Kept after the in-flight URL is cleared so `get_export_status` can still
+    /// name the file that was written.
+    private(set) var completedExportURL: URL?
+    private(set) var completedExportSucceeded = false
+
+    init() {
+        if CommandLine.arguments.contains("--mcp") {
+            enterAgentSession()
+        }
+    }
+
+    /// Empty timeline, no autosave, no Finder reveal. Used by `--mcp` and tests.
+    func enterAgentSession(autosaveDirectory: URL? = nil) {
+        isAgentSession = true
+        revealExportsInFinder = false
+        isLoading = false
+        status = ""
+        if let autosaveDirectory {
+            autosaveDirectoryOverride = autosaveDirectory
+        }
+    }
 
     func bumpMCPRevision() {
         mcpRevision += 1
+    }
+
+    /// MCP edits that already went through `pushHistory` have bumped once.
+    /// Call this after the mutation so a path that skipped history still counts,
+    /// without counting the same edit twice.
+    func bumpMCPRevisionIfUnchanged(since previous: Int) {
+        if mcpRevision == previous {
+            bumpMCPRevision()
+        }
     }
 
     /// Public bridge for MCP server — the MCP layer calls these instead of reaching into private state.
@@ -818,6 +858,8 @@ final class EditorModel {
         isExporting = true
         exportProgress = 0
         errorMessage = nil
+        completedExportSucceeded = false
+        exportDestinationURL = prepared.destination
         exportIntent += 1
         let intent = exportIntent
         Task { @MainActor in
@@ -894,6 +936,7 @@ final class EditorModel {
     /// The MCP layer owns the explicit confirmation gate.
     func resetForTemplate(videoTrackCount: Int, audioTrackCount: Int, name: String?) async {
         guard !isExporting else { return }
+        let revisionBefore = mcpRevision
         pushHistory()
 
         let videoCount = max(1, videoTrackCount)
@@ -933,7 +976,9 @@ final class EditorModel {
             status = "Created new project template"
         }
         errorMessage = nil
-        bumpMCPRevision()
+        if mcpRevision == revisionBefore {
+            bumpMCPRevision()
+        }
         projectFileURL = nil
         scheduleAutosave()
         await rebuildAndWait()
@@ -988,6 +1033,7 @@ final class EditorModel {
     }
 
     private func scheduleAutosave() {
+        guard !isAgentSession else { return }
         autosaveTimer?.invalidate()
         autosaveTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: false) { [weak self] _ in
             Task { @MainActor [weak self] in
@@ -997,6 +1043,7 @@ final class EditorModel {
     }
 
     private func flushAutosave() {
+        guard !isAgentSession else { return }
         autosaveTimer?.invalidate()
         autosaveTimer = nil
         do {
@@ -1007,9 +1054,10 @@ final class EditorModel {
     }
 
     private var autosaveURL: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("StudioAudioLane", isDirectory: true)
-            .appendingPathComponent("autosave.json")
+        let folder = autosaveDirectoryOverride
+            ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("StudioAudioLane", isDirectory: true)
+        return folder.appendingPathComponent("autosave.json")
     }
 
     private func makeProjectDocument() -> ProjectDocument {
@@ -1040,6 +1088,7 @@ final class EditorModel {
 
     /// Background autosave into Application Support (same JSON format as user Save).
     func saveProject() async {
+        guard !isAgentSession else { return }
         do {
             try writeProjectDocument(makeProjectDocument(), to: autosaveURL)
         } catch {
@@ -1083,7 +1132,10 @@ final class EditorModel {
             try writeProjectDocument(makeProjectDocument(), to: url)
             projectFileURL = url
             // Keep autosave in sync so relaunch still restores the latest state.
-            try? writeProjectDocument(makeProjectDocument(), to: autosaveURL)
+            // An agent session must not replace the user's autosave with its timeline.
+            if !isAgentSession {
+                try? writeProjectDocument(makeProjectDocument(), to: autosaveURL)
+            }
             let label = "Saved \(url.lastPathComponent)"
             status = label
             errorMessage = nil
@@ -1240,7 +1292,7 @@ final class EditorModel {
     func start() {
         guard !didStart else { return }
         didStart = true
-        Task { await loadDefaults() }
+        Task { await loadInitialSession() }
         installTimeObserver()
         installKeyMonitor()
         installTerminationHandler()
@@ -1291,6 +1343,9 @@ final class EditorModel {
         future.removeAll()
         if history.count > 100 { history.removeFirst() }
         refreshHistoryState()
+        // One revision step per gesture. MCP handlers that also land here
+        // must not bump again.
+        bumpMCPRevision()
     }
 
     private var currentSnapshot: EditorSnapshot {
@@ -2723,8 +2778,10 @@ final class EditorModel {
         stopExportProgressTimer()
         activeExportSession = nil
         if let dest = exportDestinationURL {
+            completedExportURL = dest
             try? FileManager.default.removeItem(at: dest)
         }
+        completedExportSucceeded = false
         removeExportTemporaryFiles()
         exportDestinationURL = nil
         if isExporting {
@@ -4055,11 +4112,13 @@ final class EditorModel {
         }
 
         exportProgress = ok ? 1 : 0
+        completedExportURL = destination
+        completedExportSucceeded = ok
         if ok {
             let label = "Exported \(destination.lastPathComponent)"
             status = label
             errorMessage = nil
-            if reveal {
+            if reveal, revealExportsInFinder {
                 NSWorkspace.shared.activateFileViewerSelecting([destination])
             }
             isExportSheetPresented = false
@@ -4157,7 +4216,17 @@ final class EditorModel {
         return composition
     }
 
-    private func loadDefaults() async {
+    /// First session load. `--mcp` stays on the empty timeline and does not
+    /// read autosave; a normal launch restores the last session.
+    func loadInitialSession() async {
+        if isAgentSession {
+            ensureDefaultTracks()
+            isLoading = false
+            if videoClips.isEmpty, audioClips.isEmpty {
+                status = "Drop media to begin"
+            }
+            return
+        }
         isLoading = true
         status = "Opening…"
         isProMode = UserDefaults.standard.bool(forKey: Self.proModeDefaultsKey)
