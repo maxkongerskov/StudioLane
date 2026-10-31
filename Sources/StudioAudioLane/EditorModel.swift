@@ -2538,7 +2538,7 @@ final class EditorModel {
         let ratio = min(max(sourceTime / max(clip.sourceDuration, 0.000_1), 0), 0.999_999)
         let index = min(clip.waveform.count - 1, max(0, Int(ratio * Double(clip.waveform.count))))
         let level = min(max(clip.waveform[index] * clip.gain, 0), 1)
-        let pan = ProFeatureMath.equalPowerPan(clip.pan)
+        let pan = ProFeatureMath.unityCenterPan(clip.pan)
         return (level * pan.left, level * pan.right)
     }
 
@@ -3586,8 +3586,10 @@ final class EditorModel {
     }
 
     /// Offline mixdown: reads every timeline audio track through `audioMix`
-    /// (track volumes, clip gain, mute, ducking, fade ramps and the Pro pan/
-    /// limiter tap) as one interleaved stream and encodes it to `destination`.
+    /// (track volumes, clip gain, mute, ducking, fade ramps, and — only when a
+    /// clip is actually panned — the Pro pan/limiter tap) as one interleaved
+    /// stream and encodes it to `destination`. Centered clips do not install
+    /// that tap, so export loudness matches Standard playback.
     /// Internal for tests; never touch MainActor state from here.
     nonisolated static func performAudioExport(
         asset: AVAsset,
@@ -4682,7 +4684,9 @@ final class EditorModel {
             item.audioMix = makeAudioMix()
             item.videoComposition = makeVideoComposition()
             let wasPlaying = isPlaying
+            let playbackVolume = player.volume
             player.replaceCurrentItem(with: item)
+            player.volume = playbackVolume
             seek(to: min(currentTime, duration))
             if wasPlaying {
                 player.play()
@@ -4712,60 +4716,82 @@ final class EditorModel {
         }
     }
 
+    /// Mix parameters for every clip. Playback (`makeAudioMix`) and export share
+    /// this, so a Pro/Standard switch cannot change track volume, clip gain,
+    /// ducking, or fade endpoints. A centered clip does not install the Pro tap.
+    /// Panning uses a constant-power law whose center is unity, so loudness matches.
+    func clipAudioMixSpecs() -> [ClipAudioMixSpec] {
+        var specs: [ClipAudioMixSpec] = []
+        func append(_ clip: MediaClip, trackVolume: Float, applyDuck: Bool) {
+            let duck: Float = applyDuck ? duckFactor(for: clip) : 1
+            let clipGain = min(max(0, clip.gain), 1)
+            let mixVolume: Float = clip.muted ? 0 : trackVolume * clipGain * duck
+            let fadeIn = min(max(0, clip.fadeIn), clip.duration / 2)
+            let fadeOut = min(max(0, clip.fadeOut), max(0, clip.duration - fadeIn))
+            let tap = ProFeatureMath.playbackTap(pan: clip.pan, proMode: isProMode)
+            specs.append(ClipAudioMixSpec(
+                clipID: clip.id,
+                mixVolume: mixVolume,
+                timelineStart: clip.timelineStart,
+                duration: clip.duration,
+                fadeIn: fadeIn,
+                fadeOut: fadeOut,
+                pan: clip.pan,
+                tapLeft: tap.left,
+                tapRight: tap.right,
+                installsProcessingTap: tap.install
+            ))
+        }
+        for clip in videoClips {
+            let vol = track(id: clip.trackID)?.volume ?? videoVolume
+            append(clip, trackVolume: vol, applyDuck: false)
+        }
+        for clip in audioClips {
+            let vol = track(id: clip.trackID)?.volume ?? musicVolume
+            append(clip, trackVolume: vol, applyDuck: true)
+        }
+        return specs
+    }
+
     private func makeAudioMix() -> AVMutableAudioMix {
         let mix = AVMutableAudioMix()
         var params: [AVMutableAudioMixInputParameters] = []
-        func addMix(for clip: MediaClip, trackID: CMPersistentTrackID, volume: Float, applyDuck: Bool) {
+        for spec in clipAudioMixSpecs() {
+            guard let trackID = videoAudioTrackIDs[spec.clipID] ?? musicTrackIDs[spec.clipID] else { continue }
             let p = AVMutableAudioMixInputParameters()
             p.trackID = trackID
-            let duck: Float = applyDuck ? duckFactor(for: clip) : 1
-            let clipGain = min(max(0, clip.gain), 1)
-            let vol: Float = clip.muted ? 0 : volume * clipGain * duck
-            let start = clip.timelineStart
-            let fadeIn = min(max(0, clip.fadeIn), clip.duration / 2)
-            let fadeOut = min(max(0, clip.fadeOut), clip.duration - fadeIn)
-            if fadeIn > 0.01 && vol > 0 {
+            let start = spec.timelineStart
+            let vol = spec.mixVolume
+            if spec.fadeIn > 0.01 && vol > 0 {
                 p.setVolumeRamp(
                     fromStartVolume: 0,
                     toEndVolume: vol,
                     timeRange: CMTimeRange(
                         start: CMTime(seconds: start, preferredTimescale: 600),
-                        duration: CMTime(seconds: fadeIn, preferredTimescale: 600)
+                        duration: CMTime(seconds: spec.fadeIn, preferredTimescale: 600)
                     )
                 )
             } else {
                 p.setVolume(vol, at: CMTime(seconds: start, preferredTimescale: 600))
             }
-            if isProMode,
+            if spec.installsProcessingTap,
                let tap = ProAudioProcessor.makeTap(
-                   pan: clip.pan,
+                   pan: spec.pan,
                    limiterEnabled: proSettings.limiterEnabled
                ) {
                 p.audioTapProcessor = tap
             }
-            if fadeOut > 0.01 && vol > 0 {
+            if spec.fadeOut > 0.01 && vol > 0 {
                 p.setVolumeRamp(
                     fromStartVolume: vol,
                     toEndVolume: 0,
                     timeRange: CMTimeRange(
-                        start: CMTime(seconds: start + clip.duration - fadeOut, preferredTimescale: 600),
-                        duration: CMTime(seconds: fadeOut, preferredTimescale: 600)
+                        start: CMTime(seconds: start + spec.duration - spec.fadeOut, preferredTimescale: 600),
+                        duration: CMTime(seconds: spec.fadeOut, preferredTimescale: 600)
                     )
                 )
             }
             params.append(p)
-        }
-        for clip in videoClips {
-            if let id = videoAudioTrackIDs[clip.id] {
-                let vol = track(id: clip.trackID)?.volume ?? videoVolume
-                addMix(for: clip, trackID: id, volume: vol, applyDuck: false)
-            }
-        }
-        for clip in audioClips {
-            if let id = musicTrackIDs[clip.id] {
-                let vol = track(id: clip.trackID)?.volume ?? musicVolume
-                addMix(for: clip, trackID: id, volume: vol, applyDuck: true)
-            }
         }
         mix.inputParameters = params
         return mix

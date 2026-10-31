@@ -9,6 +9,34 @@ final class ProFeaturesTests: XCTestCase {
         XCTAssertEqual(ProFeatureMath.equalPowerPan(-1).right, 0, accuracy: 0.000_1)
         XCTAssertEqual(ProFeatureMath.equalPowerPan(1).left, 0, accuracy: 0.000_1)
         XCTAssertLessThanOrEqual(ProFeatureMath.limitedSample(8, enabled: true), 1)
+        // The ceiling must not turn down audio that already fits in full scale.
+        // The old tanh curve did, and Pro mode played quieter than Standard.
+        for sample in [Float(-1), -0.25, 0, 0.5, 0.95, 1] {
+            XCTAssertEqual(ProFeatureMath.limitedSample(sample, enabled: true), sample, accuracy: 0.000_001)
+            let processed = ProFeatureMath.processedSample(
+                sample,
+                channelGain: ProFeatureMath.unityCenterPan(0).left,
+                limiterEnabled: true
+            )
+            XCTAssertEqual(processed, sample, accuracy: 0.000_001)
+        }
+        XCTAssertEqual(ProFeatureMath.limitedSample(4, enabled: false), 4, accuracy: 0.000_001)
+        XCTAssertEqual(ProFeatureMath.limitedSample(-3, enabled: true), -1, accuracy: 0.000_001)
+        let unity = ProFeatureMath.unityCenterPan(0)
+        XCTAssertEqual(unity.left, 1, accuracy: 0.000_01)
+        XCTAssertEqual(unity.right, 1, accuracy: 0.000_01)
+        func power(_ pan: Float) -> Float {
+            let gains = ProFeatureMath.unityCenterPan(pan)
+            return gains.left * gains.left + gains.right * gains.right
+        }
+        XCTAssertEqual(power(-1), power(0), accuracy: 0.000_5)
+        XCTAssertEqual(power(1), power(0.35), accuracy: 0.000_5)
+        let centeredTap = ProFeatureMath.playbackTap(pan: 0, proMode: true)
+        XCTAssertFalse(centeredTap.install)
+        XCTAssertEqual(centeredTap.left, 1, accuracy: 0.000_01)
+        XCTAssertEqual(centeredTap.right, 1, accuracy: 0.000_01)
+        XCTAssertFalse(ProFeatureMath.playbackTap(pan: -0.8, proMode: false).install)
+        XCTAssertTrue(ProFeatureMath.playbackTap(pan: -0.8, proMode: true).install)
         XCTAssertEqual(
             ProFeatureMath.normalizedGain(current: 0.5, peak: 0.25, targetPeak: 0.9),
             1,
