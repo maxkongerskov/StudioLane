@@ -306,7 +306,7 @@ final class MCPAgentLoopTests: XCTestCase {
         let videoTracks = try await asset.loadTracks(withMediaType: .video)
         XCTAssertFalse(audioTracks.isEmpty && videoTracks.isEmpty)
 
-        let progressTokens = client.log.snapshot().compactMap { line -> Any? in
+        let progressTokens = client.outputLines().compactMap { line -> Any? in
             guard let obj = jsonObject(line),
                   obj["method"] as? String == "notifications/progress",
                   let params = obj["params"] as? [String: Any] else { return nil }
@@ -318,13 +318,21 @@ final class MCPAgentLoopTests: XCTestCase {
     }
 }
 
-/// Talks to a real `StudioAudioLane --mcp` process. Stdout is read on a
-/// background queue with no main-actor hop, so `swift test` can service the pipes.
+/// Talks to a real `StudioAudioLane --mcp` process.
+///
+/// Stdout and stderr are drained with `FileHandle.availableData` on dedicated
+/// threads. Those calls do not hop to the main actor. The parent's write ends
+/// stay open until `stop()`: closing them right after `run()` dropped the
+/// child's output on this SDK, so both pipes looked empty.
 private final class MCPProcessClient {
     let process: Process
-    let log: MCPLineLog
+    let executablePath: String
+    private let executableBytes: Int
     private let stdin: Pipe
-    private let stderrLog: MCPLineLog
+    private let stdout: Pipe
+    private let stderr: Pipe
+    private let stdoutLog: MCPByteLog
+    private let stderrLog: MCPByteLog
     private var closed = false
 
     init() throws {
@@ -332,26 +340,35 @@ private final class MCPProcessClient {
         let stdin = Pipe()
         let stdout = Pipe()
         let stderr = Pipe()
+        let stdoutLog = MCPByteLog()
+        let stderrLog = MCPByteLog()
         let process = Process()
         process.executableURL = executable
         process.arguments = ["--mcp"]
         process.standardInput = stdin
         process.standardOutput = stdout
         process.standardError = stderr
-        let log = MCPLineLog()
-        let stderrLog = MCPLineLog()
-        DispatchQueue.global(qos: .userInitiated).async {
-            MCPStdio.readLines(from: stdout.fileHandleForReading, isRunning: { true }) { line in
-                log.append(Data(line.utf8))
-            }
+        // Match a shell launch. The test runner's inserted libraries and
+        // XCTest config can keep the child alive without ever reaching --mcp.
+        var environment = ProcessInfo.processInfo.environment
+        for key in [
+            "DYLD_INSERT_LIBRARIES",
+            "XCTestConfigurationFilePath",
+            "XCTestBundlePath",
+            "XCTestSessionIdentifier",
+            "XCInjectBundle",
+            "XCInjectBundleInto"
+        ] {
+            environment.removeValue(forKey: key)
         }
-        DispatchQueue.global(qos: .utility).async {
-            while true {
-                let chunk = (try? stderr.fileHandleForReading.read(upToCount: 65_536)) ?? Data()
-                if chunk.isEmpty { break }
-                stderrLog.append(chunk)
-            }
-        }
+        process.environment = environment
+
+        // Block in read(2) before the child starts so the ready line cannot
+        // land in a pipe nobody is reading. Write ends stay open in the parent,
+        // so this is not an EOF.
+        PipeDrain(handle: stdout.fileHandleForReading, log: stdoutLog).start()
+        PipeDrain(handle: stderr.fileHandleForReading, log: stderrLog).start()
+
         do {
             try process.run()
         } catch {
@@ -360,13 +377,29 @@ private final class MCPProcessClient {
             try? stdin.fileHandleForWriting.close()
             throw error
         }
-        // The parent still holds the write ends. Close them so the readers see
-        // EOF when the child exits, without closing the child's copies.
-        try? stdout.fileHandleForWriting.close()
-        try? stderr.fileHandleForWriting.close()
+
+        let bytes = (try? FileManager.default.attributesOfItem(atPath: executable.path)[.size] as? NSNumber)?.intValue ?? -1
+        let pid = process.processIdentifier
+        let running = process.isRunning
+        let launch = "MCP test exec=\(executable.path) bytes=\(bytes) pid=\(pid) running=\(running)\n"
+        FileHandle.standardError.write(Data(launch.utf8))
+        guard running, pid > 0 else {
+            Thread.sleep(forTimeInterval: 0.05)
+            let stderrText = stderrLog.text()
+            let stdoutText = stdoutLog.text()
+            try? stdout.fileHandleForWriting.close()
+            try? stderr.fileHandleForWriting.close()
+            try? stdin.fileHandleForWriting.close()
+            throw MCPLaunchError(message: "StudioAudioLane exited during launch. exec=\(executable.path) bytes=\(bytes) pid=\(pid) status=\(process.terminationStatus)\nstdout:\n\(stdoutText)\nstderr:\n\(stderrText)")
+        }
+
         self.process = process
+        self.executablePath = executable.path
+        self.executableBytes = bytes
         self.stdin = stdin
-        self.log = log
+        self.stdout = stdout
+        self.stderr = stderr
+        self.stdoutLog = stdoutLog
         self.stderrLog = stderrLog
     }
 
@@ -388,15 +421,19 @@ private final class MCPProcessClient {
             params: ["name": tool, "arguments": arguments],
             timeout: timeout
         )
-        let result = try XCTUnwrap(rpc["result"] as? [String: Any], "\(rpc) stderr:\n\(stderrText())")
+        let result = try XCTUnwrap(rpc["result"] as? [String: Any], "\(rpc)\n\(statusLine())\nstderr:\n\(stderrText())")
         let content = try XCTUnwrap(result["content"] as? [[String: Any]])
         let text = try XCTUnwrap(content.first?["text"] as? String)
         let payload = try XCTUnwrap(jsonObject(text))
         return (rpc, payload)
     }
 
+    func outputLines() -> [String] {
+        stdoutLog.lines()
+    }
+
     func responseCount() -> Int {
-        log.snapshot().filter { jsonObject($0)?["id"] != nil }.count
+        outputLines().filter { jsonObject($0)?["id"] != nil }.count
     }
 
     func closeAndWaitForExit(timeout: TimeInterval = 8) async throws {
@@ -405,7 +442,7 @@ private final class MCPProcessClient {
         while process.isRunning, Date() < deadline {
             try await Task.sleep(nanoseconds: 50_000_000)
         }
-        XCTAssertFalse(process.isRunning, "process did not quit after stdin closed. stderr:\n\(stderrText())")
+        XCTAssertFalse(process.isRunning, "process did not quit after stdin closed. \(statusLine())\nstderr:\n\(stderrText())")
     }
 
     /// Closes stdin and kills a process that is still up. Used from `defer`.
@@ -414,6 +451,9 @@ private final class MCPProcessClient {
         if process.isRunning {
             process.terminate()
         }
+        // Unblock the drain threads once the child can no longer write.
+        try? stdout.fileHandleForWriting.close()
+        try? stderr.fileHandleForWriting.close()
     }
 
     private func closeInput() {
@@ -431,7 +471,7 @@ private final class MCPProcessClient {
     private func waitForResponse(id: Any, timeout: TimeInterval) async throws -> [String: Any] {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            for line in log.snapshot() {
+            for line in outputLines() {
                 guard let obj = jsonObject(line), idsMatch(obj["id"], id) else { continue }
                 return obj
             }
@@ -440,12 +480,20 @@ private final class MCPProcessClient {
             }
             try await Task.sleep(nanoseconds: 20_000_000)
         }
-        XCTFail("timed out waiting for id \(id). stdout:\n\(log.snapshot().joined(separator: "\n"))\nstderr:\n\(stderrText())")
+        XCTFail("timed out waiting for id \(id). \(statusLine())\nstdout:\n\(stdoutLog.text())\nstderr:\n\(stderrText())")
         throw MCPTestTimeout()
     }
 
+    private func statusLine() -> String {
+        let pid = process.processIdentifier
+        if process.isRunning {
+            return "exec=\(executablePath) bytes=\(executableBytes) pid=\(pid) still running"
+        }
+        return "exec=\(executablePath) bytes=\(executableBytes) pid=\(pid) exited status=\(process.terminationStatus)"
+    }
+
     private func stderrText() -> String {
-        stderrLog.snapshot().joined()
+        stderrLog.text()
     }
 
     /// `swift test` puts the executable next to the `.xctest` bundle.
@@ -479,6 +527,56 @@ private final class MCPProcessClient {
         }
         throw MCPExecutableNotFound(tried: tried)
     }
+}
+
+/// Blocking `availableData` loop. Not a Swift task and not the main actor.
+private final class PipeDrain: Thread {
+    private let handle: FileHandle
+    private let log: MCPByteLog
+
+    init(handle: FileHandle, log: MCPByteLog) {
+        self.handle = handle
+        self.log = log
+        super.init()
+        self.name = "StudioLaneMCPPipeDrain"
+        self.qualityOfService = .userInitiated
+    }
+
+    override func main() {
+        while !isCancelled {
+            let chunk = autoreleasepool { handle.availableData }
+            if chunk.isEmpty { return }
+            log.append(chunk)
+        }
+    }
+}
+
+private final class MCPByteLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+
+    func append(_ chunk: Data) {
+        guard !chunk.isEmpty else { return }
+        lock.lock()
+        data.append(chunk)
+        lock.unlock()
+    }
+
+    func text() -> String {
+        lock.lock()
+        let copy = data
+        lock.unlock()
+        return String(data: copy, encoding: .utf8) ?? "<\(copy.count) bytes>"
+    }
+
+    func lines() -> [String] {
+        text().split(whereSeparator: \.isNewline).map(String.init)
+    }
+}
+
+private struct MCPLaunchError: Error, LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
 }
 
 private struct MCPExecutableNotFound: Error, LocalizedError {
