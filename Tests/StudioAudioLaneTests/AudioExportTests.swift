@@ -453,6 +453,8 @@ final class AudioExportTests: XCTestCase {
         return (composition, mix)
     }
 
+    /// `EditorModel` is `@MainActor`, so its default track ids are isolated too.
+    @MainActor
     private func placeholderClip(name: String, duration: TimeInterval = 1) -> MediaClip {
         MediaClip(
             id: UUID(),
