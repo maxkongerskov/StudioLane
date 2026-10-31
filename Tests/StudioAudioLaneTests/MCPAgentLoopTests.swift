@@ -41,6 +41,34 @@ final class MCPAgentLoopTests: XCTestCase {
         )
     }
 
+    /// JSON-RPC `id` 1 arrives as `NSNumber`. Swift's `is Bool` is true for that
+    /// value, which used to make `idsMatch` reject the initialize reply.
+    func testResponseLinesMatchJSONRPCIds() throws {
+        let log = MCPByteLog()
+        log.append(Data("{\"id\":1,\"jsonrpc\":\"2.0\",\"result\":{\"protocolVersion\":\"2024-11-05\"}}\n".utf8))
+        log.append(Data("{\"id\":"))
+        log.append(Data("\"ping\"}\r\n{\"id\":true}\n"))
+        let lines = log.lines()
+        XCTAssertEqual(lines.count, 3)
+
+        let first = try XCTUnwrap(jsonObject(lines[0]))
+        XCTAssertTrue(idsMatch(first["id"], 1))
+        XCTAssertTrue(idsMatch(1, first["id"]))
+        XCTAssertFalse(idsMatch(first["id"], true))
+        XCTAssertFalse(idsMatch(first["id"], 2))
+        XCTAssertEqual(first["jsonrpc"] as? String, "2.0")
+
+        XCTAssertTrue(idsMatch(jsonObject(lines[1])?["id"], "ping"))
+        let boolID = try XCTUnwrap(jsonObject(lines[2]))
+        XCTAssertFalse(idsMatch(boolID["id"], 1))
+        XCTAssertTrue(idsMatch(boolID["id"], true))
+
+        let partial = MCPByteLog()
+        partial.append(Data("{\"id\":1,\"ok\":true}"))
+        XCTAssertEqual(partial.lines(), ["{\"id\":1,\"ok\":true}"])
+        XCTAssertTrue(idsMatch(jsonObject(partial.lines()[0])?["id"], 1))
+    }
+
     func testJSONRPCIdsNotificationsAndMissingDelete() async throws {
         let client = try MCPProcessClient()
         defer { client.stop() }
@@ -518,7 +546,7 @@ private final class MCPProcessClient {
             }
             try await Task.sleep(nanoseconds: 20_000_000)
         }
-        XCTFail("timed out waiting for id \(id). \(deliveryHint()) \(statusLine())\nstdout:\n\(stdoutLog.text())\nstderr:\n\(stderrText())")
+        XCTFail("timed out waiting for id \(id). \(deliveryHint(id: id)) \(statusLine())\nstdout:\n\(stdoutLog.text())\nstderr:\n\(stderrText())")
         throw MCPTestTimeout()
     }
 
@@ -531,19 +559,31 @@ private final class MCPProcessClient {
         return "exec=\(executablePath) bytes=\(executableBytes) pid=\(pid) exited status=\(process.terminationStatus) \(wrote)"
     }
 
-    private func deliveryHint() -> String {
+    private func deliveryHint(id: Any) -> String {
+        let lines = outputLines()
+        let parsed = lines.compactMap { jsonObject($0) }
+        if parsed.contains(where: { idsMatch($0["id"], id) }) {
+            return "matching response is already in stdout."
+        }
+        if !stdoutLog.text().trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let seen = parsed.map { describeID($0["id"]) }
+            return "stdout has \(lines.count) line(s) but none matched id \(describeID(id)). parsed ids: \(seen.joined(separator: ", "))."
+        }
         let err = stderrText()
         if err.contains("line ready"), !err.contains("wrote ") {
             return "child received the line but did not write a response."
         }
-        if err.contains("stdin read"), !err.contains("line ready") {
+        if err.contains("stdin read "), !err.contains("line ready") {
             return "child read stdin bytes but did not assemble a line."
         }
-        if err.contains("stdin eof") {
-            return "child saw stdin EOF before a request."
+        if err.contains("stdin eof"), !err.contains("line ready") {
+            return "child saw stdin EOF before a request line."
         }
-        if err.contains("stdin waiting"), !err.contains("stdin read") {
+        if err.contains("stdin waiting"), !err.contains("stdin read ") {
             return "child is blocked in read; the request never arrived."
+        }
+        if err.contains("stdin read ") || err.contains("line ready") || err.contains("handling on main") {
+            return "child logged stdin activity and stdout is empty."
         }
         return "no stdin activity after the ready log."
     }
@@ -626,7 +666,17 @@ private final class MCPByteLog: @unchecked Sendable {
     }
 
     func lines() -> [String] {
-        text().split(whereSeparator: \.isNewline).map(String.init)
+        let raw = text()
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        guard !raw.isEmpty else { return [] }
+        var parts = raw.split(separator: "\n", omittingEmptySubsequences: false).map {
+            String($0).trimmingCharacters(in: .whitespaces)
+        }
+        if raw.hasSuffix("\n"), parts.last?.isEmpty == true {
+            parts.removeLast()
+        }
+        return parts.filter { !$0.isEmpty }
     }
 }
 
@@ -674,13 +724,31 @@ private func idsMatch(_ lhs: Any?, _ rhs: Any?) -> Bool {
     return left == right
 }
 
+private func describeID(_ value: Any?) -> String {
+    normalizeID(value) ?? "unparsed(\(String(describing: value)))"
+}
+
+/// JSON-RPC ids. `JSONSerialization` boxes numbers as `NSNumber`, and Swift's
+/// `is Bool` / `as? Bool` is true for 0 and 1, so an initialize id of 1 must
+/// be told apart from a boolean with `CFBoolean`.
 private func normalizeID(_ value: Any?) -> String? {
     guard let value else { return nil }
     if value is NSNull { return "null" }
     if let string = value as? String { return "s:\(string)" }
-    if value is Bool { return nil }
-    if let number = value as? NSNumber { return "n:\(number.stringValue)" }
-    return nil
+    // `is Bool` is also true for JSON numbers 0 and 1. Only an actual Bool
+    // has this dynamic type.
+    if type(of: value) == Bool.self, let bool = value as? Bool {
+        return bool ? "b:1" : "b:0"
+    }
+    guard let number = value as? NSNumber else { return nil }
+    if CFGetTypeID(number) == CFBooleanGetTypeID() {
+        return number.boolValue ? "b:1" : "b:0"
+    }
+    let asDouble = number.doubleValue
+    if asDouble.isFinite, asDouble.rounded() == asDouble, abs(asDouble) <= Double(Int.max) {
+        return "n:\(Int(asDouble))"
+    }
+    return "n:\(asDouble)"
 }
 
 private func jsonInt(_ value: Any?) -> Int? {
