@@ -97,6 +97,10 @@ final class MCPAgentLoopTests: XCTestCase {
         let listed = try await client.request(id: "list", method: "tools/list")
         XCTAssertTrue(idsMatch(listed["id"], "list"))
         let tools = try XCTUnwrap((listed["result"] as? [String: Any])?["tools"] as? [[String: Any]])
+        let names = Set(tools.compactMap { $0["name"] as? String })
+        for required in ["render_frame", "get_waveform", "undo", "redo", "get_history", "apply_batch"] {
+            XCTAssertTrue(names.contains(required), required)
+        }
         let addClip = try XCTUnwrap(tools.first { $0["name"] as? String == "add_clip" })
         let description = try XCTUnwrap(addClip["description"] as? String)
         XCTAssertTrue(description.localizedCaseInsensitiveContains("playlist"))
@@ -294,6 +298,37 @@ final class MCPAgentLoopTests: XCTestCase {
         ])
         XCTAssertEqual(again.payload["status"] as? String, "unchanged")
         XCTAssertEqual(jsonInt(again.payload["revision"]) ?? -1, revisionAfterImport + 2)
+
+        let revisionBeforeBatch = try XCTUnwrap(jsonInt(again.payload["revision"]))
+        let batched = try await client.call(id: "batch", tool: "apply_batch", arguments: [
+            "operations": [
+                ["tool": "set_clip_volume", "arguments": ["clip_id": trimTarget, "gain": 0.4]],
+                ["tool": "set_fade_out", "arguments": ["clip_id": trimTarget, "duration": 0.05]]
+            ]
+        ])
+        XCTAssertNotEqual((batched.rpc["result"] as? [String: Any])?["isError"] as? Bool, true, "\(batched.payload)")
+        XCTAssertEqual(batched.payload["status"] as? String, "applied")
+        XCTAssertEqual(jsonInt(batched.payload["applied"]), 2)
+        XCTAssertEqual(jsonInt(batched.payload["revision"]) ?? -1, revisionBeforeBatch + 1)
+        XCTAssertEqual(batched.payload["undo_label"] as? String, "Apply batch")
+
+        let undone = try await client.call(id: "undo-batch", tool: "undo")
+        XCTAssertEqual(undone.payload["status"] as? String, "undone")
+        XCTAssertEqual(undone.payload["label"] as? String, "Apply batch")
+        XCTAssertEqual(jsonInt(undone.payload["revision"]) ?? -1, revisionBeforeBatch + 2)
+        let undoneState = try await client.call(id: "state-undo", tool: "get_project_state")
+        let undoneClips = try XCTUnwrap(undoneState.payload["clips"] as? [[String: Any]])
+        let undoneClip = try XCTUnwrap(undoneClips.first { $0["id"] as? String == trimTarget })
+        XCTAssertEqual(jsonDouble(undoneClip["fade_out"]) ?? -1, 0, accuracy: 0.001)
+        XCTAssertEqual(jsonDouble(undoneClip["gain"]) ?? -1, 1, accuracy: 0.02)
+        let history = try await client.call(id: "history", tool: "get_history")
+        let redoLabels = try XCTUnwrap(history.payload["redo_labels"] as? [String])
+        XCTAssertEqual(redoLabels.first, "Apply batch")
+
+        let redone = try await client.call(id: "redo-batch", tool: "redo")
+        XCTAssertEqual(redone.payload["status"] as? String, "redone")
+        XCTAssertEqual(redone.payload["label"] as? String, "Apply batch")
+        XCTAssertEqual(jsonInt(redone.payload["revision"]) ?? -1, revisionBeforeBatch + 3)
 
         let timeline = jsonDouble(
             (try await client.call(id: "state-before-export", tool: "get_project_state")).payload["timeline_duration"]

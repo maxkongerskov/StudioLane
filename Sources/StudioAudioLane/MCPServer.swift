@@ -1,4 +1,5 @@
 import AppKit
+import CoreFoundation
 import Foundation
 
 // MARK: - MCP Server (stdio JSON-RPC)
@@ -324,6 +325,42 @@ final class MCPServer {
                 ["type": "object", "properties": [:]]
             ),
             toolDef(
+                "get_history",
+                "Recent undo and redo labels, newest first. can_undo and can_redo match the Edit menu. Labels come from the same history the window uses, so a change made in the UI shows up here.",
+                [
+                    "type": "object",
+                    "properties": [
+                        "limit": ["type": "integer", "description": "How many labels to return on each stack. Defaults to 20. Clamped to 1–100."]
+                    ]
+                ]
+            ),
+            toolDef(
+                "get_waveform",
+                "Downsampled peak and RMS for one clip or the mixed timeline. peaks and rms are linear amplitude (1 is full scale), one value per bucket. Pass clip_id to read that file over the overlap, ignoring lane volume. Omit clip_id to mix everything you would hear, including lane volume, clip gain, mute, and fades. Audio-only projects work. A range with no audible clips returns no_audio.",
+                [
+                    "type": "object",
+                    "properties": [
+                        "clip_id": ["type": "string", "description": "Clip to measure. Omit for the mixed timeline."],
+                        "start": ["type": "number", "description": "Range start in timeline seconds. Defaults to the clip start, or 0 for the mix."],
+                        "duration": ["type": "number", "description": "Range length in seconds. Defaults to the rest of the clip or the timeline."],
+                        "buckets": ["type": "integer", "description": "Number of peak/RMS pairs. Defaults to 64. Clamped to 1–2048."]
+                    ]
+                ]
+            ),
+            toolDef(
+                "render_frame",
+                "Render the composited video frame at a timeline time to a PNG. Returns file_path, width, and height. Set include_image true to also return MCP image content (base64 PNG). max_dimension is the longest edge in pixels (default 640, clamped to 16–4096). An audio-only project returns no_video.",
+                [
+                    "type": "object",
+                    "properties": [
+                        "time": ["type": "number", "description": "Timeline time in seconds. Defaults to the playhead."],
+                        "max_dimension": ["type": "integer", "description": "Longest edge of the PNG in pixels. Defaults to 640."],
+                        "destination_path": ["type": "string", "description": "Absolute PNG path. A temporary file is used when omitted."],
+                        "include_image": ["type": "boolean", "description": "When true, the tool result also contains an image content block. Defaults to false."]
+                    ]
+                ]
+            ),
+            toolDef(
                 "add_clip",
                 """
                 Add a video, image, or audio file. Returns clip_id plus track_id, file_path, timeline_start, duration, source_duration, and the fades actually stored. Images go on a video lane. \(MCPHandlers.editingBehavior) rippled and auto_crossfade in the result say whether this call moved other clips or wrote fades you did not ask for.
@@ -416,8 +453,42 @@ final class MCPServer {
                 ], required: ["clip_id"])
             ),
             toolDef(
+                "undo",
+                "Undo the last timeline edit. Uses the same history as the window, so this undoes an MCP edit or a change made in the UI. Revision increases by one; it does not rewind. nothing_to_undo when the stack is empty, and the revision stays put.",
+                editable([String: Any](), required: [])
+            ),
+            toolDef(
+                "redo",
+                "Redo the last undone timeline edit. Same history as the window. Revision increases by one. nothing_to_redo when there is nothing to restore.",
+                editable([String: Any](), required: [])
+            ),
+            toolDef(
+                "apply_batch",
+                "Apply tools in order, all or nothing. operations is a list of {tool, arguments}. If any step fails, the timeline returns to the pre-batch state and the error names failed_step (0-based), failed_tool, and step_error. A successful batch is one undo step labeled Apply batch and bumps revision once. dry_run validates by running the steps and then restoring the timeline, without bumping revision. export_project, cancel_export, undo, redo, batch_edit, and apply_batch are not allowed inside a batch. Playlist ripple still applies to add_clip and delete_clip.",
+                [
+                    "type": "object",
+                    "properties": [
+                        "operations": [
+                            "type": "array",
+                            "description": "Ordered steps. Each object has tool and arguments.",
+                            "items": [
+                                "type": "object",
+                                "properties": [
+                                    "tool": ["type": "string"],
+                                    "arguments": ["type": "object"]
+                                ],
+                                "required": ["tool"]
+                            ]
+                        ],
+                        "dry_run": ["type": "boolean", "description": "Run every step, then restore the timeline. Defaults to false."],
+                        "expected_revision": ["type": "integer", "description": "Reject the batch if the project revision is no longer this value. Nothing is applied."]
+                    ],
+                    "required": ["operations"]
+                ]
+            ),
+            toolDef(
                 "batch_edit",
-                "Apply edit operations in order. This is not rolled back if a later operation fails: errors lists the failures and applied_ops counts how many ran. Ops are trim_clip, move_clip, set_clip_volume, set_fade_in, set_fade_out, clear_fades, toggle_mute, and crossfade_clips. Playlist ripple and auto-crossfade still apply to any included op that adds or deletes audio (none of the current ops do). A no-op op does not bump revision.",
+                "Apply a short list of edits in order. This is not rolled back if a later operation fails: errors lists the failures and applied_ops counts how many ran. Use apply_batch when a failure must restore the timeline and count as one undo step. Ops are trim_clip, move_clip, set_clip_volume, set_fade_in, set_fade_out, clear_fades, toggle_mute, and crossfade_clips. A no-op op does not bump revision.",
                 [
                     "type": "object",
                     "properties": [
@@ -495,12 +566,21 @@ final class MCPServer {
     // MARK: - Tool Dispatch
 
     private func callTool(name: String, arguments: [String: Any], requestId: Any) async -> Data {
+        toolImageBase64 = nil
         let result = await dispatchTool(name: name, arguments: arguments)
+        let image = name == "render_frame" ? toolImageBase64 : nil
+        toolImageBase64 = nil
         switch result {
         case .success(let value):
-            return MCPJSONRPC.response(id: requestId, result: [
-                "content": [["type": "text", "text": encodeJSON(value)]]
-            ])
+            var content: [[String: Any]] = [["type": "text", "text": encodeJSON(value)]]
+            if let image, !image.isEmpty {
+                content.append([
+                    "type": "image",
+                    "data": image,
+                    "mimeType": "image/png"
+                ])
+            }
+            return MCPJSONRPC.response(id: requestId, result: ["content": content])
         case .failure(let error):
             return MCPJSONRPC.response(id: requestId, result: [
                 "isError": true,
@@ -515,9 +595,20 @@ final class MCPServer {
         return String(data: data, encoding: .utf8) ?? "{}"
     }
 
+    /// Base64 PNG for the in-flight `render_frame` result. Cleared by `callTool`.
+    private var toolImageBase64: String?
+
     private struct MCPDictError: Error {
         let dict: [String: Any]
     }
+
+    private static let batchableTools: Set<String> = [
+        "get_project_state", "get_export_status", "get_history", "get_waveform", "render_frame",
+        "add_clip", "trim_clip", "move_clip", "split_clip", "delete_clip",
+        "set_clip_volume", "set_track_volume", "toggle_mute",
+        "set_fade_in", "set_fade_out", "clear_fades", "crossfade_clips",
+        "create_project_template"
+    ]
 
     private func map(_ result: Result<[String: Any], MCPErrorResponse>) -> Result<[String: Any], MCPDictError> {
         switch result {
@@ -528,17 +619,44 @@ final class MCPServer {
         }
     }
 
-    /// JSON numbers arrive as `NSNumber`. Casts to `Double` fail for whole
-    /// numbers, which is how agents usually write `1` and `0`.
+    /// JSON numbers arrive as `NSNumber`. `value is Bool` is true for 0 and 1,
+    /// so only a real CFBoolean is left alone. Whole numbers become `Double`
+    /// because `as? Double` fails on an integer `NSNumber`. Nested objects and
+    /// arrays are walked so `apply_batch` steps see the same numbers.
     private func coerceNumbers(_ arguments: [String: Any]) -> [String: Any] {
-        var copy = arguments
+        var copy: [String: Any] = [:]
+        copy.reserveCapacity(arguments.count)
         for (key, value) in arguments {
-            if value is Bool { continue }
-            if let number = value as? NSNumber {
-                copy[key] = number.doubleValue
-            }
+            copy[key] = coerceJSON(value)
         }
         return copy
+    }
+
+    private func coerceJSON(_ value: Any) -> Any {
+        if jsonBool(value) != nil { return value }
+        if let number = value as? NSNumber {
+            return number.doubleValue
+        }
+        if let dict = value as? [String: Any] {
+            return coerceNumbers(dict)
+        }
+        if let list = value as? [Any] {
+            return list.map { coerceJSON($0) }
+        }
+        return value
+    }
+
+    /// Swift `Bool` or a real `CFBoolean`. `NSNumber` 0 and 1 also satisfy `is Bool`
+    /// and `is Int`, so those checks cannot run first — they would turn `true`
+    /// into the number 1 and drop `dry_run` / `include_image` / `confirmed`.
+    private func jsonBool(_ value: Any?) -> Bool? {
+        guard let value, !(value is NSNull) else { return nil }
+        if type(of: value) == Bool.self {
+            return value as? Bool
+        }
+        guard let number = value as? NSNumber else { return nil }
+        guard CFGetTypeID(number) == CFBooleanGetTypeID() else { return nil }
+        return number.boolValue
     }
 
     private func intArg(_ arguments: [String: Any], _ key: String) -> Int? {
@@ -553,11 +671,47 @@ final class MCPServer {
         let arguments = coerceNumbers(rawArguments)
         switch name {
         case "get_project_state":
-            let compact = (arguments["compact"] as? Bool) ?? false
+            let compact = jsonBool(arguments["compact"]) ?? false
             return .success(MCPHandlers.getProjectState(model: model, compact: compact))
 
         case "get_export_status":
             return .success(MCPHandlers.getExportStatus(model: model))
+
+        case "get_history":
+            let limit = intArg(arguments, "limit") ?? 20
+            let labels = model.historyLabels(limit: limit)
+            return .success([
+                "revision": model.mcpRevision,
+                "can_undo": model.canUndo,
+                "can_redo": model.canRedo,
+                "undo_labels": labels.undo,
+                "redo_labels": labels.redo
+            ])
+
+        case "get_waveform":
+            return map(await MCPHandlers.getWaveform(
+                model: model,
+                clipId: arguments["clip_id"] as? String,
+                start: arguments["start"] as? Double,
+                duration: arguments["duration"] as? Double,
+                buckets: intArg(arguments, "buckets")
+            ))
+
+        case "render_frame":
+            let rendered = await MCPHandlers.renderFrame(
+                model: model,
+                time: arguments["time"] as? Double,
+                maxDimension: intArg(arguments, "max_dimension"),
+                destination: arguments["destination_path"] as? String,
+                includeImage: jsonBool(arguments["include_image"]) ?? false
+            )
+            switch rendered {
+            case .success(let frame):
+                toolImageBase64 = frame.imageBase64
+                return .success(frame.payload)
+            case .failure(let error):
+                return .failure(errorDict(error))
+            }
 
         case "add_clip":
             if let conflict = checkExpectedRevision(arguments) { return .failure(conflict) }
@@ -600,7 +754,7 @@ final class MCPServer {
             return map(MCPHandlers.deleteClip(
                 model: model,
                 clipId: arguments["clip_id"] as? String ?? "",
-                confirmed: arguments["confirmed"] as? Bool ?? false
+                confirmed: jsonBool(arguments["confirmed"]) ?? false
             ))
 
         case "set_clip_volume":
@@ -644,6 +798,39 @@ final class MCPServer {
         case "clear_fades":
             if let conflict = checkExpectedRevision(arguments) { return .failure(conflict) }
             return map(MCPHandlers.clearFades(model: model, clipId: arguments["clip_id"] as? String ?? ""))
+
+        case "undo":
+            if let conflict = checkExpectedRevision(arguments) { return .failure(conflict) }
+            guard let label = model.undo() else {
+                return .failure(MCPDictError(dict: [
+                    "error": "nothing_to_undo",
+                    "message": "There is nothing to undo.",
+                    "revision": model.mcpRevision
+                ] as [String: Any]))
+            }
+            return .success(MCPHandlers.outcome(model, status: "undone", extra: [
+                "label": label,
+                "can_undo": model.canUndo,
+                "can_redo": model.canRedo
+            ]))
+
+        case "redo":
+            if let conflict = checkExpectedRevision(arguments) { return .failure(conflict) }
+            guard let label = model.redo() else {
+                return .failure(MCPDictError(dict: [
+                    "error": "nothing_to_redo",
+                    "message": "There is nothing to redo.",
+                    "revision": model.mcpRevision
+                ] as [String: Any]))
+            }
+            return .success(MCPHandlers.outcome(model, status: "redone", extra: [
+                "label": label,
+                "can_undo": model.canUndo,
+                "can_redo": model.canRedo
+            ]))
+
+        case "apply_batch":
+            return await applyBatch(arguments)
 
         case "batch_edit":
             return batchEdit(arguments)
@@ -695,6 +882,122 @@ final class MCPServer {
         let conflict = MCPHandlers.checkRevision(model: model, expected: expected)
         guard let conflict else { return nil }
         return errorDict(conflict)
+    }
+
+    private func applyBatch(_ args: [String: Any]) async -> Result<[String: Any], MCPDictError> {
+        if let conflict = checkExpectedRevision(args) { return .failure(conflict) }
+        guard let ops = objectArray(args["operations"]), !ops.isEmpty else {
+            return .failure(MCPDictError(dict: [
+                "error": "invalid_operations",
+                "message": "operations must be a non-empty array of {tool, arguments} objects"
+            ] as [String: Any]))
+        }
+
+        let dryRun = jsonBool(args["dry_run"]) ?? false
+        for (index, op) in ops.enumerated() {
+            let tool = (op["tool"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !tool.isEmpty else {
+                return batchRejected(step: index, tool: "", code: "invalid_operation", message: "Each operation needs a tool name.")
+            }
+            guard Self.batchableTools.contains(tool) else {
+                return batchRejected(
+                    step: index,
+                    tool: tool,
+                    code: "not_batchable",
+                    message: "\(tool) cannot run inside apply_batch. Export, undo, redo, and nested batches are separate calls."
+                )
+            }
+            if op["arguments"] != nil, !(op["arguments"] is [String: Any]) {
+                return batchRejected(step: index, tool: tool, code: "invalid_arguments", message: "arguments must be an object.")
+            }
+        }
+
+        let preimage = model.beginGroupedEdit()
+        let revision = model.mcpRevision
+        let projectURL = model.projectFileURL
+        model.journalProjectWrites = !dryRun
+        model.skipProjectWrites = dryRun
+        model.projectWriteJournal.removeAll()
+
+        var results: [[String: Any]] = []
+        for (index, op) in ops.enumerated() {
+            let tool = (op["tool"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let stepArgs = (op["arguments"] as? [String: Any]) ?? [:]
+            let outcome = await dispatchTool(name: tool, arguments: stepArgs)
+            switch outcome {
+            case .success(let payload):
+                results.append(payload)
+            case .failure(let error):
+                rollbackBatch(to: preimage, revision: revision, projectURL: projectURL)
+                return .failure(batchFailure(step: index, tool: tool, error: error))
+            }
+        }
+
+        if dryRun {
+            rollbackBatch(to: preimage, revision: revision, projectURL: projectURL)
+            return .success([
+                "status": "dry_run",
+                "would_apply": ops.count,
+                "revision": model.mcpRevision,
+                "results": results
+            ])
+        }
+
+        model.commitGroupedEdit(label: "Apply batch", preimage: preimage)
+        model.finishProjectWriteJournal()
+        let finalRevision = model.mcpRevision
+        for index in results.indices {
+            results[index]["revision"] = finalRevision
+        }
+        return .success([
+            "status": "applied",
+            "applied": ops.count,
+            "revision": finalRevision,
+            "undo_label": "Apply batch",
+            "results": results
+        ])
+    }
+
+    private func rollbackBatch(to preimage: EditorSnapshot, revision: Int, projectURL: URL?) {
+        model.discardGroupedEdit(restoring: preimage)
+        model.restoreMCPRevision(revision)
+        model.rollbackProjectWrites()
+        model.projectFileURL = projectURL
+        model.errorMessage = nil
+    }
+
+    private func batchRejected(step: Int, tool: String, code: String, message: String) -> Result<[String: Any], MCPDictError> {
+        .failure(MCPDictError(dict: [
+            "error": "batch_failed",
+            "message": "operations[\(step)] \(tool) failed: \(message)",
+            "failed_step": step,
+            "failed_tool": tool,
+            "step_error": code,
+            "step_message": message,
+            "revision": model.mcpRevision
+        ] as [String: Any]))
+    }
+
+    private func batchFailure(step: Int, tool: String, error: MCPDictError) -> MCPDictError {
+        let code = error.dict["error"] as? String ?? "step_failed"
+        let message = error.dict["message"] as? String ?? "Step failed"
+        return MCPDictError(dict: [
+            "error": "batch_failed",
+            "message": "operations[\(step)] \(tool) failed: \(message)",
+            "failed_step": step,
+            "failed_tool": tool,
+            "step_error": code,
+            "step_message": message,
+            "revision": model.mcpRevision
+        ] as [String: Any])
+    }
+
+    private func objectArray(_ value: Any?) -> [[String: Any]]? {
+        if let typed = value as? [[String: Any]] { return typed }
+        guard let items = value as? [Any] else { return nil }
+        let dicts = items.compactMap { $0 as? [String: Any] }
+        guard dicts.count == items.count else { return nil }
+        return dicts
     }
 
     private func batchEdit(_ args: [String: Any]) -> Result<[String: Any], MCPDictError> {
@@ -763,7 +1066,7 @@ final class MCPServer {
     }
 
     private func createProjectTemplate(_ args: [String: Any]) async -> Result<[String: Any], MCPDictError> {
-        guard args["confirmed"] as? Bool == true else {
+        guard jsonBool(args["confirmed"]) == true else {
             return .failure(MCPDictError(dict: [
                 "error": "confirmation_required",
                 "message": "Set confirmed=true to replace the current timeline with an empty template."
@@ -789,7 +1092,7 @@ final class MCPServer {
             let finalURL = requested.pathExtension.lowercased() == "salproject"
                 ? requested
                 : requested.deletingPathExtension().appendingPathExtension("salproject")
-            if FileManager.default.fileExists(atPath: finalURL.path), args["overwrite"] as? Bool != true {
+            if FileManager.default.fileExists(atPath: finalURL.path), jsonBool(args["overwrite"]) != true {
                 return .failure(MCPDictError(dict: [
                     "error": "file_exists",
                     "message": "Destination already exists. Pass overwrite=true to replace it."
@@ -800,9 +1103,10 @@ final class MCPServer {
             destination = nil
         }
 
-        let previousRevision = model.mcpRevision
-        await model.resetForTemplate(videoTrackCount: videoCount, audioTrackCount: audioCount, name: name)
-        guard model.mcpRevision > previousRevision else {
+        model.armHistoryLabel("Create template")
+        let applied = await model.resetForTemplate(videoTrackCount: videoCount, audioTrackCount: audioCount, name: name)
+        guard applied else {
+            model.disarmHistoryLabel()
             return .failure(MCPDictError(dict: ["error": "template_failed", "message": "Template could not be applied"] as [String: Any]))
         }
 
@@ -836,7 +1140,7 @@ final class MCPServer {
         let container = (args["container"] as? String)?.lowercased() ?? "mp4"
         let codecRaw = (args["codec"] as? String)?.lowercased() ?? "h264"
         let qualityRaw = (args["quality"] as? String)?.lowercased() ?? "high"
-        let overwrite = args["overwrite"] as? Bool ?? false
+        let overwrite = jsonBool(args["overwrite"]) ?? false
 
         let containerEnum: ExportSettings.Container
         switch container {
@@ -895,7 +1199,7 @@ final class MCPServer {
             "codec": codecRaw,
             "quality": qualityRaw,
             "revision": model.mcpRevision,
-            "finder_reveal": model.revealExportsInFinder,
+            "finder_reveal": model.shouldRevealExportedFileInFinder,
             "note": audioOnly
                 ? "Audio-only timeline. This file is a WAV mixdown; the extension may differ from the path you passed. Finder is not opened. Poll get_export_status until is_exporting is false."
                 : "Export is running in the background. Finder is not opened when the app was launched with --mcp. Poll get_export_status until is_exporting is false and succeeded is true."
