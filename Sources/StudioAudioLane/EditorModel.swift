@@ -219,6 +219,34 @@ struct MediaClip: Identifiable, Codable {
     }
 }
 
+struct CompositedFrame: Sendable {
+    var url: URL
+    var png: Data
+    var width: Int
+    var height: Int
+    var time: TimeInterval
+}
+
+enum FrameRenderError: Error {
+    case noVideo
+    case failed(String)
+}
+
+struct AmplitudeReading: Sendable {
+    var peaks: [Double]
+    var rms: [Double]
+    var start: Double
+    var duration: Double
+    var sampleRate: Double
+}
+
+enum AmplitudeReadError: Error {
+    case clipNotFound
+    case noAudio
+    case outsideRange
+    case unreadable
+}
+
 struct EditorSnapshot: Codable {
     var videoClips: [MediaClip]
     var audioClips: [MediaClip]
@@ -742,8 +770,17 @@ final class EditorModel {
     private var videoAudioTrackIDs: [UUID: CMPersistentTrackID] = [:]
     private var didStart = false
     private var terminationObserver: NSObjectProtocol?
-    private var history: [EditorSnapshot] = []
-    private var future: [EditorSnapshot] = []
+    private struct HistoryEntry {
+        var label: String
+        var snapshot: EditorSnapshot
+    }
+
+    private var history: [HistoryEntry] = []
+    private var future: [HistoryEntry] = []
+    private var nextHistoryLabel: String?
+    /// While set, `pushHistory` and `bumpMCPRevision` do not record. `apply_batch`
+    /// uses this so the whole batch is one undo step and one revision.
+    private var historyRecordingSuppressed = false
     private var autosaveTimer: Timer?
     /// Lock-box token for the writer pipeline. `Task.isCancelled` is always false
     /// inside `requestMediaDataWhenReady` callbacks (they run on raw dispatch queues
@@ -779,8 +816,15 @@ final class EditorModel {
 
     /// `--mcp` sessions start empty. They must not read or write the user's autosave.
     private(set) var isAgentSession = false
-    /// UI exports select the file in Finder. Agent sessions leave Finder alone.
+    /// Single switch for revealing an export in Finder.
+    /// A normal launch selects the file. `--mcp` turns this off in `enterAgentSession`,
+    /// and tests start with it off. `shouldRevealExportedFileInFinder` is the gate
+    /// every reveal path uses, so XCTest cannot open Finder even if the flag is forced on.
     var revealExportsInFinder = true
+    /// Set while `apply_batch` is running so nested edits do not each push history.
+    var journalProjectWrites = false
+    var skipProjectWrites = false
+    var projectWriteJournal: [(url: URL, previous: Data?)] = []
     /// Tests point this at a temporary folder so the real autosave is never touched.
     var autosaveDirectoryOverride: URL?
     /// Kept after the in-flight URL is cleared so `get_export_status` can still
@@ -789,9 +833,29 @@ final class EditorModel {
     private(set) var completedExportSucceeded = false
 
     init() {
+        if Self.isRunningUnderXCTest {
+            revealExportsInFinder = false
+        }
         if CommandLine.arguments.contains("--mcp") {
             enterAgentSession()
         }
+    }
+
+    /// True when this process is the test runner. The `--mcp` child launched by
+    /// tests does not inherit XCTest, so it is not treated as a test.
+    static var isRunningUnderXCTest: Bool {
+        let env = ProcessInfo.processInfo.environment
+        if env["XCTestConfigurationFilePath"] != nil
+            || env["XCTestBundlePath"] != nil
+            || env["XCTestSessionIdentifier"] != nil {
+            return true
+        }
+        return NSClassFromString("XCTestCase") != nil
+    }
+
+    /// The only Finder-reveal decision. Call sites must not touch `NSWorkspace` themselves.
+    var shouldRevealExportedFileInFinder: Bool {
+        revealExportsInFinder && !Self.isRunningUnderXCTest
     }
 
     /// Empty timeline, no autosave, no Finder reveal. Used by `--mcp` and tests.
@@ -806,7 +870,13 @@ final class EditorModel {
     }
 
     func bumpMCPRevision() {
+        guard !historyRecordingSuppressed else { return }
         mcpRevision += 1
+    }
+
+    /// Puts the revision back after a batch rollback. Successful edits only move forward.
+    func restoreMCPRevision(_ value: Int) {
+        mcpRevision = max(0, value)
     }
 
     /// MCP edits that already went through `pushHistory` have bumped once.
@@ -934,8 +1004,10 @@ final class EditorModel {
 
     /// MCP template entry point — replaces the live timeline without a confirmation dialog.
     /// The MCP layer owns the explicit confirmation gate.
-    func resetForTemplate(videoTrackCount: Int, audioTrackCount: Int, name: String?) async {
-        guard !isExporting else { return }
+    /// Returns false when an export is in progress and the timeline is left alone.
+    @discardableResult
+    func resetForTemplate(videoTrackCount: Int, audioTrackCount: Int, name: String?) async -> Bool {
+        guard !isExporting else { return false }
         let revisionBefore = mcpRevision
         pushHistory()
 
@@ -982,6 +1054,7 @@ final class EditorModel {
         projectFileURL = nil
         scheduleAutosave()
         await rebuildAndWait()
+        return true
     }
 
     /// MCP save entry point — bypasses the save panel after template creation.
@@ -989,10 +1062,39 @@ final class EditorModel {
         let finalURL = destination.pathExtension.lowercased() == "salproject"
             ? destination
             : destination.deletingPathExtension().appendingPathExtension("salproject")
+        if journalProjectWrites, !skipProjectWrites {
+            let previous = try? Data(contentsOf: finalURL)
+            projectWriteJournal.append((url: finalURL, previous: previous))
+        }
+        if skipProjectWrites {
+            projectFileURL = finalURL
+            status = "Saved \(finalURL.lastPathComponent)"
+            errorMessage = nil
+            return
+        }
         try writeProjectDocument(makeProjectDocument(), to: finalURL)
         projectFileURL = finalURL
         status = "Saved \(finalURL.lastPathComponent)"
         errorMessage = nil
+    }
+
+    func rollbackProjectWrites() {
+        for entry in projectWriteJournal.reversed() {
+            if let previous = entry.previous {
+                try? previous.write(to: entry.url, options: Data.WritingOptions.atomic)
+            } else {
+                try? FileManager.default.removeItem(at: entry.url)
+            }
+        }
+        projectWriteJournal.removeAll()
+        journalProjectWrites = false
+        skipProjectWrites = false
+    }
+
+    func finishProjectWriteJournal() {
+        projectWriteJournal.removeAll()
+        journalProjectWrites = false
+        skipProjectWrites = false
     }
 
     private static func filmstripFrameCount(for sourceDuration: TimeInterval) -> Int {
@@ -1323,23 +1425,82 @@ final class EditorModel {
         isEditingClip = true
     }
 
-    func undo() {
-        guard let snapshot = history.popLast() else { return }
-        future.append(currentSnapshot)
-        restore(snapshot)
+    @discardableResult
+    func undo() -> String? {
+        guard let entry = history.popLast() else { return nil }
+        future.append(HistoryEntry(label: entry.label, snapshot: currentSnapshot))
+        restore(entry.snapshot)
+        refreshHistoryState()
+        bumpMCPRevision()
         rebuild()
+        return entry.label
     }
 
-    func redo() {
-        guard let snapshot = future.popLast() else { return }
-        history.append(currentSnapshot)
-        restore(snapshot)
+    @discardableResult
+    func redo() -> String? {
+        guard let entry = future.popLast() else { return nil }
+        history.append(HistoryEntry(label: entry.label, snapshot: currentSnapshot))
+        restore(entry.snapshot)
+        refreshHistoryState()
+        bumpMCPRevision()
         rebuild()
+        return entry.label
+    }
+
+    /// Labels an edit that is about to call `pushHistory` internally (add, delete, template).
+    func armHistoryLabel(_ label: String) {
+        nextHistoryLabel = label
+    }
+
+    func disarmHistoryLabel() {
+        nextHistoryLabel = nil
+    }
+
+    /// Records one undo step for a mutation that does not go through `pushHistory`.
+    func recordHistory(_ label: String) {
+        armHistoryLabel(label)
+        pushHistory()
+    }
+
+    /// Newest labels first, capped at `limit`.
+    func historyLabels(limit: Int) -> (undo: [String], redo: [String]) {
+        let cap = min(max(limit, 1), 100)
+        return (
+            undo: Array(history.suffix(cap).reversed().map(\.label)),
+            redo: Array(future.suffix(cap).reversed().map(\.label))
+        )
+    }
+
+    func beginGroupedEdit() -> EditorSnapshot {
+        historyRecordingSuppressed = true
+        nextHistoryLabel = nil
+        return currentSnapshot
+    }
+
+    func discardGroupedEdit(restoring snapshot: EditorSnapshot) {
+        historyRecordingSuppressed = false
+        nextHistoryLabel = nil
+        restore(snapshot)
+        scheduleRebuild()
+    }
+
+    /// One history entry for a batch, using the snapshot taken before any step ran.
+    func commitGroupedEdit(label: String, preimage: EditorSnapshot) {
+        historyRecordingSuppressed = false
+        nextHistoryLabel = nil
+        history.append(HistoryEntry(label: label, snapshot: preimage))
+        future.removeAll()
+        if history.count > 100 { history.removeFirst() }
+        refreshHistoryState()
+        bumpMCPRevision()
     }
 
     private func pushHistory() {
+        let label = nextHistoryLabel ?? "Edit"
+        nextHistoryLabel = nil
+        guard !historyRecordingSuppressed else { return }
         guard !isLoading else { return }
-        history.append(currentSnapshot)
+        history.append(HistoryEntry(label: label, snapshot: currentSnapshot))
         future.removeAll()
         if history.count > 100 { history.removeFirst() }
         refreshHistoryState()
@@ -2377,6 +2538,139 @@ final class EditorModel {
     }
 
     func scheduleRebuildPublic() { scheduleRebuild() }
+
+    /// Renders the composited picture at `time`. Audio-only timelines fail with `noVideo`.
+    func renderCompositedFrame(at requested: TimeInterval, maxDimension: Int, destination: URL?) async -> Result<CompositedFrame, FrameRenderError> {
+        guard hasVideo else { return .failure(.noVideo) }
+        await rebuildAndWait()
+        guard let item = player.currentItem else {
+            return .failure(.failed("The timeline has no composited picture yet."))
+        }
+        let maxEdge = max(16, min(maxDimension, 4096))
+        let upper = max(0, duration - 0.001)
+        let time = min(max(0, requested), upper)
+        let generator = AVAssetImageGenerator(asset: item.asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: maxEdge, height: maxEdge)
+        generator.requestedTimeToleranceBefore = CMTime(seconds: 0.05, preferredTimescale: 600)
+        generator.requestedTimeToleranceAfter = CMTime(seconds: 0.05, preferredTimescale: 600)
+        if let composition = item.videoComposition {
+            generator.videoComposition = composition
+        }
+        let cgImage: CGImage
+        do {
+            cgImage = try generator.copyCGImage(at: CMTime(seconds: time, preferredTimescale: 600), actualTime: nil)
+        } catch {
+            return .failure(.failed(error.localizedDescription))
+        }
+        let fitted = Self.fitted(cgImage, maxEdge: maxEdge)
+        guard let png = Self.pngData(fitted) else {
+            return .failure(.failed("Could not encode a PNG."))
+        }
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StudioLane/frames", isDirectory: true)
+        let url = destination ?? folder.appendingPathComponent("frame-\(UUID().uuidString).png")
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try png.write(to: url, options: Data.WritingOptions.atomic)
+        } catch {
+            return .failure(.failed(error.localizedDescription))
+        }
+        return .success(CompositedFrame(url: url, png: png, width: fitted.width, height: fitted.height, time: time))
+    }
+
+    /// Clip scope is the file's linear amplitude. Timeline scope is the mix you hear
+    /// (lane volume, clip gain, mute, and fades).
+    func amplitudeReading(clipID: UUID?, start: Double?, duration requestedDuration: Double?, buckets: Int) async -> Result<AmplitudeReading, AmplitudeReadError> {
+        let points = min(2048, max(1, buckets))
+        if let clipID {
+            guard let clip = videoClips.first(where: { $0.id == clipID }) ?? audioClips.first(where: { $0.id == clipID }) else {
+                return .failure(.clipNotFound)
+            }
+            let rangeStart = start ?? clip.timelineStart
+            let rangeDuration = requestedDuration ?? max(0, clip.timelineEnd - rangeStart)
+            guard rangeDuration > 0.000_1 else { return .failure(.outsideRange) }
+            let overlapStart = max(rangeStart, clip.timelineStart)
+            let overlapEnd = min(rangeStart + rangeDuration, clip.timelineEnd)
+            let overlap = overlapEnd - overlapStart
+            guard overlap > 0.000_1 else { return .failure(.outsideRange) }
+            let sourceStart = clip.inPoint + (overlapStart - clip.timelineStart)
+            guard let analyzed = await Waveform.analyzeFile(url: clip.url, start: sourceStart, limit: overlap, buckets: points) else {
+                return .failure(.unreadable)
+            }
+            return .success(AmplitudeReading(
+                peaks: analyzed.peaks,
+                rms: analyzed.rms,
+                start: overlapStart,
+                duration: overlap,
+                sampleRate: analyzed.sampleRate
+            ))
+        }
+
+        let rangeStart = max(0, start ?? 0)
+        let rangeDuration = requestedDuration ?? max(0, duration - rangeStart)
+        guard rangeDuration > 0.000_1 else { return .failure(.noAudio) }
+        var mixClips: [Waveform.MixClip] = []
+        func append(_ clip: MediaClip) {
+            guard !clip.muted, clip.gain > 0.000_1 else { return }
+            let overlapStart = max(rangeStart, clip.timelineStart)
+            let overlapEnd = min(rangeStart + rangeDuration, clip.timelineEnd)
+            guard overlapEnd - overlapStart > 0.000_1 else { return }
+            let lane = track(id: clip.trackID)?.volume ?? (audioClips.contains(where: { $0.id == clip.id }) ? musicVolume : videoVolume)
+            let gain = Double(min(max(lane, 0), 1) * min(max(clip.gain, 0), 1))
+            guard gain > 0 else { return }
+            mixClips.append(Waveform.MixClip(
+                url: clip.url,
+                timelineStart: clip.timelineStart,
+                sourceStart: clip.inPoint,
+                duration: clip.duration,
+                gain: gain,
+                fadeIn: clip.fadeIn,
+                fadeOut: clip.fadeOut
+            ))
+        }
+        for clip in audioClips { append(clip) }
+        for clip in videoClips { append(clip) }
+        guard !mixClips.isEmpty else { return .failure(.noAudio) }
+        guard let analyzed = await Waveform.analyzeMix(clips: mixClips, start: rangeStart, duration: rangeDuration, buckets: points) else {
+            return .failure(.unreadable)
+        }
+        return .success(AmplitudeReading(
+            peaks: analyzed.peaks,
+            rms: analyzed.rms,
+            start: rangeStart,
+            duration: rangeDuration,
+            sampleRate: analyzed.sampleRate
+        ))
+    }
+
+    private static func fitted(_ image: CGImage, maxEdge: Int) -> CGImage {
+        let longest = max(image.width, image.height)
+        guard longest > maxEdge, maxEdge > 0 else { return image }
+        let scale = Double(maxEdge) / Double(longest)
+        let width = max(1, Int((Double(image.width) * scale).rounded()))
+        let height = max(1, Int((Double(image.height) * scale).rounded()))
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return image }
+        context.interpolationQuality = .high
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return context.makeImage() ?? image
+    }
+
+    private static func pngData(_ image: CGImage) -> Data? {
+        let data = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(data as CFMutableData, UTType.png.identifier as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(dest, image, nil)
+        guard CGImageDestinationFinalize(dest) else { return nil }
+        return data as Data
+    }
 
     /// Awaits the pending composition rebuild (if any) until no newer one has been
     /// queued in the meantime. Export snapshots must pair the player item's asset
@@ -4084,6 +4378,12 @@ final class EditorModel {
         exportProgressTimer = nil
     }
 
+    /// Every export reveal goes through here. Tests and `--mcp` leave Finder alone.
+    private func revealExportedFileInFinder(_ destination: URL) {
+        guard shouldRevealExportedFileInFinder else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([destination])
+    }
+
     private func finishExport(success: Bool, destination: URL, message: String?, reveal: Bool = true) {
         stopExportProgressTimer()
         activeExportSession = nil
@@ -4118,8 +4418,8 @@ final class EditorModel {
             let label = "Exported \(destination.lastPathComponent)"
             status = label
             errorMessage = nil
-            if reveal, revealExportsInFinder {
-                NSWorkspace.shared.activateFileViewerSelecting([destination])
+            if reveal {
+                revealExportedFileInFinder(destination)
             }
             isExportSheetPresented = false
             Task { @MainActor in
@@ -5245,6 +5545,161 @@ final class EditorModel {
 }
 
 enum Waveform {
+    struct MixClip: Sendable {
+        var url: URL
+        var timelineStart: Double
+        var sourceStart: Double
+        var duration: Double
+        var gain: Double
+        var fadeIn: Double
+        var fadeOut: Double
+    }
+
+    struct Shaped: Sendable {
+        var peaks: [Double]
+        var rms: [Double]
+        var sampleRate: Double
+    }
+
+    /// Linear peak and RMS for one file. `start` is a source-time offset.
+    static func analyzeFile(url: URL, start: TimeInterval, limit: TimeInterval, buckets: Int) async -> Shaped? {
+        let points = max(1, buckets)
+        return await Task.detached(priority: .userInitiated) {
+            guard let audio = readMono(url: url, start: start, limit: limit) else { return nil }
+            let shaped = bucketize(samples: audio.samples, buckets: points)
+            return Shaped(peaks: shaped.peaks, rms: shaped.rms, sampleRate: audio.rate)
+        }.value
+    }
+
+    /// Sums clips on a shared clock, then measures peak and RMS per bucket.
+    static func analyzeMix(clips: [MixClip], start: TimeInterval, duration: TimeInterval, buckets: Int) async -> Shaped? {
+        let points = max(1, buckets)
+        let rangeStart = start
+        let rangeDuration = duration
+        return await Task.detached(priority: .userInitiated) {
+            struct Loaded {
+                var rate: Double
+                var samples: [Float]
+                var timelineStart: Double
+                var duration: Double
+                var gain: Double
+                var fadeIn: Double
+                var fadeOut: Double
+            }
+            var loaded: [Loaded] = []
+            for clip in clips {
+                guard let audio = readMono(url: clip.url, start: clip.sourceStart, limit: clip.duration) else { continue }
+                loaded.append(Loaded(
+                    rate: audio.rate,
+                    samples: audio.samples,
+                    timelineStart: clip.timelineStart,
+                    duration: clip.duration,
+                    gain: clip.gain,
+                    fadeIn: clip.fadeIn,
+                    fadeOut: clip.fadeOut
+                ))
+            }
+            guard let rate = loaded.first?.rate, rate > 0 else { return nil }
+            let totalFrames = max(1, Int((rangeDuration * rate).rounded(.down)))
+            let frameCap = 44_100 * 60
+            let frames = min(totalFrames, frameCap)
+            var mixed = [Float](repeating: 0, count: frames)
+            let frameDuration = rangeDuration / Double(frames)
+            for clip in loaded {
+                for index in 0..<frames {
+                    let time = rangeStart + (Double(index) + 0.5) * frameDuration
+                    let local = time - clip.timelineStart
+                    guard local >= 0, local < clip.duration else { continue }
+                    let sampleIndex = Int(local * clip.rate)
+                    guard sampleIndex >= 0, sampleIndex < clip.samples.count else { continue }
+                    let env = envelope(local: local, duration: clip.duration, fadeIn: clip.fadeIn, fadeOut: clip.fadeOut)
+                    mixed[index] += clip.samples[sampleIndex] * Float(clip.gain * env)
+                }
+            }
+            let shaped = bucketize(samples: mixed, buckets: points)
+            return Shaped(peaks: shaped.peaks, rms: shaped.rms, sampleRate: rate)
+        }.value
+    }
+
+    private static func envelope(local: Double, duration: Double, fadeIn: Double, fadeOut: Double) -> Double {
+        var gain = 1.0
+        if fadeIn > 0.000_1, local < fadeIn {
+            gain = max(0, local / fadeIn)
+        }
+        if fadeOut > 0.000_1 {
+            let fadeStart = duration - fadeOut
+            if local > fadeStart {
+                gain = min(gain, max(0, (duration - local) / max(fadeOut, 0.000_1)))
+            }
+        }
+        return gain
+    }
+
+    private static func readMono(url: URL, start: TimeInterval, limit: TimeInterval) -> (rate: Double, samples: [Float])? {
+        guard let file = try? AVAudioFile(forReading: url) else { return nil }
+        let format = file.processingFormat
+        let rate = format.sampleRate
+        guard rate > 0, limit > 0 else { return nil }
+        let startFrame = AVAudioFramePosition(max(0, start) * rate)
+        if startFrame < file.length {
+            file.framePosition = startFrame
+        }
+        let remaining = max(0, file.length - file.framePosition)
+        let wanted = AVAudioFramePosition(limit * rate)
+        let total = min(remaining, max(0, wanted))
+        guard total > 0 else { return nil }
+        let chunk = AVAudioFrameCount(65_536)
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: chunk),
+              let channels = buffer.floatChannelData else { return nil }
+        let channelCount = Int(format.channelCount)
+        var samples: [Float] = []
+        samples.reserveCapacity(Int(min(total, AVAudioFramePosition(44_100 * 180))))
+        var read: AVAudioFramePosition = 0
+        let sampleCap = AVAudioFramePosition(44_100 * 180)
+        while read < total, AVAudioFramePosition(samples.count) < sampleCap {
+            let framesToRead = AVAudioFrameCount(min(Int64(chunk), total - read))
+            buffer.frameLength = 0
+            do {
+                try file.read(into: buffer, frameCount: framesToRead)
+            } catch {
+                break
+            }
+            let frames = Int(buffer.frameLength)
+            if frames == 0 { break }
+            for frame in 0..<frames {
+                var mixed: Float = 0
+                for channel in 0..<channelCount {
+                    mixed += channels[channel][frame]
+                }
+                samples.append(mixed / Float(max(1, channelCount)))
+            }
+            read += AVAudioFramePosition(frames)
+        }
+        guard !samples.isEmpty else { return nil }
+        return (rate, samples)
+    }
+
+    private static func bucketize(samples: [Float], buckets: Int) -> (peaks: [Double], rms: [Double]) {
+        let points = max(1, buckets)
+        var peaks = [Double](repeating: 0, count: points)
+        var sumSq = [Double](repeating: 0, count: points)
+        var counts = [Int](repeating: 0, count: points)
+        let count = samples.count
+        guard count > 0 else { return (peaks, [Double](repeating: 0, count: points)) }
+        for (index, sample) in samples.enumerated() {
+            let bucket = min(points - 1, Int(Double(index) / Double(count) * Double(points)))
+            let value = Double(sample)
+            peaks[bucket] = max(peaks[bucket], abs(value))
+            sumSq[bucket] += value * value
+            counts[bucket] += 1
+        }
+        let rms = (0..<points).map { index -> Double in
+            guard counts[index] > 0 else { return 0 }
+            return (sumSq[index] / Double(counts[index])).squareRoot()
+        }
+        return (peaks, rms)
+    }
+
     static func peaks(url: URL, points: Int, start: TimeInterval = 0, limit: TimeInterval) async -> [Float] {
         await Task.detached(priority: .userInitiated) {
             do {

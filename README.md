@@ -35,6 +35,8 @@ That writes `.build/StudioAudioLane.app` and launches it. The window opens at 15
 
 Claude Desktop, Cursor, or another stdio MCP client can run the editor unattended. The app starts empty, does not touch your autosave, and speaks JSON-RPC on stdout. See [docs/MCP.md](docs/MCP.md).
 
+An agent can read the timeline, render a PNG of the composited frame (`render_frame`), and sample peak and RMS (`get_waveform`). `apply_batch` runs several edits as one undo step and rolls them all back if any step fails. `undo`, `redo`, and `get_history` use the same history as the window. Export from `--mcp` writes the file and does not open Finder.
+
 ```json
 {
   "mcpServers": {

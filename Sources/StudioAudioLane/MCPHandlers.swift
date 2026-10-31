@@ -124,6 +124,7 @@ enum MCPHandlers {
 
         let before = placementSnapshot(model)
         let revisionBefore = model.mcpRevision
+        model.armHistoryLabel("Add clip")
         let added: Bool
         if kind == .video {
             added = await model.addVideoPublic(url: url, start: start.map { TimeInterval($0) }, ontoTrackID: trackID)
@@ -131,6 +132,7 @@ enum MCPHandlers {
             added = await model.addAudioPublic(url: url, start: start.map { TimeInterval($0) }, ontoTrackID: trackID)
         }
         guard added else {
+            model.disarmHistoryLabel()
             return .failure(MCPErrorResponse(
                 error: "import_failed",
                 message: model.errorMessage ?? "Could not import \(url.lastPathComponent).",
@@ -180,6 +182,7 @@ enum MCPHandlers {
             return .success(payload)
         }
         let revisionBefore = model.mcpRevision
+        model.recordHistory("Trim clip")
         store(model, clip, at: located)
         model.bumpMCPRevisionIfUnchanged(since: revisionBefore)
         model.scheduleRebuildPublic()
@@ -206,6 +209,7 @@ enum MCPHandlers {
             return .success(payload)
         }
         let revisionBefore = model.mcpRevision
+        model.recordHistory("Move clip")
         store(model, clip, at: located)
         model.bumpMCPRevisionIfUnchanged(since: revisionBefore)
         model.scheduleRebuildPublic()
@@ -225,9 +229,10 @@ enum MCPHandlers {
                 return .failure(MCPErrorResponse(error: "split_out_of_range", message: "Split time must be within clip bounds (excluding minimum duration)", currentRevision: nil))
             }
             let parts = model.gaplessSplitPublic(clip, at: atTime)
+            let revisionBefore = model.mcpRevision
+            model.recordHistory("Split clip")
             model.videoClips[vi] = parts.left
             model.videoClips.insert(parts.right, at: vi + 1)
-            let revisionBefore = model.mcpRevision
             model.bumpMCPRevisionIfUnchanged(since: revisionBefore)
             model.scheduleRebuildPublic()
             return .success(outcome(model, status: "split", extra: [
@@ -243,9 +248,10 @@ enum MCPHandlers {
             let parts = model.gaplessSplitPublic(clip, at: atTime)
             var right = parts.right
             right.waveform = clip.waveform
+            let revisionBefore = model.mcpRevision
+            model.recordHistory("Split clip")
             model.audioClips[ai] = parts.left
             model.audioClips.insert(right, at: ai + 1)
-            let revisionBefore = model.mcpRevision
             model.bumpMCPRevisionIfUnchanged(since: revisionBefore)
             model.scheduleRebuildPublic()
             return .success(outcome(model, status: "split", extra: [
@@ -272,6 +278,7 @@ enum MCPHandlers {
         }
         let before = placementSnapshot(model)
         let revisionBefore = model.mcpRevision
+        model.armHistoryLabel("Delete clip")
         model.deleteClipPublic(clipID: uuid)
         model.bumpMCPRevisionIfUnchanged(since: revisionBefore)
         let after = placementSnapshot(model)
@@ -298,6 +305,7 @@ enum MCPHandlers {
         var clip = located.clip
         clip.gain = clamped
         let revisionBefore = model.mcpRevision
+        model.recordHistory("Set clip volume")
         store(model, clip, at: located)
         model.bumpMCPRevisionIfUnchanged(since: revisionBefore)
         model.applyFadesPublic(refreshingVideo: false)
@@ -316,6 +324,7 @@ enum MCPHandlers {
             return .success(outcome(model, status: "unchanged", extra: ["track_id": trackId, "volume": Double(track.volume)]))
         }
         let revisionBefore = model.mcpRevision
+        model.recordHistory("Set track volume")
         model.setTrackVolume(uuid, clamped)
         model.bumpMCPRevisionIfUnchanged(since: revisionBefore)
         return .success(outcome(model, status: "track_volume_set", extra: ["track_id": trackId, "volume": Double(clamped)]))
@@ -331,6 +340,7 @@ enum MCPHandlers {
         var clip = located.clip
         clip.muted.toggle()
         let revisionBefore = model.mcpRevision
+        model.recordHistory("Toggle mute")
         store(model, clip, at: located)
         model.bumpMCPRevisionIfUnchanged(since: revisionBefore)
         model.applyFadesPublic(refreshingVideo: false)
@@ -357,6 +367,7 @@ enum MCPHandlers {
             ]))
         }
         let revisionBefore = model.mcpRevision
+        model.recordHistory(direction == "in" ? "Set fade in" : "Set fade out")
         store(model, clip, at: located)
         model.bumpMCPRevisionIfUnchanged(since: revisionBefore)
         model.applyFadesPublic(refreshingVideo: located.kind == "video")
@@ -382,6 +393,7 @@ enum MCPHandlers {
         clip.fadeIn = 0
         clip.fadeOut = 0
         let revisionBefore = model.mcpRevision
+        model.recordHistory("Clear fades")
         store(model, clip, at: located)
         model.bumpMCPRevisionIfUnchanged(since: revisionBefore)
         model.applyFadesPublic(refreshingVideo: located.kind == "video")
@@ -429,11 +441,12 @@ enum MCPHandlers {
             case .failure(let error):
                 return .failure(error)
             case .success(let (newLeft, newRight)):
+                let revisionBefore = model.mcpRevision
+                model.recordHistory("Crossfade")
                 model.videoClips[leftIndex] = newLeft
                 model.videoClips[rightIndex] = newRight
+                model.bumpMCPRevisionIfUnchanged(since: revisionBefore)
             }
-            let revisionBefore = model.mcpRevision
-            model.bumpMCPRevisionIfUnchanged(since: revisionBefore)
             model.scheduleRebuildPublic()
             let left = model.videoClips[leftIndex]
             let right = model.videoClips[rightIndex]
@@ -445,11 +458,12 @@ enum MCPHandlers {
             case .failure(let error):
                 return .failure(error)
             case .success(let (newLeft, newRight)):
+                let revisionBefore = model.mcpRevision
+                model.recordHistory("Crossfade")
                 model.audioClips[leftIndex] = newLeft
                 model.audioClips[rightIndex] = newRight
+                model.bumpMCPRevisionIfUnchanged(since: revisionBefore)
             }
-            let revisionBefore = model.mcpRevision
-            model.bumpMCPRevisionIfUnchanged(since: revisionBefore)
             model.scheduleRebuildPublic()
             let left = model.audioClips[leftIndex]
             let right = model.audioClips[rightIndex]
@@ -461,6 +475,121 @@ enum MCPHandlers {
             message: "Both clips must exist and belong to the same media kind",
             currentRevision: nil
         ))
+    }
+
+    // MARK: - Feedback
+
+    struct MCPRenderedFrame {
+        var payload: [String: Any]
+        var imageBase64: String?
+    }
+
+    static func renderFrame(
+        model: EditorModel,
+        time: Double?,
+        maxDimension: Int?,
+        destination: String?,
+        includeImage: Bool
+    ) async -> Result<MCPRenderedFrame, MCPErrorResponse> {
+        let requested = time ?? model.currentTime
+        let edge = maxDimension ?? 640
+        let url = destination.flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
+        let rendered = await model.renderCompositedFrame(at: requested, maxDimension: edge, destination: url)
+        switch rendered {
+        case .failure(.noVideo):
+            return .failure(MCPErrorResponse(
+                error: "no_video",
+                message: "This project has no video or image clips. render_frame needs picture on the timeline; an audio-only project has nothing to draw.",
+                currentRevision: model.mcpRevision
+            ))
+        case .failure(.failed(let message)):
+            return .failure(MCPErrorResponse(
+                error: "render_failed",
+                message: message,
+                currentRevision: model.mcpRevision
+            ))
+        case .success(let frame):
+            var payload: [String: Any] = [
+                "status": "rendered",
+                "file_path": frame.url.path,
+                "time": frame.time,
+                "width": frame.width,
+                "height": frame.height,
+                "max_dimension": max(16, min(edge, 4096)),
+                "mime_type": "image/png",
+                "revision": model.mcpRevision
+            ]
+            if abs(frame.time - requested) > 0.000_5 {
+                payload["clamped_from"] = requested
+            }
+            let base64 = includeImage ? frame.png.base64EncodedString() : nil
+            if includeImage {
+                payload["image_included"] = true
+            }
+            return .success(MCPRenderedFrame(payload: payload, imageBase64: base64))
+        }
+    }
+
+    static func getWaveform(
+        model: EditorModel,
+        clipId: String?,
+        start: Double?,
+        duration: Double?,
+        buckets: Int?
+    ) async -> Result<[String: Any], MCPErrorResponse> {
+        let points = buckets ?? 64
+        let clipUUID: UUID?
+        if let clipId, !clipId.isEmpty {
+            guard let uuid = UUID(uuidString: clipId) else {
+                return .failure(MCPErrorResponse(error: "invalid_clip_id", message: "Not a UUID: \(clipId)", currentRevision: nil))
+            }
+            clipUUID = uuid
+        } else {
+            clipUUID = nil
+        }
+        let reading = await model.amplitudeReading(clipID: clipUUID, start: start, duration: duration, buckets: points)
+        switch reading {
+        case .failure(.clipNotFound):
+            return .failure(MCPErrorResponse(error: "clip_not_found", message: "No clip with id \(clipId ?? "")", currentRevision: nil))
+        case .failure(.noAudio):
+            return .failure(MCPErrorResponse(
+                error: "no_audio",
+                message: "Nothing audible in that range. Add a clip, unmute it, or pass clip_id to read a file that is muted on the timeline.",
+                currentRevision: model.mcpRevision
+            ))
+        case .failure(.outsideRange):
+            return .failure(MCPErrorResponse(
+                error: "range_outside_clip",
+                message: "The requested range does not overlap that clip.",
+                currentRevision: model.mcpRevision
+            ))
+        case .failure(.unreadable):
+            return .failure(MCPErrorResponse(
+                error: "waveform_unavailable",
+                message: "Could not read audio samples for that clip.",
+                currentRevision: model.mcpRevision
+            ))
+        case .success(let value):
+            var payload: [String: Any] = [
+                "status": "ok",
+                "scope": clipUUID == nil ? "timeline" : "clip",
+                "start": value.start,
+                "duration": value.duration,
+                "buckets": value.peaks.count,
+                "peaks": value.peaks,
+                "rms": value.rms,
+                "sample_rate": value.sampleRate,
+                "scale": "linear amplitude, 1 is full scale",
+                "revision": model.mcpRevision
+            ]
+            if let clipUUID {
+                payload["clip_id"] = clipUUID.uuidString
+                payload["note"] = "Clip scope is the source file for the overlap, before lane volume. Timeline scope (omit clip_id) is the mix you hear, including lane volume, gain, mute, and fades."
+            } else {
+                payload["note"] = "Timeline scope mixes every audible clip. Lane volume, clip gain, mute, and fades are included. Pass clip_id to read one file without the lane volume."
+            }
+            return .success(payload)
+        }
     }
 
     // MARK: - Payload helpers

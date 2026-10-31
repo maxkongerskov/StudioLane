@@ -2,7 +2,7 @@
 
 Client setup (Claude Desktop, Cursor, the `--mcp` binary path) is in [docs/MCP.md](docs/MCP.md). The running server is newline-delimited JSON-RPC on stdio: responses echo the request id, stdout is reserved for MCP messages, and `--mcp` starts from an empty timeline without reading or writing the user's autosave.
 
-The notes below are the original design sketch. Where they disagree with `MCPServer.swift` or docs/MCP.md, the code and that doc win. In particular there is no `get_schema_docs` tool, batch edits are not rolled back, and `export_project` does not return a `job_id` — poll `get_export_status`.
+The notes below are the original design sketch. Where they disagree with `MCPServer.swift` or docs/MCP.md, the code and that doc win. In particular there is no `get_schema_docs` tool, and `export_project` does not return a `job_id` — poll `get_export_status`. `apply_batch` is the all-or-nothing batch. The older `batch_edit` tool still applies what it can and reports the rest.
 
 ## Design Principles
 
