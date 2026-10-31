@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreVideo
+import Darwin
 import XCTest
 @testable import StudioAudioLane
 
@@ -328,16 +329,28 @@ private final class MCPProcessClient {
     let process: Process
     let executablePath: String
     private let executableBytes: Int
-    private let stdin: Pipe
     private let stdout: Pipe
     private let stderr: Pipe
     private let stdoutLog: MCPByteLog
     private let stderrLog: MCPByteLog
+    /// Parent's write end of the child's stdin. A Swift `Pipe` assigned to
+    /// `Process.standardInput` did not deliver bytes when the parent was xctest.
+    private var stdinWriteFD: Int32
+    private var lastWriteBytes = 0
     private var closed = false
 
     init() throws {
         let executable = try Self.executable()
-        let stdin = Pipe()
+        var ends = [Int32](repeating: 0, count: 2)
+        guard ends.withUnsafeMutableBufferPointer({ Darwin.pipe($0.baseAddress!) }) == 0 else {
+            throw MCPLaunchError(message: "pipe() failed errno=\(errno)")
+        }
+        let readEnd = ends[0]
+        let writeEnd = ends[1]
+        // The child must not inherit the write end, or closing it here will not
+        // look like EOF on the child's stdin.
+        _ = Darwin.fcntl(writeEnd, F_SETFD, FD_CLOEXEC)
+        let stdinRead = FileHandle(fileDescriptor: readEnd, closeOnDealloc: false)
         let stdout = Pipe()
         let stderr = Pipe()
         let stdoutLog = MCPByteLog()
@@ -345,7 +358,7 @@ private final class MCPProcessClient {
         let process = Process()
         process.executableURL = executable
         process.arguments = ["--mcp"]
-        process.standardInput = stdin
+        process.standardInput = stdinRead
         process.standardOutput = stdout
         process.standardError = stderr
         // Match a shell launch. The test runner's inserted libraries and
@@ -374,9 +387,12 @@ private final class MCPProcessClient {
         } catch {
             try? stdout.fileHandleForWriting.close()
             try? stderr.fileHandleForWriting.close()
-            try? stdin.fileHandleForWriting.close()
+            Darwin.close(readEnd)
+            Darwin.close(writeEnd)
             throw error
         }
+        // Child has its own dup of the read end. Drop the parent's copy.
+        Darwin.close(readEnd)
 
         let bytes = (try? FileManager.default.attributesOfItem(atPath: executable.path)[.size] as? NSNumber)?.intValue ?? -1
         let pid = process.processIdentifier
@@ -389,18 +405,18 @@ private final class MCPProcessClient {
             let stdoutText = stdoutLog.text()
             try? stdout.fileHandleForWriting.close()
             try? stderr.fileHandleForWriting.close()
-            try? stdin.fileHandleForWriting.close()
+            Darwin.close(writeEnd)
             throw MCPLaunchError(message: "StudioAudioLane exited during launch. exec=\(executable.path) bytes=\(bytes) pid=\(pid) status=\(process.terminationStatus)\nstdout:\n\(stdoutText)\nstderr:\n\(stderrText)")
         }
 
         self.process = process
         self.executablePath = executable.path
         self.executableBytes = bytes
-        self.stdin = stdin
         self.stdout = stdout
         self.stderr = stderr
         self.stdoutLog = stdoutLog
         self.stderrLog = stderrLog
+        self.stdinWriteFD = writeEnd
     }
 
     func request(id: Any, method: String, params: [String: Any]? = nil, timeout: TimeInterval = 30) async throws -> [String: Any] {
@@ -459,13 +475,35 @@ private final class MCPProcessClient {
     private func closeInput() {
         guard !closed else { return }
         closed = true
-        try? stdin.fileHandleForWriting.close()
+        if stdinWriteFD >= 0 {
+            Darwin.close(stdinWriteFD)
+            stdinWriteFD = -1
+        }
     }
 
     private func write(_ object: [String: Any]) throws {
         var data = try JSONSerialization.data(withJSONObject: object)
         data.append(UInt8(ascii: "\n"))
-        stdin.fileHandleForWriting.write(data)
+        let count = data.count
+        let written = data.withUnsafeBytes { raw -> Int in
+            guard let base = raw.baseAddress else { return 0 }
+            var offset = 0
+            while offset < raw.count {
+                let n = Darwin.write(stdinWriteFD, base.advanced(by: offset), raw.count - offset)
+                if n < 0 {
+                    if errno == EINTR { continue }
+                    return -1
+                }
+                offset += n
+            }
+            return offset
+        }
+        lastWriteBytes = written
+        let note = "MCP test wrote \(written)/\(count) bytes to stdin fd \(stdinWriteFD) errno=\(written < 0 ? errno : 0)\n"
+        FileHandle.standardError.write(Data(note.utf8))
+        guard written == count else {
+            throw MCPLaunchError(message: "stdin write failed. \(note)\(statusLine())")
+        }
     }
 
     private func waitForResponse(id: Any, timeout: TimeInterval) async throws -> [String: Any] {
@@ -480,16 +518,34 @@ private final class MCPProcessClient {
             }
             try await Task.sleep(nanoseconds: 20_000_000)
         }
-        XCTFail("timed out waiting for id \(id). \(statusLine())\nstdout:\n\(stdoutLog.text())\nstderr:\n\(stderrText())")
+        XCTFail("timed out waiting for id \(id). \(deliveryHint()) \(statusLine())\nstdout:\n\(stdoutLog.text())\nstderr:\n\(stderrText())")
         throw MCPTestTimeout()
     }
 
     private func statusLine() -> String {
         let pid = process.processIdentifier
+        let wrote = "wrote \(lastWriteBytes) stdin bytes"
         if process.isRunning {
-            return "exec=\(executablePath) bytes=\(executableBytes) pid=\(pid) still running"
+            return "exec=\(executablePath) bytes=\(executableBytes) pid=\(pid) still running \(wrote)"
         }
-        return "exec=\(executablePath) bytes=\(executableBytes) pid=\(pid) exited status=\(process.terminationStatus)"
+        return "exec=\(executablePath) bytes=\(executableBytes) pid=\(pid) exited status=\(process.terminationStatus) \(wrote)"
+    }
+
+    private func deliveryHint() -> String {
+        let err = stderrText()
+        if err.contains("line ready"), !err.contains("wrote ") {
+            return "child received the line but did not write a response."
+        }
+        if err.contains("stdin read"), !err.contains("line ready") {
+            return "child read stdin bytes but did not assemble a line."
+        }
+        if err.contains("stdin eof") {
+            return "child saw stdin EOF before a request."
+        }
+        if err.contains("stdin waiting"), !err.contains("stdin read") {
+            return "child is blocked in read; the request never arrived."
+        }
+        return "no stdin activity after the ready log."
     }
 
     private func stderrText() -> String {

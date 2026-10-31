@@ -9,22 +9,24 @@ enum MCPStdio {
     static func readLines(
         from handle: FileHandle,
         isRunning: @escaping @Sendable () -> Bool,
+        onWait: (@Sendable () -> Void)? = nil,
+        onChunk: (@Sendable (Int) -> Void)? = nil,
         onLine: @escaping @Sendable (String) -> Void
     ) {
         var pending = Data()
         while isRunning() {
-            do {
-                guard let chunk = try handle.read(upToCount: 65_536), !chunk.isEmpty else {
-                    consume(&pending, flushRemainder: true, onLine: onLine)
-                    return
-                }
-                pending.append(chunk)
-                consume(&pending, flushRemainder: false, onLine: onLine)
-            } catch {
-                MCPLog.info("stdin read ended: \(error.localizedDescription)")
+            onWait?()
+            // availableData blocks in read(2) until bytes arrive or every
+            // write end closes. read(upToCount:) can report EOF immediately
+            // on a pipe that is still open.
+            let chunk = handle.availableData
+            onChunk?(chunk.count)
+            if chunk.isEmpty {
                 consume(&pending, flushRemainder: true, onLine: onLine)
                 return
             }
+            pending.append(chunk)
+            consume(&pending, flushRemainder: false, onLine: onLine)
         }
         consume(&pending, flushRemainder: true, onLine: onLine)
     }
@@ -55,6 +57,12 @@ enum MCPLog {
     static func info(_ message: String) {
         let line = "StudioLane MCP: \(message)\n"
         FileHandle.standardError.write(Data(line.utf8))
+    }
+
+    static func preview(_ text: String, limit: Int = 180) -> String {
+        let flat = text.replacingOccurrences(of: "\n", with: " ")
+        if flat.count <= limit { return flat }
+        return String(flat.prefix(limit)) + "…"
     }
 }
 
@@ -88,18 +96,43 @@ private final class MCPSessionBridge: @unchecked Sendable {
 
     func read(from input: FileHandle) {
         let bridge = self
-        MCPStdio.readLines(from: input, isRunning: { bridge.runState.isRunning }) { line in
-            let semaphore = DispatchSemaphore(value: 0)
-            Task { @MainActor in
-                await bridge.server?.handleMessage(line)
-                semaphore.signal()
+        MCPStdio.readLines(
+            from: input,
+            isRunning: { bridge.runState.isRunning },
+            onWait: { MCPLog.info("stdin waiting") },
+            onChunk: { count in
+                MCPLog.info(count == 0 ? "stdin eof" : "stdin read \(count) bytes")
+            },
+            onLine: { line in
+                MCPLog.info("line ready (\(line.utf8.count) bytes): \(MCPLog.preview(line))")
+                // Enqueue on the main queue, then wake the run loop. A Task
+                // created directly on this background thread never ran when
+                // the app was a child of xctest (NSApp was up — onAppear had
+                // already logged "server ready" — but the Swift executor did
+                // not drain).
+                bridge.hopToMain {
+                    await bridge.server?.handleMessage(line)
+                }
             }
-            semaphore.wait()
-        }
+        )
         runState.isRunning = false
-        Task { @MainActor in
+        hopToMain {
             bridge.server?.handleEOF()
         }
+    }
+
+    /// Main-queue hop that does not block the main thread. The stdin thread
+    /// waits; NSApp's run loop runs the handler.
+    private func hopToMain(_ body: @escaping @MainActor () async -> Void) {
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.main.async {
+            Task { @MainActor in
+                await body()
+                done.signal()
+            }
+        }
+        CFRunLoopWakeUp(CFRunLoopGetMain())
+        done.wait()
     }
 }
 
@@ -150,6 +183,7 @@ final class MCPServer {
     }
 
     func handleMessage(_ line: String) async {
+        MCPLog.info("handling on main: \(MCPLog.preview(line))")
         guard let data = line.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             writeResponse(MCPJSONRPC.error(id: NSNull(), code: -32700, message: "Parse error"))
@@ -210,6 +244,7 @@ final class MCPServer {
             framed.append(UInt8(ascii: "\n"))
         }
         emit(framed)
+        MCPLog.info("wrote \(framed.count) bytes")
     }
 
     private func writeNotification(_ data: Data) {
