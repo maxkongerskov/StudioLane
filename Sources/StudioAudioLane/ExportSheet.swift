@@ -15,18 +15,60 @@ struct ExportSettings: Equatable {
 
     /// Standalone-audio export formats. macOS ships no MP3/OGG encoder, so
     /// lossy options are the ISO-media-family codecs (AAC) next to ALAC/FLAC.
+    /// The FFmpeg entries only join the picker when an ffmpeg binary is found
+    /// (see ``FFmpegBridge``); the mixdown still happens in AVFoundation and
+    /// ffmpeg only converts the temporary WAV.
     enum AudioFormat: String, CaseIterable, Identifiable {
         case wav = "WAV"
         case aiff = "AIFF"
         case flac = "FLAC"
         case alac = "ALAC"
         case aac = "AAC"
+        case mp3 = "MP3"
+        case ogg = "OGG"
+        case opus = "Opus"
 
         var id: String { rawValue }
 
-        var isLossless: Bool { self != .aac }
+        /// Not encodable by AVFoundation; exported via an external ffmpeg.
+        var isFFmpeg: Bool { self == .mp3 || self == .ogg || self == .opus }
+
+        var isLossy: Bool { self == .aac || isFFmpeg }
+
+        var isLossless: Bool { !isLossy }
 
         var usesPCMBitDepth: Bool { self == .wav || self == .aiff }
+
+        /// Formats the picker may offer right now.
+        static func available(ffmpegAvailable: Bool) -> [AudioFormat] {
+            allCases.filter { !$0.isFFmpeg || ffmpegAvailable }
+        }
+
+        /// Preferred encoder first, then the experimental native encoder that
+        /// ships inside every ffmpeg build (Homebrew's ffmpeg, for example,
+        /// carries no libvorbis).
+        var ffmpegCodecCandidates: [String] {
+            switch self {
+            case .mp3: ["libmp3lame", "mp3"]
+            case .ogg: ["libvorbis", "vorbis"]
+            case .opus: ["libopus", "opus"]
+            default: []
+            }
+        }
+
+        private static let experimentalNativeCodecs: Set<String> = ["mp3", "vorbis", "opus"]
+
+        /// Encoder selection for the ffmpeg conversion step. Paths are passed
+        /// to Process as arguments; nothing here is ever embedded in a shell.
+        func ffmpegEncodeArguments(bitRate: Int, codec: String? = nil) -> [String] {
+            guard isFFmpeg, let codec = codec ?? ffmpegCodecCandidates.first else { return [] }
+            let kbps = Swift.max(32, bitRate / 1_000)
+            var arguments = ["-codec:a", codec, "-b:a", "\(kbps)k"]
+            if Self.experimentalNativeCodecs.contains(codec) {
+                arguments += ["-strict", "-2"]
+            }
+            return arguments
+        }
 
         var pathExtension: String {
             switch self {
@@ -34,6 +76,9 @@ struct ExportSettings: Equatable {
             case .aiff: "aiff"
             // CoreAudio writes FLAC/ALAC/AAC into ISO-media containers.
             case .flac, .alac, .aac: "m4a"
+            case .mp3: "mp3"
+            case .ogg: "ogg"
+            case .opus: "opus"
             }
         }
 
@@ -42,6 +87,11 @@ struct ExportSettings: Equatable {
             case .wav: .wav
             case .aiff: .aiff
             case .flac, .alac, .aac: .m4a
+            case .mp3: .mp3
+            // FFmpeg formats never reach AVAssetWriter; these IDs are for
+            // completeness only (AVFoundation ships no OGG/Opus constants).
+            case .ogg: AVFileType("public.ogg")
+            case .opus: AVFileType("org.xiph.opus")
             }
         }
 
@@ -50,6 +100,9 @@ struct ExportSettings: Equatable {
             case .wav: .wav
             case .aiff: .aiff
             case .flac, .alac, .aac: .mpeg4Audio
+            case .mp3: .mp3
+            case .ogg: UTType(filenameExtension: "ogg") ?? .audio
+            case .opus: UTType(filenameExtension: "opus") ?? .audio
             }
         }
     }
@@ -284,7 +337,7 @@ struct ExportSettings: Equatable {
         // Strip a trailing extension if the user typed one matching common movie types.
         let noExt: String = {
             let lower = cleaned.lowercased()
-            for ext in [".mp4", ".mov", ".m4v", ".gif", ".wav", ".aiff", ".m4a"] where lower.hasSuffix(ext) {
+            for ext in [".mp4", ".mov", ".m4v", ".gif", ".wav", ".aiff", ".m4a", ".mp3", ".ogg", ".opus"] where lower.hasSuffix(ext) {
                 return String(cleaned.dropLast(ext.count))
             }
             return cleaned
@@ -393,11 +446,42 @@ struct ExportSettings: Equatable {
     }
 }
 
+/// Locates an optional external ffmpeg binary for the MP3/OGG/Opus exports.
+/// The app never bundles ffmpeg; when none is found those formats simply stay
+/// out of the picker and everything else keeps working.
+enum FFmpegBridge {
+    /// Usual install locations checked in addition to `$PATH` (a GUI app
+    /// launched from Finder sees a very short PATH).
+    static let standardSearchPaths = ["/opt/homebrew/bin", "/usr/local/bin"]
+
+    static var defaultSearchPaths: [String] {
+        let path = ProcessInfo.processInfo.environment["PATH"] ?? ""
+        return path.split(separator: ":").map(String.init) + standardSearchPaths
+    }
+
+    static func detect(
+        searchPaths: [String] = defaultSearchPaths,
+        fileManager: FileManager = .default
+    ) -> URL? {
+        for directory in searchPaths {
+            let candidate = URL(fileURLWithPath: directory).appendingPathComponent("ffmpeg")
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: candidate.path, isDirectory: &isDirectory),
+                  !isDirectory.boolValue,
+                  fileManager.isExecutableFile(atPath: candidate.path)
+            else { continue }
+            return candidate
+        }
+        return nil
+    }
+}
+
 struct ExportSheet: View {
     @Environment(EditorModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @State private var settings = ExportSettings()
     @State private var isRenaming = false
+    @State private var ffmpegAvailable = false
     @FocusState private var nameFieldFocused: Bool
 
     var body: some View {
@@ -446,6 +530,8 @@ struct ExportSheet: View {
             settings.fileBaseName = ExportSettings.sanitizedBaseName(model.clipName)
             if !model.hasVideo { settings.mode = .audio }
             if model.isProMode { settings.audioSampleRateHertz = Int(model.proSettings.sampleRate) }
+            ffmpegAvailable = FFmpegBridge.detect() != nil
+            if !ffmpegAvailable, settings.audioFormat.isFFmpeg { settings.audioFormat = .wav }
             settings.sanitize()
         }
         .onChange(of: settings.codec) { _, _ in
@@ -470,18 +556,22 @@ struct ExportSheet: View {
         field("Format") {
             VStack(alignment: .leading, spacing: 6) {
                 Picker("", selection: $settings.audioFormat) {
-                    ForEach(ExportSettings.AudioFormat.allCases) { item in
+                    ForEach(availableAudioFormats) { item in
                         Text(item.rawValue).tag(item)
                     }
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                Text(settings.audioFormat.isLossless
-                     ? "Lossless bounce of the full timeline. FLAC, ALAC and AAC files use the M4A container."
-                     : "Lossy AAC for sharing. FLAC, ALAC and AAC files use the M4A container.")
+                Text(audioFormatCaption)
                     .font(.system(size: 11))
                     .foregroundStyle(StudioTheme.muted)
                     .fixedSize(horizontal: false, vertical: true)
+                if !ffmpegAvailable {
+                    Text("MP3, OGG and Opus unlock automatically when FFmpeg is installed (for example: brew install ffmpeg).")
+                        .font(.system(size: 11))
+                        .foregroundStyle(StudioTheme.muted)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
         field("Sample rate") {
@@ -503,7 +593,7 @@ struct ExportSheet: View {
                 .labelsHidden()
             }
         }
-        if settings.audioFormat == .aac {
+        if settings.audioFormat.isLossy {
             field("Bitrate") {
                 VStack(alignment: .leading, spacing: 6) {
                     Picker("", selection: $settings.audioBitrate) {
@@ -513,12 +603,28 @@ struct ExportSheet: View {
                     }
                     .pickerStyle(.menu)
                     .labelsHidden()
-                    Text("Match / default exports AAC at 192 kbps.")
+                    Text("Match / default encodes at 192 kbps.")
                         .font(.system(size: 11))
                         .foregroundStyle(StudioTheme.muted)
                 }
             }
         }
+    }
+
+    /// Formats the picker offers: the five native codecs plus MP3/OGG/Opus
+    /// once `FFmpegBridge.detect()` has found an ffmpeg binary.
+    private var availableAudioFormats: [ExportSettings.AudioFormat] {
+        ExportSettings.AudioFormat.available(ffmpegAvailable: ffmpegAvailable)
+    }
+
+    private var audioFormatCaption: String {
+        let format = settings.audioFormat
+        if format.isFFmpeg {
+            return "Lossy \(format.rawValue) for sharing. Converted from the lossless mixdown with FFmpeg on your Mac."
+        }
+        return format.isLossless
+            ? "Lossless bounce of the full timeline. FLAC, ALAC and AAC files use the M4A container."
+            : "Lossy AAC for sharing. FLAC, ALAC and AAC files use the M4A container."
     }
 
     @ViewBuilder
@@ -757,7 +863,7 @@ struct ExportSheet: View {
                     format: "Full timeline · %@ · %.1f kHz · %@",
                     settings.audioFormat.rawValue,
                     Double(settings.audioSampleRateHertz) / 1_000,
-                    settings.audioFormat == .aac
+                    settings.audioFormat.isLossy
                         ? (settings.audioBitrate.bitsPerSecond.map { "\($0 / 1_000) kbps" } ?? "192 kbps")
                         : settings.audioFormat.usesPCMBitDepth ? "\(settings.pcmBitDepth)-bit" : "lossless"
                 ))

@@ -3476,8 +3476,22 @@ final class EditorModel {
         let format = settings.audioFormat
         let sampleRate = Double(settings.audioSampleRateHertz)
         let bitDepth = settings.pcmBitDepth
-        let aacBitRate = settings.audioBitrate.bitsPerSecond ?? 192_000
+        let lossyBitRate = settings.audioBitrate.bitsPerSecond ?? 192_000
         let contentDuration = Swift.max(duration, 0.001)
+
+        // FFmpeg-only formats (MP3/OGG/Opus): bounce the mix to a temporary
+        // WAV first, then convert. Registered in exportTemporaryURLs so
+        // cancel and failure clean it up.
+        let temporaryWAV: URL? = {
+            guard format.isFFmpeg else { return nil }
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("StudioLane-Audio-\(UUID().uuidString)")
+                .appendingPathExtension("wav")
+            try? FileManager.default.removeItem(at: url)
+            exportTemporaryURLs.insert(url)
+            return url
+        }()
+        let renderDestination = temporaryWAV ?? destination
 
         // AVFoundation objects are not Sendable; pin them for off-main render work.
         nonisolated(unsafe) let unsafeAsset = asset
@@ -3492,20 +3506,33 @@ final class EditorModel {
                 // nonisolated static: the pump callbacks must NOT inherit @MainActor.
                 try await EditorModel.performAudioExport(
                     asset: unsafeAsset,
-                    destination: destination,
-                    format: format,
+                    destination: renderDestination,
+                    format: format.isFFmpeg ? .wav : format,
                     sampleRate: sampleRate,
                     bitDepth: bitDepth,
-                    aacBitRate: aacBitRate,
+                    aacBitRate: lossyBitRate,
                     duration: contentDuration,
                     audioMix: unsafeAudioMix,
                     isCancelled: { cancelFlag.value },
                     onProgress: { value in
+                        // The ffmpeg conversion is fast; keep the mixdown at 65 %.
+                        let scaled = format.isFFmpeg ? value * 0.65 : value
                         Task { @MainActor in
-                            self.exportProgress = value
+                            self.exportProgress = scaled
                         }
                     }
                 )
+                guard self.exportIntent == intent else { return }
+                if let temporaryWAV {
+                    await MainActor.run { self.exportProgress = 0.7 }
+                    try await EditorModel.performFFmpegAudioConversion(
+                        sourceWAV: temporaryWAV,
+                        destination: destination,
+                        format: format,
+                        bitRate: lossyBitRate,
+                        isCancelled: { cancelFlag.value }
+                    )
+                }
                 guard self.exportIntent == intent else { return }
                 self.finishExport(success: true, destination: destination, message: nil)
             } catch is CancellationError {
@@ -3538,6 +3565,14 @@ final class EditorModel {
         isCancelled: @escaping @Sendable () -> Bool,
         onProgress: @escaping @Sendable (Double) -> Void
     ) async throws {
+        guard !format.isFFmpeg else {
+            throw NSError(
+                domain: "StudioAudioLane",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "\(format.rawValue) runs through the FFmpeg bridge: render a WAV with a native format first, then convert it."]
+            )
+        }
         let audioTracks = try await asset.loadTracks(withMediaType: .audio)
         guard !audioTracks.isEmpty else {
             throw NSError(domain: "StudioAudioLane", code: 1, userInfo: [NSLocalizedDescriptionKey: "No audio to export"])
@@ -3590,6 +3625,10 @@ final class EditorModel {
                 AVSampleRateKey: sampleRate,
                 AVEncoderBitRateKey: aacBitRate
             ]
+        case .mp3, .ogg, .opus:
+            // Unreachable — guarded at function entry; ffmpeg formats never
+            // reach AVAssetWriter.
+            throw NSError(domain: "StudioAudioLane", code: 2, userInfo: [NSLocalizedDescriptionKey: "Format requires the FFmpeg bridge"])
         }
 
         nonisolated(unsafe) let writerInput = AVAssetWriterInput(mediaType: .audio, outputSettings: outputSettings)
@@ -3745,6 +3784,192 @@ final class EditorModel {
         }
         if reader.status == .failed {
             throw reader.error ?? NSError(domain: "StudioAudioLane", code: 7, userInfo: [NSLocalizedDescriptionKey: "Audio export reading failed"])
+        }
+    }
+
+    /// Converts the temporary mixdown WAV to an ffmpeg-only format (MP3, OGG
+    /// Vorbis, Opus). ffmpeg is launched directly with the file paths as
+    /// arguments — never through a shell string — and is killed if the export
+    /// is cancelled. Internal for tests; never touch MainActor state from here.
+    nonisolated static func performFFmpegAudioConversion(
+        sourceWAV: URL,
+        destination: URL,
+        format: ExportSettings.AudioFormat,
+        bitRate: Int,
+        isCancelled: @escaping @Sendable () -> Bool
+    ) async throws {
+        if isCancelled() { throw CancellationError() }
+        guard format.isFFmpeg else {
+            throw NSError(
+                domain: "StudioAudioLane",
+                code: 10,
+                userInfo: [NSLocalizedDescriptionKey: "\(format.rawValue) is encoded natively; the FFmpeg bridge does not handle it."]
+            )
+        }
+        // The picker hid these formats when ffmpeg was absent, but the binary
+        // can vanish between selection and encode; fail with a clear message.
+        guard let ffmpeg = FFmpegBridge.detect() else {
+            throw NSError(
+                domain: "StudioAudioLane",
+                code: 10,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "FFmpeg was not found on this Mac. Install it (for example `brew install ffmpeg`) or choose a built-in format."]
+            )
+        }
+        // Builds differ in which encoders they carry (Homebrew ffmpeg 9 has
+        // no libvorbis), so ask this binary what it can encode and pick the
+        // best candidate for the format.
+        let encoders = await probeFFmpegAudioEncoders(executable: ffmpeg)
+        let codec: String?
+        if encoders.isEmpty {
+            codec = format.ffmpegCodecCandidates.first // probe failed; assume a full build
+        } else {
+            codec = format.ffmpegCodecCandidates.first { encoders.contains($0) }
+        }
+        guard let codec else {
+            throw NSError(
+                domain: "StudioAudioLane",
+                code: 10,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "FFmpeg on this Mac has no \(format.rawValue) encoder (looked for \(format.ffmpegCodecCandidates.joined(separator: ", ")))."]
+            )
+        }
+        var arguments = ["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", sourceWAV.path]
+        arguments += format.ffmpegEncodeArguments(bitRate: bitRate, codec: codec)
+        arguments.append(destination.path)
+        do {
+            try await runFFmpeg(executable: ffmpeg, arguments: arguments, outputURL: destination, isCancelled: isCancelled)
+        } catch {
+            // Never leave a half-written MP3/OGG/Opus behind.
+            try? FileManager.default.removeItem(at: destination)
+            throw error
+        }
+    }
+
+    /// Audio encoder names the given ffmpeg binary reports (`A` lines of
+    /// `ffmpeg -encoders`). Empty when the probe itself fails — callers should
+    /// treat that as "unknown", not "nothing available".
+    nonisolated static func probeFFmpegAudioEncoders(executable: URL) async -> Set<String> {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Set<String>, Never>) in
+            DispatchQueue.global(qos: .utility).async {
+                let process = Process()
+                process.executableURL = executable
+                process.arguments = ["-hide_banner", "-loglevel", "error", "-encoders"]
+                process.standardInput = FileHandle.nullDevice
+                let outputPipe = Pipe()
+                process.standardOutput = outputPipe
+                process.standardError = FileHandle.nullDevice
+                do {
+                    try process.run()
+                } catch {
+                    continuation.resume(returning: [])
+                    return
+                }
+                let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                var encoders: Set<String> = []
+                for line in String(decoding: data, as: UTF8.self).split(separator: "\n") {
+                    let fields = line.split(separator: " ", omittingEmptySubsequences: true)
+                    guard fields.count >= 2, fields[0].hasPrefix("A") else { continue }
+                    encoders.insert(String(fields[1]))
+                }
+                continuation.resume(returning: encoders)
+            }
+        }
+    }
+
+    /// Runs the ffmpeg binary to completion off-main, honouring both the
+    /// export cancel flag and structured task cancellation with SIGINT→SIGTERM.
+    nonisolated static func runFFmpeg(
+        executable: URL,
+        arguments: [String],
+        outputURL: URL? = nil,
+        isCancelled: @escaping @Sendable () -> Bool
+    ) async throws {
+        final class StopBox: @unchecked Sendable {
+            private let lock = NSLock()
+            private var stopped = false
+            func set() { lock.lock(); stopped = true; lock.unlock() }
+            var value: Bool { lock.lock(); defer { lock.unlock() }; return stopped }
+        }
+        final class ErrorLog: @unchecked Sendable {
+            private let lock = NSLock()
+            private var data = Data()
+            func append(_ chunk: Data) { lock.lock(); data.append(chunk); lock.unlock() }
+            var text: String {
+                lock.lock(); defer { lock.unlock() }
+                return String(decoding: data, as: UTF8.self)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+
+        nonisolated(unsafe) let process = Process()
+        process.executableURL = executable
+        process.arguments = arguments
+        process.standardInput = FileHandle.nullDevice
+        nonisolated(unsafe) let errorPipe = Pipe()
+        process.standardError = errorPipe
+        let errorLog = ErrorLog()
+        let stop = StopBox()
+
+        @Sendable func kill() {
+            stop.set()
+            process.interrupt()
+            DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+                if process.isRunning { process.terminate() }
+            }
+        }
+
+        do {
+            try process.run()
+        } catch {
+            throw NSError(
+                domain: "StudioAudioLane",
+                code: 11,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Could not start FFmpeg (\(error.localizedDescription)). It may have been removed or is not executable."]
+            )
+        }
+
+        // Drain stderr before waiting: loglevel=error keeps it short, but an
+        // unread pipe buffer would block ffmpeg.
+        DispatchQueue.global(qos: .utility).async {
+            errorLog.append(errorPipe.fileHandleForReading.readDataToEndOfFile())
+        }
+
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    while process.isRunning {
+                        if isCancelled() { kill() }
+                        usleep(100_000)
+                    }
+                    continuation.resume()
+                }
+            }
+        } onCancel: {
+            kill()
+        }
+
+        if stop.value || Task.isCancelled || isCancelled() { throw CancellationError() }
+        guard process.terminationStatus == 0 else {
+            let detail = String(errorLog.text.prefix(400))
+            throw NSError(
+                domain: "StudioAudioLane",
+                code: 12,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "FFmpeg failed with status \(process.terminationStatus): \(detail.isEmpty ? "no details" : detail)"]
+            )
+        }
+        let bytes = outputURL.flatMap { url in
+            (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue
+        } ?? 1
+        guard bytes > 0 else {
+            throw NSError(
+                domain: "StudioAudioLane",
+                code: 13,
+                userInfo: [NSLocalizedDescriptionKey: "FFmpeg produced an empty output file"]
+            )
         }
     }
 

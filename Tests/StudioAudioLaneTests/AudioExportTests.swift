@@ -41,6 +41,171 @@ final class AudioExportTests: XCTestCase {
         XCTAssertEqual(settings.pcmBitDepth, 24)
     }
 
+    // MARK: - FFmpeg bridge: settings & detection
+
+    func testFFmpegFormatSettings() {
+        XCTAssertEqual(ExportSettings.AudioFormat.mp3.pathExtension, "mp3")
+        XCTAssertEqual(ExportSettings.AudioFormat.ogg.pathExtension, "ogg")
+        XCTAssertEqual(ExportSettings.AudioFormat.opus.pathExtension, "opus")
+        XCTAssertTrue(ExportSettings.AudioFormat.mp3.isFFmpeg)
+        XCTAssertTrue(ExportSettings.AudioFormat.ogg.isFFmpeg)
+        XCTAssertTrue(ExportSettings.AudioFormat.opus.isFFmpeg)
+        XCTAssertFalse(ExportSettings.AudioFormat.flac.isFFmpeg)
+        XCTAssertTrue(ExportSettings.AudioFormat.opus.isLossy)
+        XCTAssertFalse(ExportSettings.AudioFormat.opus.isLossless)
+        XCTAssertFalse(ExportSettings.AudioFormat.wav.isLossy)
+
+        var settings = ExportSettings()
+        settings.mode = .audio
+        settings.audioFormat = .mp3
+        settings.sanitize()
+        XCTAssertEqual(settings.pathExtension, "mp3")
+        XCTAssertEqual(settings.contentType, .mp3)
+        XCTAssertEqual(settings.audioFormat.ffmpegEncodeArguments(bitRate: 192_000),
+                       ["-codec:a", "libmp3lame", "-b:a", "192k"])
+        settings.audioFormat = .opus
+        settings.sanitize()
+        XCTAssertEqual(settings.pathExtension, "opus")
+        XCTAssertTrue(settings.audioFormat.ffmpegEncodeArguments(bitRate: 128_000)
+            .contains("libopus"))
+
+        settings.fileBaseName = "bounce.mp3"
+        settings.sanitize()
+        XCTAssertEqual(settings.fileBaseName, "bounce")
+
+        // The picker hides the three lossy extras without ffmpeg.
+        XCTAssertEqual(ExportSettings.AudioFormat.available(ffmpegAvailable: false),
+                       [.wav, .aiff, .flac, .alac, .aac])
+        XCTAssertEqual(ExportSettings.AudioFormat.available(ffmpegAvailable: true).count,
+                       ExportSettings.AudioFormat.allCases.count)
+    }
+
+    func testFFmpegDetectionScansSearchPaths() throws {
+        let bin = directory.appendingPathComponent("fake-bin")
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        let missingDir = directory.appendingPathComponent("empty-bin")
+        try FileManager.default.createDirectory(at: missingDir, withIntermediateDirectories: true)
+
+        // Nothing executable named ffmpeg anywhere in the list → nil.
+        XCTAssertNil(FFmpegBridge.detect(searchPaths: [
+            missingDir.path, "/nonexistent-directory-for-sal-tests", directory.path
+        ]))
+
+        let fake = bin.appendingPathComponent("ffmpeg")
+        FileManager.default.createFile(
+            atPath: fake.path,
+            contents: Data("#!/bin/sh\nexit 0\n".utf8),
+            attributes: [.posixPermissions: 0o755]
+        )
+        XCTAssertEqual(
+            FFmpegBridge.detect(searchPaths: [missingDir.path, bin.path])?.path,
+            fake.path
+        )
+
+        // A non-executable stub must not count as a detection.
+        let stub = missingDir.appendingPathComponent("ffmpeg")
+        try Data("not executable".utf8).write(to: stub)
+        XCTAssertNil(FFmpegBridge.detect(searchPaths: [missingDir.path]))
+    }
+
+    func testNativeRendererRejectsFFmpegFormats() async throws {
+        let (asset, audioMix) = try await makeTwoTrackMix()
+        do {
+            try await EditorModel.performAudioExport(
+                asset: asset,
+                destination: directory.appendingPathComponent("bounce.mp3"),
+                format: .mp3,
+                sampleRate: 44_100,
+                bitDepth: 24,
+                aacBitRate: 192_000,
+                duration: 2.5,
+                audioMix: audioMix,
+                isCancelled: { false },
+                onProgress: { _ in }
+            )
+            XCTFail("performAudioExport must not encode MP3 natively")
+        } catch let error as NSError {
+            XCTAssertEqual(error.domain, "StudioAudioLane")
+            XCTAssertTrue(error.localizedDescription.contains("FFmpeg"),
+                          "error should point at the FFmpeg bridge: \(error.localizedDescription)")
+        }
+    }
+
+    func testFFmpegConversionProducesPlayableFiles() async throws {
+        guard let ffmpeg = FFmpegBridge.detect() else {
+            throw XCTSkip("ffmpeg is not installed on this machine — skipping FFmpeg conversion test")
+        }
+        for format in [ExportSettings.AudioFormat.mp3, .ogg, .opus] {
+            let (asset, audioMix) = try await makeTwoTrackMix()
+            let wav = directory.appendingPathComponent("in-\(format.rawValue).wav")
+            try await EditorModel.performAudioExport(
+                asset: asset,
+                destination: wav,
+                format: .wav,
+                sampleRate: 44_100,
+                bitDepth: 24,
+                aacBitRate: 192_000,
+                duration: 2.5,
+                audioMix: audioMix,
+                isCancelled: { false },
+                onProgress: { _ in }
+            )
+
+            let encoded = directory
+                .appendingPathComponent("bounce-\(format.rawValue)")
+                .appendingPathExtension(format.pathExtension)
+            try await EditorModel.performFFmpegAudioConversion(
+                sourceWAV: wav,
+                destination: encoded,
+                format: format,
+                bitRate: 192_000,
+                isCancelled: { false }
+            )
+            let bytes = (try FileManager.default.attributesOfItem(atPath: encoded.path)[.size] as? NSNumber)?.intValue ?? 0
+            XCTAssertGreaterThan(bytes, 1_024, "\(format.rawValue) produced a truncated file")
+
+            // Decode back through ffmpeg and listen numerically: 0.5–1.0 s is
+            // the unmuted 440 Hz tone, 2.3–2.4 s stays after tone A ends and
+            // the muted tone B — it must remain (near) silence.
+            let decoded = directory.appendingPathComponent("decoded-\(format.rawValue).wav")
+            try await EditorModel.runFFmpeg(
+                executable: ffmpeg,
+                arguments: ["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", encoded.path, decoded.path],
+                outputURL: decoded,
+                isCancelled: { false }
+            )
+            XCTAssertGreaterThan(try rms(in: decoded, from: 0.5, to: 1.0), 0.05,
+                                 "\(format.rawValue) lost the audible content")
+            XCTAssertLessThan(try rms(in: decoded, from: 2.3, to: 2.4), 0.01,
+                              "\(format.rawValue) noise-filled the silent tail")
+        }
+    }
+
+    func testFFmpegConversionHonoursCancellation() async throws {
+        guard let ffmpeg = FFmpegBridge.detect() else {
+            throw XCTSkip("ffmpeg is not installed on this machine — skipping cancellation test")
+        }
+        // -re pumps a 10 s WAV in real time, so the run lasts long enough for
+        // the cancel flag (set after 0.4 s) to fire mid-encode.
+        let wav = directory.appendingPathComponent("cancel-feed.wav")
+        try writeSine(to: wav, seconds: 10, frequency: 220)
+        let started = Date()
+        do {
+            try await EditorModel.runFFmpeg(
+                executable: ffmpeg,
+                arguments: [
+                    "-hide_banner", "-loglevel", "error", "-nostdin",
+                    "-re", "-i", wav.path, "-f", "null", "-",
+                ],
+                isCancelled: { Date().timeIntervalSince(started) > 0.4 }
+            )
+            XCTFail("runFFmpeg should have thrown CancellationError")
+        } catch is CancellationError {
+            XCTAssertLessThan(Date().timeIntervalSince(started), 10,
+                              "cancellation must terminate ffmpeg promptly")
+        }
+    }
+
     // MARK: - Render
 
     func testAudioExportRendersMixedTimeline() async throws {
