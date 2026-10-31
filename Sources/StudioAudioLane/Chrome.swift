@@ -143,7 +143,7 @@ struct TitleBar: View {
     }
 
     private var exportEnabled: Bool {
-        !model.isExporting && (model.hasVideo || model.hasMusic)
+        model.canExport
     }
 
     private var titleText: String {
@@ -173,7 +173,7 @@ struct InspectorPane: View {
                 VStack(alignment: .leading, spacing: 0) {
                     if model.isLoading {
                         loading
-                    } else if !model.hasVideo {
+                    } else if !model.hasVideo && !model.hasMusic {
                         emptyProject
                     } else {
                         ScrollView {

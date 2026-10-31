@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreVideo
 import XCTest
 @testable import StudioAudioLane
 
@@ -267,6 +268,148 @@ final class AudioExportTests: XCTestCase {
         }
     }
 
+    // MARK: - Audio-only timeline
+
+    /// The Export action must turn on for a playlist that has sound and no picture,
+    /// and a video container choice must become an audio mixdown instead of a
+    /// video encode that has nothing to write.
+    @MainActor
+    func testAudioOnlyTimelineEnablesExportAndRewritesVideoSettings() {
+        let model = EditorModel()
+        XCTAssertFalse(model.canExport)
+        model.presentExportSheet()
+        XCTAssertFalse(model.isExportSheetPresented)
+
+        model.audioClips = [placeholderClip(name: "voice")]
+        XCTAssertFalse(model.hasVideo)
+        XCTAssertTrue(model.hasMusic)
+        XCTAssertTrue(model.canExport)
+        XCTAssertEqual(model.clipName, "voice")
+        model.presentExportSheet()
+        XCTAssertTrue(model.isExportSheetPresented)
+
+        var video = ExportSettings()
+        video.mode = .video
+        video.container = .mp4
+        let adjusted = model.settingsAdjustedForTimeline(video)
+        XCTAssertEqual(adjusted.mode, .audio)
+        XCTAssertEqual(adjusted.pathExtension, "wav")
+        let rewritten = model.resolvedExportURL(
+            URL(fileURLWithPath: "/tmp/mix.mp4"),
+            settings: adjusted
+        )
+        XCTAssertEqual(rewritten.pathExtension, "wav")
+
+        model.isExporting = true
+        XCTAssertFalse(model.canExport, "export stays disabled while an encode is running")
+        model.isExporting = false
+
+        model.videoClips = [placeholderClip(name: "picture")]
+        var kept = ExportSettings()
+        kept.mode = .video
+        kept.container = .mov
+        let stillVideo = model.settingsAdjustedForTimeline(kept)
+        XCTAssertEqual(stillVideo.mode, .video)
+        XCTAssertEqual(stillVideo.pathExtension, "mov")
+    }
+
+    @MainActor
+    func testAudioOnlyPlaylistExportsPlayableWAV() async throws {
+        let source = directory.appendingPathComponent("voice.wav")
+        try writeSine(to: source, seconds: 1.0, frequency: 440)
+
+        let model = EditorModel()
+        let added = await model.addAudioPublic(
+            url: source,
+            start: nil,
+            ontoTrackID: EditorModel.defaultAudioTrackID
+        )
+        XCTAssertTrue(added, model.errorMessage ?? "audio import failed")
+        XCTAssertTrue(model.audioClips.count == 1)
+        XCTAssertTrue(model.videoClips.isEmpty)
+        XCTAssertTrue(model.canExport)
+
+        let item = try XCTUnwrap(model.player.currentItem, "audio-only timeline produced no player item")
+        let videos = try await item.asset.loadTracks(withMediaType: .video)
+        let audios = try await item.asset.loadTracks(withMediaType: .audio)
+        XCTAssertTrue(videos.isEmpty, "an empty video track makes the audio asset unreadable")
+        XCTAssertFalse(audios.isEmpty)
+
+        var settings = ExportSettings()
+        settings.mode = .audio
+        settings.audioFormat = .wav
+        settings.audioSampleRateHertz = 44_100
+        let destination = directory.appendingPathComponent("audio-only.wav")
+        XCTAssertTrue(model.beginExportDirect(settings: settings, destination: destination))
+        let failure = await waitForExport(model)
+        XCTAssertNil(failure)
+        XCTAssertGreaterThan(try rms(in: destination, from: 0.2, to: 0.8), 0.05)
+    }
+
+    @MainActor
+    func testVideoContainerOnAudioOnlyTimelineWritesAudio() async throws {
+        let source = directory.appendingPathComponent("voice.wav")
+        try writeSine(to: source, seconds: 1.0, frequency: 440)
+        let model = EditorModel()
+        let added = await model.addAudioPublic(
+            url: source,
+            start: nil,
+            ontoTrackID: EditorModel.defaultAudioTrackID
+        )
+        XCTAssertTrue(added, model.errorMessage ?? "audio import failed")
+
+        var settings = ExportSettings()
+        settings.mode = .video
+        settings.container = .mp4
+        let requested = directory.appendingPathComponent("from-video.mp4")
+        let expected = model.preparedExport(settings: settings, destination: requested).destination
+        XCTAssertEqual(expected.pathExtension, "wav")
+        XCTAssertTrue(model.beginExportDirect(settings: settings, destination: requested))
+        let failure = await waitForExport(model)
+        XCTAssertNil(failure)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: expected.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: requested.path))
+        XCTAssertGreaterThan(try rms(in: expected, from: 0.2, to: 0.8), 0.05)
+    }
+
+    @MainActor
+    func testMixedTimelineKeepsVideoTrackAndVideoExport() async throws {
+        let videoURL = directory.appendingPathComponent("clip.mov")
+        let audioURL = directory.appendingPathComponent("bed.wav")
+        try writeVideo(to: videoURL, frames: 10)
+        try writeSine(to: audioURL, seconds: 0.6, frequency: 440)
+
+        let model = EditorModel()
+        let videoOK = await model.addVideoPublic(
+            url: videoURL,
+            start: nil,
+            ontoTrackID: EditorModel.defaultVideoTrackID
+        )
+        XCTAssertTrue(videoOK, model.errorMessage ?? "video import failed")
+        let audioOK = await model.addAudioPublic(
+            url: audioURL,
+            start: nil,
+            ontoTrackID: EditorModel.defaultAudioTrackID
+        )
+        XCTAssertTrue(audioOK, model.errorMessage ?? "audio import failed")
+        XCTAssertTrue(model.canExport)
+
+        let asset = try XCTUnwrap(model.player.currentItem?.asset)
+        let videos = try await asset.loadTracks(withMediaType: .video)
+        let audios = try await asset.loadTracks(withMediaType: .audio)
+        XCTAssertFalse(videos.isEmpty, "a picture clip must still land on a video track")
+        let videoDuration = try await videos[0].load(.timeRange).duration.seconds
+        XCTAssertGreaterThan(videoDuration, 0.1)
+        XCTAssertFalse(audios.isEmpty)
+
+        var settings = ExportSettings()
+        settings.mode = .video
+        settings.container = .mp4
+        let adjusted = model.settingsAdjustedForTimeline(settings)
+        XCTAssertEqual(adjusted.mode, .video)
+        XCTAssertEqual(adjusted.pathExtension, "mp4")
+    }
+
     // MARK: - Fixtures
 
     /// A: 440 Hz sine covering 0–2 s, unmuted.
@@ -310,6 +453,33 @@ final class AudioExportTests: XCTestCase {
         return (composition, mix)
     }
 
+    /// `EditorModel` is `@MainActor`, so its default track ids are isolated too.
+    @MainActor
+    private func placeholderClip(name: String, duration: TimeInterval = 1) -> MediaClip {
+        MediaClip(
+            id: UUID(),
+            url: URL(fileURLWithPath: "/tmp/\(name).wav"),
+            name: name,
+            sourceDuration: duration,
+            inPoint: 0,
+            timelineStart: 0,
+            duration: duration,
+            fadeIn: 0,
+            fadeOut: 0,
+            trackID: EditorModel.defaultAudioTrackID
+        )
+    }
+
+    @MainActor
+    private func waitForExport(_ model: EditorModel, timeout: TimeInterval = 20) async -> String? {
+        let deadline = Date().addingTimeInterval(timeout)
+        while model.isExporting, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        if model.isExporting { return "export timed out" }
+        return model.errorMessage
+    }
+
     /// Hand-rolled 16-bit PCM WAV bytes — deterministic, no encoder in the
     /// fixture path.
     private func writeSine(to url: URL, seconds: Double, frequency: Double) throws {
@@ -343,6 +513,48 @@ final class AudioExportTests: XCTestCase {
         }
         samples.withUnsafeBytes { data.append(contentsOf: $0) }
         try data.write(to: url, options: .atomic)
+    }
+
+    private func writeVideo(to url: URL, frames: Int) throws {
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: 160,
+            AVVideoHeightKey: 90
+        ])
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: input,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+                kCVPixelBufferWidthKey as String: 160,
+                kCVPixelBufferHeightKey as String: 90
+            ]
+        )
+        writer.add(input)
+        writer.startWriting()
+        writer.startSession(atSourceTime: .zero)
+        for frame in 0..<frames {
+            while !input.isReadyForMoreMediaData {
+                Thread.sleep(forTimeInterval: 0.002)
+            }
+            var buffer: CVPixelBuffer?
+            CVPixelBufferCreate(nil, 160, 90, kCVPixelFormatType_32BGRA, nil, &buffer)
+            guard let buffer else { continue }
+            CVPixelBufferLockBaseAddress(buffer, [])
+            if let base = CVPixelBufferGetBaseAddress(buffer) {
+                memset(base, 180, CVPixelBufferGetBytesPerRow(buffer) * 90)
+            }
+            CVPixelBufferUnlockBaseAddress(buffer, [])
+            adaptor.append(buffer, withPresentationTime: CMTime(value: CMTimeValue(frame), timescale: 30))
+        }
+        input.markAsFinished()
+        let group = DispatchGroup()
+        group.enter()
+        writer.finishWriting { group.leave() }
+        group.wait()
+        if writer.status != .completed {
+            throw writer.error ?? NSError(domain: "AudioExportTests", code: 1)
+        }
     }
 
     private func rms(in url: URL, from start: Double, to end: Double) throws -> Double {

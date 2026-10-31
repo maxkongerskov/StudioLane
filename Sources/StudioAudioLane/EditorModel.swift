@@ -673,8 +673,20 @@ final class EditorModel {
     var hasVideo: Bool { !videoClips.isEmpty }
     var hasMusic: Bool { !audioClips.isEmpty }
 
+    /// Export is available when the timeline has picture or sound, including
+    /// an audio-only playlist.
+    /// Both collections are read on every call so SwiftUI keeps tracking audio
+    /// clips while a video clip is also on the timeline. A `||` short-circuit
+    /// would skip `audioClips` in that case and leave Export disabled after
+    /// the picture is removed.
+    var canExport: Bool {
+        let picture = hasVideo
+        let sound = hasMusic
+        return !isExporting && (picture || sound)
+    }
+
     var clipName: String {
-        videoClips.first?.displayName ?? "No clip"
+        videoClips.first?.displayName ?? audioClips.first?.displayName ?? "No clip"
     }
 
     /// Window / chrome title: prefer saved project filename when available.
@@ -795,13 +807,14 @@ final class EditorModel {
     /// so the MCP layer can report failure instead of a fake `"started"` (HIGH-3).
     @discardableResult
     func beginExportDirect(settings: ExportSettings, destination: URL) -> Bool {
-        guard !isExporting, player.currentItem != nil else { return false }
-        var settings = settings
-        settings.sanitize()
+        guard canExport else { return false }
+        let prepared = preparedExport(settings: settings, destination: destination)
 
         // Claim the export slot now; if a rebuild is mid-flight, wait for it before
         // snapshotting so the item's asset and the fade instructions come from the
-        // same composition (CRITICAL-1).
+        // same composition (CRITICAL-1). Do not require `currentItem` here: an
+        // audio-only rebuild may still be in flight, and bailing out made Export
+        // look dead.
         isExporting = true
         exportProgress = 0
         errorMessage = nil
@@ -810,7 +823,7 @@ final class EditorModel {
         Task { @MainActor in
             await self.waitForRebuildsToSettle()
             guard self.isExporting, self.exportIntent == intent else { return }
-            self.startExportSnapshot(settings: settings, destination: destination)
+            self.startExportSnapshot(settings: prepared.settings, destination: prepared.destination)
         }
         return true
     }
@@ -818,7 +831,9 @@ final class EditorModel {
     private func startExportSnapshot(settings: ExportSettings, destination: URL) {
         guard let item = player.currentItem else {
             isExporting = false
+            exportProgress = 0
             status = "Nothing to export"
+            errorMessage = "Could not export — the timeline has no playable media."
             return
         }
         try? FileManager.default.removeItem(at: destination)
@@ -2634,14 +2649,35 @@ final class EditorModel {
     }
 
     func presentExportSheet() {
-        guard hasVideo || hasMusic, !isExporting else { return }
+        guard canExport else { return }
         isExportSheetPresented = true
     }
 
-    func beginExport(with settings: ExportSettings) {
-        guard !isExporting, player.currentItem != nil else { return }
+    /// Video, GIF, and X-Loop need a picture. With only audio on the timeline,
+    /// those choices become a mixdown instead of failing in the video writer.
+    func settingsAdjustedForTimeline(_ settings: ExportSettings) -> ExportSettings {
         var settings = settings
+        if !hasVideo, settings.mode != .audio {
+            settings.mode = .audio
+        }
         settings.sanitize()
+        return settings
+    }
+
+    func resolvedExportURL(_ destination: URL, settings: ExportSettings) -> URL {
+        let ext = settings.pathExtension
+        if destination.pathExtension.lowercased() == ext { return destination }
+        return destination.deletingPathExtension().appendingPathExtension(ext)
+    }
+
+    func preparedExport(settings: ExportSettings, destination: URL) -> (settings: ExportSettings, destination: URL) {
+        let settings = settingsAdjustedForTimeline(settings)
+        return (settings, resolvedExportURL(destination, settings: settings))
+    }
+
+    func beginExport(with settings: ExportSettings) {
+        guard canExport else { return }
+        let settings = settingsAdjustedForTimeline(settings)
 
         let panel = NSSavePanel()
         panel.canCreateDirectories = true
@@ -4532,7 +4568,14 @@ final class EditorModel {
             var newVideoAudioTrackIDs: [UUID: CMPersistentTrackID] = [:]
             var newMusicTrackIDs: [UUID: CMPersistentTrackID] = [:]
 
-            let videoTrack = rebuiltMix.addMutableTrack(withMediaType: .video, preferredTrackID: 1)
+            // Only create the video track when there is picture to insert. An
+            // empty track (audio-only playlist) makes AVPlayerItem fail to open
+            // and AVAssetReader refuse to start, so Export either no-ops or
+            // errors after the button looked available.
+            let segments = renderSegments()
+            let videoTrack: AVMutableCompositionTrack? = segments.isEmpty
+                ? nil
+                : rebuiltMix.addMutableTrack(withMediaType: .video, preferredTrackID: 1)
 
             // One composition track can't hold two overlapping clips — insertTimeRange pushes a
             // later clip past the previous end, inflating the player item beyond the model
@@ -4541,7 +4584,8 @@ final class EditorModel {
             // composition duration stays bounded by the model's max end. `renderSegments()` is
             // the single source of truth for that collapse, and `makeVideoComposition` derives
             // its instructions from the same segments so they can't disagree.
-            for segment in renderSegments() {
+            var insertedPicture = false
+            for segment in segments {
                 if Task.isCancelled { return }
                 guard let videoTrack else { continue }
                 if StillImage.isStill(segment.clip.url) {
@@ -4555,6 +4599,7 @@ final class EditorModel {
                             at: segment.at,
                             duration: segment.duration
                         )
+                        insertedPicture = true
                         if placed.renderSize.width > 1, placed.renderSize.height > 1 {
                             renderSize = placed.renderSize
                         }
@@ -4573,6 +4618,7 @@ final class EditorModel {
                     of: src,
                     at: CMTime(seconds: segment.at, preferredTimescale: 600)
                 )
+                insertedPicture = true
                 let transform = try await src.load(.preferredTransform)
                 videoTrack.preferredTransform = transform
                 let natural = try await src.load(.naturalSize)
@@ -4582,6 +4628,12 @@ final class EditorModel {
                 if !isProMode, fps > 1 {
                     frameDuration = CMTime(value: 1, timescale: CMTimeScale(max(1, Int(fps.rounded()))))
                 }
+            }
+
+            // Every insert can `continue` (no video sample, still that failed).
+            // A track with no samples is the same failure as never having picture.
+            if let videoTrack, !insertedPicture {
+                rebuiltMix.removeTrack(videoTrack)
             }
 
             // Each video clip gets its own audio track so `makeAudioMix` can attach one
